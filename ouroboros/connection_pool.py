@@ -188,14 +188,18 @@ def _prefer_better_rated(
 
         if random.random() < EXPLORATION_SHARE:
             return ranked
+        from ouroboros.connection_rating import quality_by_connection
+
         stats = collect_stats(root)
-        best = max(rank_value(stats.get(conn.connection_id)) for conn in ranked)
+        quality = quality_by_connection(root)
+
+        def _value(conn):
+            return rank_value(stats.get(conn.connection_id), quality=quality.get(conn.connection_id))
+
+        best = max(_value(conn) for conn in ranked)
         # Everything within the band counts as "as good as the best": success rate
         # is a noisy estimate and a hair's difference is not a reason to starve one.
-        top = [
-            conn for conn in ranked
-            if rank_value(stats.get(conn.connection_id)) >= best - RATING_TIE_BAND
-        ]
+        top = [conn for conn in ranked if _value(conn) >= best - RATING_TIE_BAND]
         return top or ranked
     except Exception:
         log.debug("rating unavailable; routing without it", exc_info=True)

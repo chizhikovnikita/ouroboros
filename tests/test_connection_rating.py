@@ -187,3 +187,70 @@ def test_rating_failure_does_not_break_routing(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rating, "collect_stats", _boom)
     assert pool.select("openai::gpt-x", tmp_path) is not None
+
+
+# --- task-outcome quality (stage 5) ------------------------------------------
+
+
+def test_quality_needs_enough_verdicts_before_it_says_anything(tmp_path):
+    # One task's verdict says far more about the task than about the key that
+    # carried it, so a handful of them must stay silent.
+    for index in range(rating.MIN_QUALITY_OBSERVATIONS - 1):
+        rating.record_task_outcome(f"task-{index}", True, tmp_path)
+        _attempt_for_task(tmp_path, "a", f"task-{index}")
+    assert rating.quality_by_connection(tmp_path).get("a") is None
+
+
+def _attempt_for_task(tmp_path, connection_id, root_task_id):
+    from ouroboros.usage_accounting import UsageScope, usage_scope
+
+    with usage_scope(UsageScope(drive_root=tmp_path, root_task_id=root_task_id, task_id=root_task_id)):
+        reservation = reserve_attempt(AttemptRequest(
+            model="openai::gpt-x", provider="openai", connection_id=connection_id,
+            drive_root=tmp_path, global_limit_usd=1000.0, max_budget_usd=0.01,
+        ))
+        mark_dispatched(reservation)
+        settle_attempt(reservation, {"prompt_tokens": 1, "completion_tokens": 1}, cost_usd=0.0, cost_final=True)
+
+
+def test_quality_is_the_share_of_accepted_tasks(tmp_path):
+    for index in range(12):
+        accepted = index < 9
+        rating.record_task_outcome(f"task-{index}", accepted, tmp_path)
+        _attempt_for_task(tmp_path, "a", f"task-{index}")
+    assert rating.quality_by_connection(tmp_path)["a"] == pytest.approx(9 / 12)
+
+
+def test_a_chatty_task_counts_once_per_connection(tmp_path):
+    # Otherwise one long task would drown out every other verdict.
+    for index in range(10):
+        rating.record_task_outcome(f"task-{index}", index == 0, tmp_path)
+        for _ in range(5 if index == 0 else 1):
+            _attempt_for_task(tmp_path, "a", f"task-{index}")
+    assert rating.quality_by_connection(tmp_path)["a"] == pytest.approx(1 / 10)
+
+
+def test_quality_only_adjusts_an_already_measured_connection():
+    # Letting a noisy verdict share move an UNRATED connection would defeat the
+    # optimistic start that keeps new connections in rotation.
+    assert rating.rank_value(None, quality=0.0) == rating.OPTIMISTIC_SUCCESS_RATE
+    measured = rating.ConnectionStats(connection_id="a", succeeded=10, failed=0)
+    assert rating.rank_value(measured, quality=0.0) < rating.rank_value(measured)
+
+
+def test_quality_moves_the_rank_but_does_not_dominate_it(tmp_path):
+    measured = rating.ConnectionStats(connection_id="a", succeeded=10, failed=0)
+    worst = rating.rank_value(measured, quality=0.0)
+    # A perfect send record with terrible task outcomes must still beat a
+    # connection that fails half its sends.
+    half_failing = rating.ConnectionStats(connection_id="b", succeeded=5, failed=5)
+    assert worst > rating.rank_value(half_failing)
+
+
+def test_a_missing_outcome_file_leaves_quality_unknown(tmp_path):
+    assert rating.quality_by_connection(tmp_path) == {}
+
+
+def test_recording_never_raises_on_a_bad_root(tmp_path):
+    rating.record_task_outcome("", True, tmp_path)
+    rating.record_task_outcome("task", True, "/nonexistent/path/that/cannot/be/made")

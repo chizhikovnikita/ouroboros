@@ -1096,6 +1096,16 @@ failures, worse than a proven one), and a rate computed from fewer than
 A released reservation — reserved, then handed back without a send — is tracked
 but is never a failure: it is a budget decision, not evidence about the provider.
 
+**Task-outcome quality** (`state/connection_outcomes.jsonl`) is the third signal.
+The verdict is recorded where it HAPPENS — at task emission, keyed by root task —
+and joined back to connections at read time through the ledger's own
+`root_task_id`, so nothing has to guess which connection served which turn. It is
+by far the noisiest input: one task's verdict says more about the task than about
+the key that carried it. So it enters with a small weight, needs
+`MIN_QUALITY_OBSERVATIONS` verdicts before it says anything, counts a task once per
+connection however chatty it was, and only ever adjusts an ALREADY-measured
+connection — letting it move an unrated one would defeat the optimistic start.
+
 Selection narrows to the best-rated band, but `EXPLORATION_SHARE` of calls ignore
 the ranking outright. Without that a pool never samples its alternatives, so it
 cannot learn that its favourite has rotted or that a newly added key is good. The

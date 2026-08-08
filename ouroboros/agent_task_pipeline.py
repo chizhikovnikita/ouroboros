@@ -687,6 +687,15 @@ def _derive_host_bound_loop_outcome(
     return derive_loop_outcome(text or "", usage, llm_trace)
 
 
+def _rating_outcome_signal(task: Dict[str, Any], loop_outcome: Dict[str, Any], drive_root: Any) -> None:
+    """Seam to the connection rating; what counts as a good outcome lives there."""
+    try:
+        from ouroboros.connection_rating import record_outcome_from_loop
+        record_outcome_from_loop(task, loop_outcome, drive_root)
+    except Exception:
+        log.debug("connection outcome signal skipped", exc_info=True)
+
+
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -697,6 +706,7 @@ def emit_task_results(
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
+    _rating_outcome_signal(task, loop_outcome, getattr(env, "drive_root", None))
     # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
     # flag HERE — once — so the SAME flagged loop_outcome feeds events and the durable
     # task_result.json. _store_task_result reuses this loop_outcome, so the

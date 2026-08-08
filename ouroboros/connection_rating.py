@@ -160,16 +160,137 @@ def collect_stats(root: pathlib.Path | str | None = None) -> Dict[str, Connectio
     }
 
 
-def rank_value(stats: Optional[ConnectionStats]) -> float:
+OUTCOMES_REL = pathlib.Path("state/connection_outcomes.jsonl")
+
+# Task-outcome quality is the noisiest signal here: one task's verdict says much
+# more about the task than about the key that carried it. It therefore enters with
+# a small weight and only once a connection has enough verdicts to mean anything.
+QUALITY_WEIGHT = 0.25
+MIN_QUALITY_OBSERVATIONS = 10
+
+
+def record_task_outcome(
+    root_task_id: str,
+    accepted: bool,
+    root: pathlib.Path | str | None = None,
+) -> None:
+    """Record one task's acceptance verdict, keyed by root task.
+
+    Written WHERE THE VERDICT HAPPENS rather than reconstructed later: the join to
+    connections is done at read time through the ledger's own ``root_task_id``, so
+    nothing here has to guess which connection served which turn.
+
+    Best-effort: a rating signal must never be able to fail a completed task.
+    """
+    root_task_id = str(root_task_id or "").strip()
+    if not root_task_id:
+        return
+    try:
+        from ouroboros.usage_ledger import _drive_root
+        from ouroboros.utils import append_jsonl
+
+        path = _drive_root(root) / OUTCOMES_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        append_jsonl(path, {"root_task_id": root_task_id, "accepted": bool(accepted)})
+    except Exception:
+        log.debug("connection outcome not recorded", exc_info=True)
+
+
+def _task_verdicts(root: pathlib.Path | str | None) -> Dict[str, bool]:
+    """Latest verdict per root task; an unreadable file simply yields none."""
+    try:
+        from ouroboros.usage_ledger import _drive_root
+
+        path = _drive_root(root) / OUTCOMES_REL
+        if not path.is_file():
+            return {}
+        import json
+
+        verdicts: Dict[str, bool] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            task_id = str(row.get("root_task_id") or "")
+            if task_id:
+                verdicts[task_id] = bool(row.get("accepted"))
+        return verdicts
+    except Exception:
+        log.debug("task verdicts unavailable", exc_info=True)
+        return {}
+
+
+def quality_by_connection(root: pathlib.Path | str | None = None) -> Dict[str, Optional[float]]:
+    """Share of accepted tasks per connection, or None where there is too little.
+
+    A connection that served both an accepted and a rejected task is credited for
+    both — attribution here is honestly coarse, which is exactly why the weight is
+    small and the floor is high.
+    """
+    verdicts = _task_verdicts(root)
+    if not verdicts:
+        return {}
+    try:
+        from ouroboros.usage_ledger import _drive_root, _locked, _read_records_locked
+
+        drive_root = _drive_root(root)
+        with _locked(drive_root):
+            records = _read_records_locked(drive_root)
+    except Exception:
+        return {}
+
+    seen: Dict[str, Dict[str, int]] = {}
+    counted: set[tuple[str, str]] = set()
+    for row in records:
+        connection_id = str(row.get("connection_id") or "")
+        task_id = str(row.get("root_task_id") or "")
+        if not connection_id or task_id not in verdicts:
+            continue
+        # One task counts ONCE per connection however many sends it took, or a
+        # chatty task would drown out every other verdict.
+        if (connection_id, task_id) in counted:
+            continue
+        counted.add((connection_id, task_id))
+        bucket = seen.setdefault(connection_id, {"accepted": 0, "total": 0})
+        bucket["total"] += 1
+        if verdicts[task_id]:
+            bucket["accepted"] += 1
+
+    return {
+        connection_id: (
+            bucket["accepted"] / bucket["total"]
+            if bucket["total"] >= MIN_QUALITY_OBSERVATIONS
+            else None
+        )
+        for connection_id, bucket in seen.items()
+    }
+
+
+def rank_value(
+    stats: Optional[ConnectionStats],
+    *,
+    quality: Optional[float] = None,
+) -> float:
     """Sortable standing for one connection. Higher is better.
 
     An unrated connection scores just under a perfect record: better than anything
     with real failures, worse than a connection that has proven itself — and, most
     importantly, high enough to actually receive traffic and become rated.
+
+    Task-outcome quality only adjusts an ALREADY-measured connection: letting a
+    noisy verdict share move an unrated one would defeat the optimistic start that
+    keeps new connections in rotation.
     """
     if stats is None or not stats.rated:
         return OPTIMISTIC_SUCCESS_RATE
-    return float(stats.success_rate or 0.0)
+    base = float(stats.success_rate or 0.0)
+    if quality is None:
+        return base
+    return base * (1.0 - QUALITY_WEIGHT) + float(quality) * QUALITY_WEIGHT
 
 
 def order_by_rating(
@@ -180,4 +301,47 @@ def order_by_rating(
 ) -> List[str]:
     """Best-first ordering. Ties keep the caller's order for the caller to break."""
     table = dict(stats) if stats is not None else collect_stats(root)
-    return sorted(connection_ids, key=lambda cid: -rank_value(table.get(cid)))
+    quality = quality_by_connection(root)
+    return sorted(
+        connection_ids,
+        key=lambda cid: -rank_value(table.get(cid), quality=quality.get(cid)),
+    )
+
+
+def record_outcome_from_loop(
+    task: Mapping[str, Any],
+    loop_outcome: Mapping[str, Any],
+    root: pathlib.Path | str | None = None,
+) -> None:
+    """Derive one task-quality verdict from a finished loop outcome and record it.
+
+    Lives here rather than in the task pipeline so the rules about what counts as
+    a good outcome stay next to the code that consumes them — and so the pipeline
+    keeps one line instead of a policy.
+
+    Best-effort: a rating signal must never fail a task that already completed.
+    """
+    try:
+        from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
+
+        root_task_id = str(task.get("root_task_id") or task.get("id") or "")
+        if not root_task_id:
+            return
+
+        decision = loop_outcome.get("acceptance_decision")
+        if isinstance(decision, dict) and decision.get("status"):
+            accepted = str(decision.get("status")) == ACCEPTANCE_ACCEPTED
+        else:
+            # No acceptance panel ran. Execution health is a weaker but honest
+            # statement about the send path; anything unknown records nothing at
+            # all rather than guessing.
+            axes = loop_outcome.get("outcome_axes") or {}
+            execution = axes.get("execution") if isinstance(axes, dict) else None
+            status = str((execution or {}).get("status") or "") if isinstance(execution, dict) else ""
+            if not status:
+                return
+            accepted = status in ("ok", "completed", "success")
+
+        record_task_outcome(root_task_id, accepted, root)
+    except Exception:
+        log.debug("outcome verdict not derived", exc_info=True)
