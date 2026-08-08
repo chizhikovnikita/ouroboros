@@ -32,7 +32,6 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from ouroboros.provider_models import (
     PROVIDER_CREDENTIAL_GROUPS,
-    PROVIDER_ENV_KEYS,
     normalize_model_identity,
 )
 
@@ -475,8 +474,34 @@ def legacy_connection_id(provider: str) -> str:
     return f"legacy:{provider}"
 
 
+# Which settings key means "this provider is configured". Derived from
+# PROVIDER_CREDENTIAL_GROUPS rather than PROVIDER_ENV_KEYS: that narrower table
+# covers only the five single-key providers, so projecting from it made the
+# openai-compatible and GigaChat lanes invisible — including, for an install whose
+# ONLY configured provider is a custom endpoint, every connection it has.
+_LEGACY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY",),
+    "cloudru": ("CLOUDRU_FOUNDATION_MODELS_API_KEY",),
+    # Either auth route counts as configured.
+    "gigachat": ("GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD"),
+    # A custom endpoint may authenticate with its own key or reuse the legacy
+    # OPENAI_* pair, exactly as llm._resolve_remote_target does.
+    "openai-compatible": ("OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL"),
+}
+
+# Where a projected connection reads its endpoint from, when it has one.
+_LEGACY_BASE_URL_KEYS: dict[str, tuple[str, ...]] = {
+    "cloudru": ("CLOUDRU_FOUNDATION_MODELS_BASE_URL",),
+    "gigachat": ("GIGACHAT_BASE_URL",),
+    "openai-compatible": ("OPENAI_COMPATIBLE_BASE_URL", "OPENAI_BASE_URL"),
+}
+
+
 def legacy_connections(env: Mapping[str, str] | None = None) -> Tuple[Connection, ...]:
-    """Project today's single-key-per-provider settings as connections.
+    """Project today's single-credential-per-provider settings as connections.
 
     These are not written to the catalog: the settings key remains the authority
     for its own value. That keeps a one-provider install working with an empty
@@ -484,16 +509,23 @@ def legacy_connections(env: Mapping[str, str] | None = None) -> Tuple[Connection
     """
     source = env if env is not None else os.environ
     out: list[Connection] = []
-    for provider, primary_key in PROVIDER_ENV_KEYS.items():
-        if not str(source.get(primary_key, "") or "").strip():
+    for provider, keys in _LEGACY_PRIMARY_KEYS.items():
+        if not any(str(source.get(key, "") or "").strip() for key in keys):
             continue
+        base_url = ""
+        for key in _LEGACY_BASE_URL_KEYS.get(provider, ()):
+            candidate = str(source.get(key, "") or "").strip()
+            if candidate:
+                base_url = candidate
+                break
         out.append(
             Connection(
                 connection_id=legacy_connection_id(provider),
-                kind=KIND_API_KEY,
+                kind=KIND_ENDPOINT if provider == "openai-compatible" and base_url else KIND_API_KEY,
                 provider=provider,
                 label=f"{provider} (settings key)",
                 enabled=True,
+                base_url=base_url,
                 privacy=PRIVACY_UNKNOWN,
                 origin=ORIGIN_LEGACY,
             )

@@ -276,3 +276,43 @@ def test_a_permissive_result_refuses_to_publish_instead_of_passing_silently(tmp_
     probe.chmod(0o644)
     with pytest.raises(conns.ConnectionConfigError, match="readable beyond the owner"):
         conns._assert_owner_only(probe)
+
+
+# --- legacy projection must cover EVERY provider lane -------------------------
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({"OPENROUTER_API_KEY": "sk-x"}, "legacy:openrouter"),
+    ({"OPENAI_API_KEY": "sk-x"}, "legacy:openai"),
+    ({"ANTHROPIC_API_KEY": "sk-x"}, "legacy:anthropic"),
+    ({"MINIMAX_API_KEY": "sk-x"}, "legacy:minimax"),
+    ({"CLOUDRU_FOUNDATION_MODELS_API_KEY": "sk-x"}, "legacy:cloudru"),
+    ({"GIGACHAT_CREDENTIALS": "sk-x"}, "legacy:gigachat"),
+    ({"OPENAI_COMPATIBLE_API_KEY": "sk-x"}, "legacy:openai-compatible"),
+    ({"OPENAI_COMPATIBLE_BASE_URL": "http://host/v1"}, "legacy:openai-compatible"),
+])
+def test_every_provider_lane_is_projected(env, expected):
+    # Projecting only the five single-key providers made a custom-endpoint install
+    # show an EMPTY pool while it was routing traffic perfectly well.
+    assert expected in {c.connection_id for c in conns.legacy_connections(env)}
+
+
+def test_a_custom_endpoint_projection_carries_its_base_url():
+    projected = conns.legacy_connections({
+        "OPENAI_COMPATIBLE_API_KEY": "sk-x",
+        "OPENAI_COMPATIBLE_BASE_URL": "https://api.example/v1",
+    })[0]
+    assert projected.base_url == "https://api.example/v1"
+    assert projected.kind == conns.KIND_ENDPOINT
+
+
+def test_a_compatible_lane_on_the_legacy_openai_pair_is_still_seen():
+    projected = conns.legacy_connections({
+        "OPENAI_COMPATIBLE_BASE_URL": "https://api.example/v1",
+        "OPENAI_API_KEY": "sk-legacy",
+    })
+    assert {"legacy:openai", "legacy:openai-compatible"} <= {c.connection_id for c in projected}
+
+
+def test_nothing_configured_projects_nothing():
+    assert conns.legacy_connections({}) == ()
