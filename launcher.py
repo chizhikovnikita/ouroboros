@@ -55,6 +55,7 @@ from ouroboros.launcher_bootstrap import (
 from ouroboros.onboarding_wizard import build_onboarding_html, prepare_onboarding_settings
 from ouroboros.platform_layer import (
     BUNDLE_DIR_ENV,
+    IS_LINUX,
     IS_MACOS,
     IS_WINDOWS,
     assign_pid_to_job,
@@ -178,6 +179,74 @@ def _show_windows_message(title: str, message: str) -> None:
         pass
 
 
+_LINUX_GUI_APT_PACKAGES = "python3-gi python3-gi-cairo gir1.2-webkit2-4.1"
+
+
+def _show_linux_message(title: str, message: str) -> None:
+    """Best-effort desktop dialog on Linux.
+
+    Deliberately NOT a webview window: this reports that the webview backend is
+    the thing that is missing. Callers always log and print the same text, so a
+    host with neither dialog tool still tells the owner what to do.
+    """
+    if not IS_LINUX:
+        return
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # No display means no dialog can render; attempting one only adds
+        # "Failed to open display" noise on top of the real message.
+        return
+    for argv in (
+        ["zenity", "--error", f"--title={title}", f"--text={message}"],
+        ["kdialog", "--title", title, "--error", message],
+    ):
+        tool = shutil.which(argv[0])
+        if not tool:
+            continue
+        try:
+            subprocess.run([tool, *argv[1:]], check=False, timeout=30)
+            return
+        except Exception:
+            continue
+
+
+def _prepare_linux_webview_runtime() -> tuple[bool, str]:
+    """Verify the GTK/WebKit backend before importing webview on Linux.
+
+    pywebview renders through the SYSTEM PyGObject + WebKit2GTK; there is no pip
+    package for them, and a venv created without `--system-site-packages` cannot
+    see them at all. Without this check `import webview` dies with a bare
+    traceback that names none of that.
+    """
+    if not IS_LINUX:
+        return True, ""
+
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False, (
+            "No graphical display detected (neither DISPLAY nor WAYLAND_DISPLAY is set).\n"
+            "The desktop UI needs a running desktop session. For a headless host use the "
+            "server instead:\n\n    ouroboros server\n\nthen open http://127.0.0.1:8765."
+        )
+
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import Gtk, WebKit2  # noqa: F401
+    except Exception as exc:
+        return False, (
+            f"The GTK/WebKit backend that the desktop UI renders through is unavailable: {exc}\n\n"
+            "1. Install the system packages:\n"
+            f"     sudo apt install {_LINUX_GUI_APT_PACKAGES}\n\n"
+            "2. If you run from source inside a virtualenv, expose them to it:\n"
+            "     python scripts/setup_linux_desktop.py\n\n"
+            "Prefer the browser UI instead? Run `ouroboros server` and open "
+            "http://127.0.0.1:8765."
+        )
+
+    return True, ""
+
+
 def _prepare_windows_webview_runtime() -> tuple[bool, str]:
     """Prepare pythonnet/pywebview runtime before importing webview on Windows."""
     if not IS_WINDOWS:
@@ -285,6 +354,9 @@ def _bootstrap_context() -> BootstrapContext:
         # Launcher is owner-process boundary; first-launch migration may set runtime mode.
         save_settings=lambda settings: save_settings(settings, allow_elevation=True),
         log=log,
+        # Same frozen check `_bundle_dir()` above keys off, passed by value so the
+        # bootstrap never has to re-derive packaging state on its own.
+        packaged=bool(getattr(sys, "frozen", False)),
     )
 
 
@@ -1071,6 +1143,16 @@ def main():
                 f"{reason}\n\n"
                 "Check launcher.log for details.",
             )
+            return
+
+    if IS_LINUX:
+        ok, reason = _prepare_linux_webview_runtime()
+        if not ok:
+            log.error("Linux UI runtime initialization failed: %s", reason)
+            # stderr too: a source run is started from a terminal, and the owner is
+            # far more likely to be looking at it than at launcher.log.
+            print(f"Ouroboros: desktop UI cannot start.\n\n{reason}", file=sys.stderr)
+            _show_linux_message("Ouroboros — Startup Failed", reason)
             return
 
     import webview

@@ -35,6 +35,11 @@ class BootstrapContext:
     hidden_run: Callable[..., Any]
     save_settings: Callable[[dict], None]
     log: Any
+    # Packaged (frozen) installs bootstrap from the sha-pinned embedded bundle and
+    # MUST fail closed when it is missing or tampered with. Only an unfrozen source
+    # checkout may fall back to bootstrapping from the checkout itself, so this
+    # defaults to the strict answer: a caller that does not opt in stays packaged.
+    packaged: bool = True
 
 
 def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -117,9 +122,12 @@ def _read_json_file(path: pathlib.Path) -> dict[str, Any]:
 
 def _normalize_bundle_manifest(raw: dict[str, Any], *, app_version: str) -> dict[str, Any]:
     manifest = dict(raw)
+    source_mode = bool(manifest.get("source_mode"))
     return {
         "schema_version": int(manifest.get("schema_version") or MANIFEST_SCHEMA_VERSION),
-        "bundle_file": str(manifest.get("bundle_file") or BUNDLE_REPO_NAME),
+        # Source mode has no bundle file at all; defaulting to the packaged name
+        # would write a durable record naming a file that never existed.
+        "bundle_file": "" if source_mode else str(manifest.get("bundle_file") or BUNDLE_REPO_NAME),
         "app_version": str(manifest.get("app_version") or app_version),
         "source_sha": str(manifest.get("source_sha") or ""),
         "release_tag": str(manifest.get("release_tag") or ""),
@@ -135,16 +143,91 @@ def _normalize_bundle_manifest(raw: dict[str, Any], *, app_version: str) -> dict
         "managed_remote_stable_branch": str(
             manifest.get("managed_remote_stable_branch") or DEFAULT_MANAGED_REMOTE_STABLE_BRANCH
         ),
+        # Records WHERE this managed checkout was bootstrapped from, and survives in
+        # `.git/ouroboros-managed.json`: a source-mode repo must stay honest about
+        # having no sha-pinned provenance even after the launcher that made it is gone.
+        # Deliberately absent from `_repo_manifest_matches` tracked keys — an install
+        # predating this field would otherwise read as a mismatch on every boot.
+        "source_mode": source_mode,
     }
+
+
+def _source_checkout_manifest(context: BootstrapContext) -> dict[str, Any] | None:
+    """Synthesize a bootstrap manifest from a live source checkout, or None.
+
+    Running `launcher.py` straight out of a git clone has no embedded `repo.bundle`
+    (it is gitignored and only build scripts produce it), and a development branch
+    cannot even build one — `scripts/build_repo_bundle.py` requires the release tag
+    `v$(cat VERSION)` on HEAD. Rather than dead-ending there, the checkout itself
+    becomes the bootstrap source: the whole downstream path is manifest-driven, so
+    only the manifest and the clone source differ from the packaged flow.
+
+    Returns None unless ALL of the guards hold, so a packaged install can never
+    silently degrade into this weaker-provenance path when its bundle is missing.
+    """
+    if context.packaged:
+        return None
+    if _bundle_manifest_path(context).is_file():
+        return None
+
+    probe = _run_git(
+        context, ["git", "rev-parse", "--is-inside-work-tree"], cwd=context.bundle_dir, check=False
+    )
+    if getattr(probe, "returncode", 1) != 0:
+        return None
+    if str(getattr(probe, "stdout", "") or "").strip() != "true":
+        return None
+
+    head = _run_git(context, ["git", "rev-parse", "HEAD"], cwd=context.bundle_dir, check=False)
+    source_sha = str(getattr(head, "stdout", "") or "").strip()
+    if getattr(head, "returncode", 1) != 0 or not source_sha:
+        # A checkout with no commits yet cannot seed anything.
+        return None
+
+    branch_probe = _run_git(
+        context, ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=context.bundle_dir, check=False
+    )
+    branch = str(getattr(branch_probe, "stdout", "") or "").strip()
+    # A detached HEAD has no upstream branch to track. Empty is the honest answer;
+    # inventing one would point the update channel at a branch nobody asked for.
+    source_branch = "" if branch in ("", "HEAD") else branch
+
+    return _normalize_bundle_manifest(
+        {
+            "bundle_file": "",
+            "app_version": context.app_version,
+            "source_sha": source_sha,
+            "release_tag": "",
+            "bundle_sha256": "",
+            "source_branch": source_branch,
+            "managed_remote_url": _remote_url(context, context.bundle_dir, "origin"),
+            "source_mode": True,
+        },
+        app_version=context.app_version,
+    )
 
 
 def load_bundle_manifest(context: BootstrapContext) -> dict[str, Any]:
     manifest_path = _bundle_manifest_path(context)
     if not manifest_path.is_file():
-        raise RuntimeError(
-            f"Embedded managed repo manifest is missing: {manifest_path}. "
-            "Rebuild the app bundle with scripts/build_repo_bundle.py."
+        source_manifest = _source_checkout_manifest(context)
+        if source_manifest is None:
+            raise RuntimeError(
+                f"Embedded managed repo manifest is missing: {manifest_path}. "
+                "Rebuild the app bundle with scripts/build_repo_bundle.py. "
+                "Running from source instead? The launcher then bootstraps from the git "
+                "checkout it lives in, so run it from inside a checkout that has at least "
+                "one commit."
+            )
+        context.log.info(
+            "Source-mode bootstrap: seeding the managed repo from the checkout at %s "
+            "(HEAD %s, branch %r). This path is NOT sha-pinned to a released bundle — "
+            "its provenance is whatever that checkout has committed.",
+            context.bundle_dir,
+            source_manifest["source_sha"][:12],
+            source_manifest["source_branch"] or "(detached)",
         )
+        return source_manifest
     manifest = _normalize_bundle_manifest(_read_json_file(manifest_path), app_version=context.app_version)
     if manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
         raise RuntimeError(
@@ -338,17 +421,27 @@ def _ensure_managed_remote(context: BootstrapContext, repo_dir: pathlib.Path, ma
 
 
 def _clone_repo_from_bundle(context: BootstrapContext, manifest: dict[str, Any]) -> pathlib.Path:
-    bundle_path = context.bundle_dir / manifest["bundle_file"]
-    if not bundle_path.is_file():
-        raise RuntimeError(
-            f"Embedded managed repo bundle is missing: {bundle_path}. "
-            "Rebuild the app bundle with scripts/build_repo_bundle.py."
-        )
+    if manifest.get("source_mode"):
+        # The checkout itself is the seed. --no-hardlinks keeps the managed repo's
+        # object store independent: with git's default local-clone hardlinking, a
+        # `git gc` in the developer's checkout would reach into the running runtime's
+        # objects. Only committed state is copied — an uncommitted working tree is
+        # deliberately not part of what the agent gets to run.
+        clone_source = str(context.bundle_dir)
+        clone_args = ["git", "clone", "--no-hardlinks", clone_source]
+    else:
+        bundle_path = context.bundle_dir / manifest["bundle_file"]
+        if not bundle_path.is_file():
+            raise RuntimeError(
+                f"Embedded managed repo bundle is missing: {bundle_path}. "
+                "Rebuild the app bundle with scripts/build_repo_bundle.py."
+            )
+        clone_args = ["git", "clone", str(bundle_path)]
 
     temp_repo = context.repo_dir.parent / f".repo-bootstrap-{uuid.uuid4().hex[:8]}"
     _remove_if_exists(temp_repo)
     try:
-        _run_git(context, ["git", "clone", str(bundle_path), str(temp_repo)], cwd=context.bundle_dir)
+        _run_git(context, [*clone_args, str(temp_repo)], cwd=context.bundle_dir)
         _configure_managed_clone(context, temp_repo, manifest)
         return temp_repo
     except Exception:

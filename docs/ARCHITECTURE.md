@@ -262,6 +262,7 @@ build.sh                      ← macOS build (PyInstaller → .dmg)
 build_linux.sh                ← Linux build (PyInstaller → .tar.gz)
 build_windows.ps1             ← Windows build (PyInstaller → .zip)
 scripts/build_repo_bundle.py  ← Builds `repo.bundle` + `repo_bundle_manifest.json` for packaged releases
+scripts/setup_linux_desktop.py ← Source-run helper: exposes the system PyGObject/WebKit2GTK to a virtualenv so the desktop UI can render on Linux (packaged builds do not need it)
 scripts/run_external_review.py ← dual-lane non-committing review wrapper. The default operator lane reviews the staged tree through the production advisory→triad→scope cycle with resolved production policy. `--contributor` reviews an exact committed target-base..head proposal in a detached target-base checkout, forces shipped target-base triad/scope models and efforts through OpenRouter with blocking enforcement, excludes Claude advisory, forbids contributor VERSION allocation, and emits a redacted SHA-bound `review-evidence.json`/`review-packet.zip`. Contributor `READY_FOR_INTEGRATION` is triage evidence, never merge authority: final version carriers and production review belong to the maintainer squash landing. Both lanes use the production triad/scope substrate and fresh non-live observability roots.
 scripts/run_plan_review.py ← v6.43.0 operator plan-review tool: invokes the reviewer-panel portion of `ouroboros.tools.plan_review` from outside the runtime, loading BIBLE/DEVELOPMENT/ARCHITECTURE/CHECKLISTS, the proposed plan, optional touched-file snapshots, and optional generated Atlas context. Inputs: `--plan`, explicit `--context-level`, optional `--files-to-touch`/`--extra-context`/`--drive-root`. Output: full raw reviewer responses plus coordinated plan-review output to stdout (and optional `--output PATH`), with no truncation. It deliberately skips the live planning-scout swarm because that requires a running worker/supervisor environment. Not part of the runtime gate; review-exempt dev tool.
 scripts/cleanup_test_pollution.py ← Dry-run-first cleanup utility for local test-pollution artifacts: known test skill state dirs, stale `__extension_imports`, and accidental `MagicMock`-named repo-root files. Use `--apply` only after inspecting planned removals.
@@ -1001,6 +1002,15 @@ Shown when `settings.json` does not contain any supported remote provider key an
 
 ### Launcher-managed bundle bootstrap
 
+The bootstrap is manifest-driven and has **two** sources. Which one applies is
+decided by `BootstrapContext.packaged` (set from `sys.frozen` in
+`launcher.py::_bootstrap_context`), never re-derived downstream:
+
+| Source | When | Provenance |
+|---|---|---|
+| Embedded `repo.bundle` | Packaged (frozen) builds | SHA-256 pinned against the manifest |
+| The git checkout itself | Unfrozen source run with no manifest present | Whatever that checkout has committed |
+
 Packaged releases ship an embedded git bundle (`repo.bundle`) plus
 `repo_bundle_manifest.json`. On the first launcher-managed run the launcher:
 
@@ -1014,6 +1024,23 @@ Packaged releases ship an embedded git bundle (`repo.bundle`) plus
   If a newer app bundle carries different embedded repo metadata, the
   launcher refreshes the managed remote/manifest metadata in place instead
   of archiving and replacing an existing git checkout.
+
+**Source-mode bootstrap.** Running `python launcher.py` out of a git clone has no
+embedded bundle — `repo.bundle` is gitignored and only build scripts produce it —
+and a development branch cannot build one either, because
+`scripts/build_repo_bundle.py` requires the release tag `v$(cat VERSION)` on HEAD.
+`_source_checkout_manifest` therefore synthesizes a manifest from live git and the
+checkout becomes the clone source (`git clone --no-hardlinks`, so a `git gc` in the
+developer's checkout cannot reach the running runtime's objects). Only committed
+state is seeded; an uncommitted working tree is deliberately not what the agent runs.
+Such a manifest carries `source_mode: true` with empty `release_tag`, `bundle_file`,
+and `bundle_sha256`, and that record persists in `.git/ouroboros-managed.json` — a
+source-mode checkout stays honest about having no sha-pinned provenance. The
+disclosure is also logged at bootstrap.
+
+This path is gated so a packaged install can never silently degrade into it: it
+requires `packaged=False` **and** an absent manifest **and** a real git work tree.
+A packaged build with a missing or tampered bundle still fails closed.
 
 Git remotes are role-based. `managed` is the official read/update source for
 release provenance and explicit Updates-panel application. `origin` is the
@@ -1206,6 +1233,7 @@ A left `#primary-sidebar` of ROWS (`.nav-row`, not an icon rail): Chat (Main), a
 - `web/modules/skill_card_renderer.js` renders installed Skills cards from shared lifecycle/review/grant state.
 - `web/modules/update_status.js` (v6.41.0) renders the main-screen Update pill + the staged auto/assisted/manual dialog; `web/modules/activity.js` (v6.41.0) renders the Dashboard Activity subtab (cron schedules, running/queued tasks, background consciousness) with direct mechanical controls. Both use the shared `.btn` button system.
 - `web/modules/toast.js`, `masonry.js`, and CSS tokens in `style.css` keep cards/notifications/layout consistent without a build system.
+
 
 Rationale: frontend work should not require understanding supervisor, worker, marketplace, extension, MCP, local-model, and settings internals at once. The Gateway Boundary and API client keep browser code pointed at one explicit contract.
 
@@ -2893,6 +2921,11 @@ success and failure.
    `repo.bundle` once, then continue from the managed git checkout. Ordinary
    restarts preserve the local branch tip; explicit Update Now is the only
    path that resets the active branch to a user-approved official SHA.
+   An unfrozen source run has no bundle to pin to and seeds from its own git
+   checkout instead (`source_mode: true`, empty `release_tag`/`bundle_sha256`);
+   a moving development HEAD updates that metadata and never re-clones over the
+   managed checkout. Packaged installs never take this path — a missing or
+   tampered bundle still fails closed.
 8. **Zero orphans on close**: shutdown MUST kill all child processes (see Section 9)
 9. **Panic MUST kill everything**: all processes (workers, subprocesses, subprocess
    trees, consciousness, evolution) are killed and the application exits completely.

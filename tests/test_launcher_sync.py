@@ -6,6 +6,8 @@ import subprocess
 import sys
 import types
 
+import pytest
+
 import ouroboros.launcher_bootstrap as bootstrap_module
 
 
@@ -557,3 +559,141 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     record = json.loads((data_dir / "state" / "server_process.json").read_text(encoding="utf-8"))
     assert record["pid"] == 54321
     assert record["port"] == 8765
+
+
+# --- Source-mode bootstrap (running launcher.py straight out of a git checkout) ---
+
+
+def _make_source_context(bundle_dir, repo_dir):
+    """Context for an UNPACKAGED launcher, i.e. `python launcher.py` from a clone."""
+    return bootstrap_module.BootstrapContext(
+        bundle_dir=bundle_dir,
+        repo_dir=repo_dir,
+        data_dir=repo_dir.parent / "data",
+        settings_path=repo_dir.parent / "settings.json",
+        embedded_python=sys.executable,
+        app_version="4.50.0-rc.2",
+        hidden_run=subprocess.run,
+        save_settings=lambda settings: None,
+        log=_log_stub(),
+        packaged=False,
+    )
+
+
+def test_source_mode_bootstraps_from_checkout_without_any_bundle(tmp_path):
+    """A source checkout seeds the managed repo directly, with no repo.bundle."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+
+    # Deliberately NO _write_bundle(): this is the state of every fresh clone.
+    assert not (src / "repo_bundle_manifest.json").exists()
+
+    ctx = _make_source_context(src, repo_dir)
+    outcome = bootstrap.ensure_managed_repo(ctx)
+
+    assert outcome == "created"
+    assert (repo_dir / "server.py").read_text(encoding="utf-8") == "print('bundle-v1')\n"
+    assert _git_output(repo_dir, "branch", "--show-current") == "ouroboros"
+    # The managed remote still points at the checkout's own origin, so the update
+    # channel keeps working against the real upstream.
+    assert _git_output(repo_dir, "remote", "get-url", "managed") == (
+        "https://github.com/razzant/ouroboros.git"
+    )
+    assert "origin" not in set(_git_output(repo_dir, "remote").splitlines())
+
+    meta = bootstrap.load_repo_manifest(repo_dir)
+    assert meta["source_mode"] is True
+    assert meta["source_sha"] == _git_output(src, "rev-parse", "HEAD")
+    # Source mode is honest about carrying no sha-pinned bundle provenance.
+    assert meta["bundle_sha256"] == ""
+    assert meta["release_tag"] == ""
+
+
+def test_source_mode_does_not_hardlink_into_the_developer_checkout(tmp_path):
+    """`git gc` in the checkout must not be able to reach runtime objects."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+
+    bootstrap.ensure_managed_repo(_make_source_context(src, repo_dir))
+
+    assert not (repo_dir / ".git" / "objects" / "info" / "alternates").exists()
+    src_inodes = {p.stat().st_ino for p in (src / ".git" / "objects").rglob("*") if p.is_file()}
+    repo_inodes = {p.stat().st_ino for p in (repo_dir / ".git" / "objects").rglob("*") if p.is_file()}
+    assert src_inodes and repo_inodes
+    assert not (src_inodes & repo_inodes)
+
+
+def test_packaged_context_without_manifest_still_fails_closed(tmp_path):
+    """A packaged install must never degrade into source mode when its bundle is gone."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+
+    # Same git checkout that source mode happily bootstraps from — the ONLY
+    # difference is packaged=True, and that alone must keep it closed.
+    ctx = _make_context(src, repo_dir)
+
+    with pytest.raises(RuntimeError, match="manifest is missing"):
+        bootstrap.ensure_managed_repo(ctx)
+    assert not repo_dir.exists()
+
+
+def test_source_mode_restart_after_new_commit_preserves_managed_checkout(tmp_path):
+    """A moving dev HEAD updates metadata; it never re-clones over the runtime."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+    ctx = _make_source_context(src, repo_dir)
+
+    assert bootstrap.ensure_managed_repo(ctx) == "created"
+    # Something the agent authored in its own managed checkout after bootstrap.
+    (repo_dir / "agent_work.txt").write_text("do not clobber me\n", encoding="utf-8")
+
+    (src / "server.py").write_text("print('bundle-v2')\n", encoding="utf-8")
+    _run(["git", "commit", "-am", "bundle v2"], cwd=src)
+
+    assert bootstrap.ensure_managed_repo(ctx) == "metadata-updated"
+    assert (repo_dir / "agent_work.txt").exists()
+    assert (repo_dir / "server.py").read_text(encoding="utf-8") == "print('bundle-v1')\n"
+
+
+def test_source_mode_tolerates_detached_head_and_missing_origin(tmp_path):
+    """No branch and no remote is a legitimate checkout state, not a crash."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+    _run(["git", "remote", "remove", "origin"], cwd=src)
+    _run(["git", "checkout", "--detach", "HEAD"], cwd=src)
+
+    ctx = _make_source_context(src, repo_dir)
+    assert bootstrap.ensure_managed_repo(ctx) == "created"
+
+    meta = bootstrap.load_repo_manifest(repo_dir)
+    assert meta["source_mode"] is True
+    assert meta["managed_remote_branch"] == ""
+    assert meta["managed_remote_url"] == ""
+    # A repo with no managed remote must still be a usable checkout.
+    assert _git_output(repo_dir, "branch", "--show-current") == "ouroboros"
+
+
+def test_source_mode_ignored_when_checkout_is_not_a_git_worktree(tmp_path):
+    bootstrap = _reload_bootstrap()
+    plain_dir = tmp_path / "not-a-checkout"
+    plain_dir.mkdir()
+    repo_dir = tmp_path / "repo"
+
+    with pytest.raises(RuntimeError, match="manifest is missing"):
+        bootstrap.ensure_managed_repo(_make_source_context(plain_dir, repo_dir))
+
+
+def test_source_mode_manifest_does_not_claim_a_bundle_file(tmp_path):
+    """The durable record must not name a repo.bundle that never existed."""
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    repo_dir = tmp_path / "repo"
+
+    bootstrap.ensure_managed_repo(_make_source_context(src, repo_dir))
+
+    assert bootstrap.load_repo_manifest(repo_dir)["bundle_file"] == ""

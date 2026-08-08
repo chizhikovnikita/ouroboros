@@ -188,6 +188,26 @@ ran `mkdir ~/Desktop` instead of creating an Ouroboros project even though
 `promote_chat_to_task(project_name=…)` already described exactly that — the fix was a
 structural `ensure_project_scope` in-task affordance, not a new SYSTEM.md rule.
 
+### Anti-pattern: host prerequisites discovered as a bare import traceback
+
+A prerequisite that lives OUTSIDE the Python dependency set — a system library, a
+display server, a distro package — must be verified by an explicit preflight that
+names the fix, not left to surface as whatever exception the importing library
+happens to raise. `requirements*.txt` cannot express it, so nothing else will.
+
+Pattern instance: `launcher.py` guarded the Windows UI runtime with
+`_prepare_windows_webview_runtime()` and an actionable message, while the Linux path
+went straight into `import webview`. pywebview on Linux renders through the system
+PyGObject + WebKit2GTK, which is not installable from PyPI and is invisible to a
+virtualenv built without `--system-site-packages` — the default that README's own
+source setup produces. Every source-run Linux user therefore hit a bare
+`ModuleNotFoundError: No module named 'gi'` from inside a third-party library, with
+nothing naming the packages, the venv wiring, or the working browser alternative.
+The fix is `_prepare_linux_webview_runtime()` plus `scripts/setup_linux_desktop.py`.
+
+When one platform already has such a preflight, the others are not exempt: an
+asymmetric guard is a gap, not a design.
+
 ### Anti-pattern: hand-maintained model pricing and admission-by-price
 
 Do not add manually maintained model-price tables, prefix-inherited tariffs, or

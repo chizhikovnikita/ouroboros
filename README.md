@@ -148,6 +148,31 @@ ouroboros server
 
 Then open `http://127.0.0.1:8765` in your browser. The setup wizard will guide you through API key configuration.
 
+### Desktop window from source
+
+`ouroboros server` above is the browser path and needs nothing extra. To run the native
+desktop shell from a checkout instead, install the launcher dependencies and start
+`launcher.py`:
+
+```bash
+python -m pip install -r requirements-launcher.txt
+python launcher.py
+```
+
+On **Linux** the window renders through the system PyGObject + WebKit2GTK, which cannot
+come from PyPI. Install them from the distro and expose them to your virtualenv:
+
+```bash
+sudo apt install python3-gi python3-gi-cairo gir1.2-webkit2-4.1
+python scripts/setup_linux_desktop.py          # adds one .pth to the venv; --check to verify only
+```
+
+The venv must be built on the same Python minor version as the system interpreter, since
+`gi` ships a compiled extension; the script checks this and tells you if it does not match.
+A source run needs no `repo.bundle` — the launcher seeds `~/Ouroboros/repo/` from the
+checkout it lives in, so its provenance is whatever that checkout has committed rather
+than a signed release.
+
 ### Google Colab
 
 Use [`notebooks/colab_quickstart.py`](notebooks/colab_quickstart.py) as a Colab-compatible cell script when you need a source-mode runtime without the desktop UI. It keeps runtime data on Google Drive and preserves the original Colab path without making it the primary installation flow.
