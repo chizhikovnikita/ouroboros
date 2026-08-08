@@ -129,6 +129,11 @@ class AttemptRequest:
     source: str = ""
     root_limit_usd: Optional[float] = None
     force_unknown_reservation: bool = False
+    # WHICH pooled connection carried this send. Captured where the connection is
+    # chosen and passed by value, never re-derived later from the model string:
+    # two connections to the same provider are indistinguishable by model alone,
+    # and per-connection rating and in-flight counting both key off this.
+    connection_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,7 @@ class AttemptReservation:
     model: str
     provider: str
     reservation_upper_bound_usd: Optional[float]
+    connection_id: str = ""
 
 
 @contextlib.contextmanager
@@ -673,6 +679,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "state": "reserved",
                     "model": str(request.model or ""),
                     "provider": str(request.provider or "unknown"),
+                    "connection_id": str(request.connection_id or ""),
                     "reservation_upper_bound_usd": bound,
                     "pricing_known": pricing_known,
                     "reservation_basis": (
@@ -695,7 +702,10 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     bucket = _ATTEMPT_COLLECTOR.get()
     if bucket is not None:
         bucket.append(attempt_id)
-    return AttemptReservation(attempt_id, root, request.model, request.provider, bound)
+    return AttemptReservation(
+        attempt_id, root, request.model, request.provider, bound,
+        str(request.connection_id or ""),
+    )
 
 
 def record_unmetered_external_dispatch(
@@ -1182,6 +1192,32 @@ def _is_tos_rejection(exc: BaseException) -> bool:
     return status == 403 or "error code: 403" in text or '"code": 403' in text or "'code': 403" in text
 
 
+def _note_connection_outcome(reservation: AttemptReservation, exc: BaseException | None) -> None:
+    """Feed the pool's rotation signal from the one place every send lands.
+
+    Best-effort by design: routing health is a hint, and failing an otherwise
+    successful accounting path over it would trade a real result for a heuristic.
+    A bad credential keeps failing, so it is separated from a transient error and
+    earns a much longer rest.
+    """
+    connection_id = str(getattr(reservation, "connection_id", "") or "")
+    if not connection_id:
+        return
+    try:
+        from ouroboros.connection_pool import note_failure, note_success
+
+        if exc is None:
+            note_success(connection_id)
+            return
+        text = f"{type(exc).__name__}: {exc}".lower()
+        kind = "auth" if any(
+            marker in text for marker in ("401", "403", "invalid api key", "unauthorized", "authentication")
+        ) else "error"
+        note_failure(connection_id, kind=kind)
+    except Exception:
+        log.debug("connection health note skipped", exc_info=True)
+
+
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> None:
     """Route a raised provider send to its honest terminal ledger state."""
     provider = str(reservation.provider or "").strip().lower()
@@ -1217,11 +1253,13 @@ def execute_physical_attempt(
     try:
         response = send()
     except BaseException as exc:
+        _note_connection_outcome(reservation, exc)
         try:
             _terminalize_failed_attempt(reservation, exc)
         except Exception:
             log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
         raise
+    _note_connection_outcome(reservation, None)
     try:
         usage, cost, final = extractor(response)
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)
@@ -1248,11 +1286,13 @@ async def execute_physical_attempt_async(
     try:
         response = await send()
     except BaseException as exc:
+        _note_connection_outcome(reservation, exc)
         try:
             _terminalize_failed_attempt(reservation, exc)
         except Exception:
             log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
         raise
+    _note_connection_outcome(reservation, None)
     try:
         usage, cost, final = extractor(response)
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)

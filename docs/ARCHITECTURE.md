@@ -120,6 +120,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── launcher_bootstrap.py ← Bundle-to-repo bootstrap and managed sync helpers (used by launcher.py)
       ├── provider_models.py   ← Provider-specific model ID helpers, direct-provider defaults (OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat)
       ├── connections.py       ← Connection registry (stage 1): every usable route to models — API keys, subscription accounts, endpoints — as a first-class entity with a stable id, an owner-declared data-privacy value and its own limits. Catalog in `state/connections.json`, credentials in a sibling `state/connections_secrets.json` (0600); legacy single-provider keys are PROJECTED, never copied, so a one-key install keeps working with an empty registry
+      ├── connection_pool.py   ← Connection selection (stage 2): eligibility, load spreading, per-connection concurrency ceilings, cooldown/failover, and the overlay onto the provider target. In-flight is DERIVED from reserved/dispatched ledger rows (cross-process by construction), never stored separately
       ├── runtime_mode_policy.py ← Runtime-mode protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by registry, git tools, and Claude gateway guards
       ├── schedule_contract.py ← Schedule id, 5-field cron, and IANA timezone validation SSOT shared by gateway, manifests, and supervisor queue
       ├── reflection.py        ← Execution reflection and pattern capture
@@ -1033,6 +1034,41 @@ page keeps working with an empty registry — the provider-independence invarian
 value: whether a vendor trains on submitted data is a contractual fact no probe can
 discover, so an omitted declaration is never read as permission. The sensitivity
 gate (stage 4) keys off an explicit `no_training` only.
+
+### Connection selection (the pool orchestrator)
+
+`connection_pool.select()` chooses which pooled route carries one send;
+`apply_to_target` overlays it onto the provider dict `llm._resolve_remote_target`
+already built. The overlay replaces only the credential and endpoint fields, so
+provider knowledge (headers, capability flags, GigaChat's non-OpenAI transport)
+stays where it was, and an empty registry returns the environment-derived target
+byte-identical to the pre-pool behavior.
+
+**None is a first-class answer.** No registry, or a single legacy-projected key,
+means "no opinion" and the caller keeps the old path — that is what preserves
+provider independence rather than a separate compatibility branch.
+`OUROBOROS_DISABLE_CONNECTION_POOL=1` forces that answer globally.
+
+**In-flight is derived, not stored.** Workers are separate processes, so an
+in-memory busy counter would read zero in a sibling. The usage ledger already
+appends a `reserved` row under a cross-process lock and moves it to a terminal
+state on settle, so the number of reserved-or-dispatched rows for a
+`connection_id` IS its in-flight count. A second concurrency store would be a
+second truth that can disagree with the money ledger. An unreadable ledger
+degrades to "spread by chance", never to "cannot route".
+
+`connection_id` is stamped on the target where the connection is chosen and
+travels by value into `AttemptRequest` and the ledger row — never re-derived from
+the model string later, because two connections to the same provider are
+indistinguishable by model alone.
+
+Rotation health is fed from `usage_accounting._note_connection_outcome`, the one
+place every physical send lands: a failure cools the connection down (a bad
+credential rests far longer than a transient error, since it will keep failing), a
+success clears it. Cooldowns are process-local and time-based on purpose — a hint
+that decays, not durable state an owner must undo by hand. If every candidate is
+resting, one is still tried: failing a task over a hint would be worse than the
+retry.
 
 ### Launcher-managed bundle bootstrap
 

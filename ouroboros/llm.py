@@ -198,6 +198,8 @@ def _attempt_request(
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
+        # Identity captured where the connection was chosen, passed by value.
+        connection_id=str(target.get("connection_id") or ""),
         prompt_tokens_estimate=max(0, prompt_chars // 4),
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
@@ -1232,6 +1234,23 @@ class LLMClient:
         return f"openai-compatible/{resolved_model}"
 
     def _resolve_remote_target(self, model: str) -> Dict[str, Any]:
+        """Provider target for ``model``, with a pooled connection overlaid.
+
+        The environment-derived target is built first and unchanged; the pool then
+        replaces only the credential/endpoint fields and stamps which connection
+        was chosen. With an empty registry the overlay is a no-op, so this returns
+        exactly what it returned before the pool existed.
+        """
+        target = self._resolve_remote_target_from_env(model)
+        try:
+            from ouroboros.connection_pool import apply_to_target
+
+            return apply_to_target(target, model)
+        except Exception:
+            log.debug("connection pool overlay unavailable", exc_info=True)
+            return target
+
+    def _resolve_remote_target_from_env(self, model: str) -> Dict[str, Any]:
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
 
