@@ -14,6 +14,11 @@ export function renderMobileNavToggle() {
 
 export function renderPageHeader({
     title,
+    // Opt-in localization keys: a caller that supplies them gets data-i18n markup
+    // that the page's own applyStaticTranslations pass resolves. Callers that do
+    // not are untouched, so this stays additive for every other page.
+    titleKey = '',
+    descriptionKey = '',
     icon = '',
     description = '',
     leadingHtml,
@@ -31,7 +36,7 @@ export function renderPageHeader({
         ? leadingHtml
         : (showMobileNav ? renderMobileNavToggle() : '');
     const descriptionHtml = description
-        ? `<p class="app-page-description">${escapeHtml(description)}</p>`
+        ? `<p class="app-page-description"${descriptionKey ? ` data-i18n="${escapeHtml(descriptionKey)}"` : ''}>${escapeHtml(description)}</p>`
         : '';
     const toolbar = (toolbarHtml || actionsHtml)
         ? `<div class="app-page-toolbar app-page-actions">${toolbarHtml || actionsHtml}</div>`
@@ -48,7 +53,7 @@ export function renderPageHeader({
             <div class="app-page-title-block">
                 <div class="app-page-title-row">
                     ${iconHtml}
-                    <h2 class="app-page-title">${escapeHtml(title)}</h2>
+                    <h2 class="app-page-title"${titleKey ? ` data-i18n="${escapeHtml(titleKey)}"` : ''}>${escapeHtml(title)}</h2>
                 </div>
                 ${descriptionHtml}
             </div>
@@ -116,6 +121,7 @@ export function renderTabStrip({
                 ${attr}="${escapeHtml(value)}"
                 role="tab"
                 aria-selected="${isActive ? 'true' : 'false'}"
+                ${item.i18nKey ? `data-i18n="${escapeHtml(item.i18nKey)}"` : ''}
             >
                 ${escapeHtml(item.label ?? value)}
                 ${pill}

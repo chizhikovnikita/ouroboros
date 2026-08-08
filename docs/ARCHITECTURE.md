@@ -18,7 +18,7 @@ launcher.py (PyWebView)       ← desktop window, immutable outer shell (tracked
   ▼
 server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (default localhost:8765; Docker/non-loopback supported via OUROBOROS_SERVER_HOST=0.0.0.0)
   │
-  ├── web/                     ← Web UI (SPA with ES modules in web/modules/)
+  ├── web/                     ← Web UI (SPA with ES modules in web/modules/; UI strings in web/locales/)
   │
   ├── supervisor/              ← Background thread inside server.py
   │   ├── message_bus.py       ← Queue-based local message bus (Web UI + reviewed transport skills)
@@ -1233,7 +1233,33 @@ A left `#primary-sidebar` of ROWS (`.nav-row`, not an icon rail): Chat (Main), a
 - `web/modules/skill_card_renderer.js` renders installed Skills cards from shared lifecycle/review/grant state.
 - `web/modules/update_status.js` (v6.41.0) renders the main-screen Update pill + the staged auto/assisted/manual dialog; `web/modules/activity.js` (v6.41.0) renders the Dashboard Activity subtab (cron schedules, running/queued tasks, background consciousness) with direct mechanical controls. Both use the shared `.btn` button system.
 - `web/modules/toast.js`, `masonry.js`, and CSS tokens in `style.css` keep cards/notifications/layout consistent without a build system.
+- `web/modules/i18n_core.js` (pure translator/`data-i18n` applier) + `web/modules/i18n.js` (IO: resolves the language, loads the catalog). Catalogs live in `web/locales/<lang>.json`; English needs none because it is the default argument at every call site.
 
+### Interface localization
+
+English is not a catalog entry — it is the second argument of every `t(key, 'English')`
+call and the literal text of every `data-i18n` element. Consequences that are the whole
+point of the design: the source stays readable, there is no `en.json` to drift, a missing
+translation renders correct English rather than a blank or a raw key, and `web/tests/*`
+can import any localized module under node with no server and still assert English.
+
+Delivery has two paths because the UI has two hosts:
+
+| Host | Catalog arrives by |
+|---|---|
+| SPA | `i18n.js` fetches `/static/locales/<lang>.json` under a top-level `await`, so every importer is suspended until it lands |
+| Setup wizard | `build_onboarding_html` INLINES the catalog into the document — `onboarding_wizard.js` is injected into a plain `<script>` and has no imports to reach a shared module with |
+
+`UI_LANGUAGE` in settings is the single authority (no `localStorage` mirror); `""` means
+follow the browser, which is also the only thing the first-run wizard can do because no
+setting exists yet. Language changes apply on reload.
+
+**Chrome only.** `t()` localizes interface labels. Message bodies, model and provider
+names, task titles, file paths, and log payloads are never routed through it, and
+`web/tests/i18n.test.js` mechanically enforces that translation keys are string literals
+so a data value cannot become a key. This is why the UI is localized at the call site
+rather than by rewriting text nodes in the DOM: a DOM-rewriting layer cannot tell a label
+from the agent's own output.
 
 Rationale: frontend work should not require understanding supervisor, worker, marketplace, extension, MCP, local-model, and settings internals at once. The Gateway Boundary and API client keep browser code pointed at one explicit contract.
 

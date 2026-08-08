@@ -232,6 +232,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # declaration, so a pre-v6.80.0 settings.json and an env allowlist forwarding the
     # mode without this key both leave the BIBLE P3 scope gate ON.
     "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "",
+    # Web UI display language. "" means AUTO — the browser's own language decides,
+    # which is why the shipped default is empty rather than "en": an existing
+    # install keeps whatever its browser already produced. Interface chrome only;
+    # it never affects the language the agent thinks or answers in.
+    "UI_LANGUAGE": "",
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
@@ -1511,6 +1516,10 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     # LAN-reachable server silently became loopback at the first self-restart and stayed
     # there. A default standing in for an absent key is not an owner decision.
     "OUROBOROS_SERVER_HOST",
+    # Browser-display preference read by the SPA over /api/settings. Nothing in a
+    # worker, tool, or subprocess consults it, and exporting it would put a
+    # locale-shaped variable into every child env for no consumer.
+    "UI_LANGUAGE",
 })
 
 

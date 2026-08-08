@@ -10,6 +10,7 @@ import {
     reloadSubagentsSection,
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
+import { applyStaticTranslations, t } from './i18n.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
@@ -35,6 +36,9 @@ const INPUT_FIELDS = [
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
+    // Display-only preference; "" is a legitimate saved value meaning "follow the
+    // browser", so it deliberately carries no fallback.
+    ['s-ui-language', 'UI_LANGUAGE'],
     ['s-evo-budget', 'OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD', '0'],
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
 ];
@@ -105,7 +109,7 @@ function resetSecretClearFlags(root) {
         input.type = 'password';
     });
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.textContent = 'Show';
+        button.textContent = t('settings.show', 'Show');
     });
 }
 
@@ -121,8 +125,8 @@ function wireSecretRow(row) {
     const toggle = row.querySelector('[data-row-secret-toggle]');
     const clear = row.querySelector('[data-row-secret-clear]');
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
-    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
+    if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? t('settings.show', 'Show') : t('settings.hide', 'Hide'); });
+    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = t('settings.show', 'Show'); markSettingsDirty(); });
 }
 
 function customSecretRow(key = '', value = '') {
@@ -336,6 +340,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     page.id = 'page-settings';
     page.className = 'page app-page-glass';
     page.innerHTML = renderSettingsPage();
+    // Immediately after innerHTML and BEFORE any binding writes dynamic text:
+    // this pass only rewrites elements carrying data-i18n, so running it later
+    // would clobber values the bindings had already computed.
+    applyStaticTranslations(page);
     document.getElementById('content').appendChild(page);
 
     const activateSettingsTab = (tabName) => {
@@ -391,7 +399,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (!visible) return;
         if (button && button.dataset.busy !== '1' && button.dataset.ready !== '1') {
             button.disabled = false;
-            button.textContent = 'Repair Runtime';
+            button.textContent = t('settings.repair_runtime', 'Repair Runtime');
         }
     }
 
@@ -401,7 +409,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             saveBtn.disabled = !settingsLoaded;
             saveBtn.title = settingsLoaded
                 ? ''
-                : 'Reload current settings successfully before saving.';
+                : t('settings.reload_before_saving', 'Reload current settings successfully before saving.');
         }
     }
 
@@ -757,7 +765,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const key = (keyInput?.value || '').trim().toUpperCase();
             const error = row.querySelector('[data-custom-secret-error]');
             if (!key) return;
-            if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Use uppercase letters, numbers, and underscores.'; } return; }
+            if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = t('settings.custom_key_format', 'Use uppercase letters, numbers, and underscores.'); } return; }
             if (row.dataset.removeCustomSecret === '1' || valueInput?.dataset.forceClear === '1') { body[key] = ''; return; }
             const value = valueInput?.value || '';
             if (value && !value.includes('...')) body[key] = value;

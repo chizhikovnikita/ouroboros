@@ -1,5 +1,6 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml, formatUsdWhole, renderMarkdown } from './utils.js';
 import { renderPageHeader } from './page_header.js';
+import { applyStaticTranslations, t } from './i18n.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
@@ -398,7 +399,7 @@ export function createChatInstance({
     // Evolve/Restart/Panic/budget chrome, which belongs to the one agent, not a
     // single project thread). The main chat keeps the full overlay header.
     const headerHtml = asPanel
-        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
+        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline" data-i18n="chat.connecting">Connecting...</span></div>`
         : renderPageHeader({
             title: title,
             icon: PAGE_ICONS.chat,
@@ -406,24 +407,24 @@ export function createChatInstance({
             className: 'chat-page-header',
             actionsHtml: `
                 <div class="chat-header-actions" id="chat-header-actions">
-                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
-                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent" data-i18n="chat.restart">Restart</button>
+                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers" data-i18n="chat.panic">Panic</button>
                     <details class="chat-header-more">
-                        <summary class="chat-header-btn" title="More agent controls">More</summary>
+                        <summary class="chat-header-btn" title="More agent controls" data-i18n="chat.more">More</summary>
                         <div class="chat-header-menu">
-                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness" data-i18n="chat.consciousness">Consciousness</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode" data-i18n="chat.evolve">Evolve</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now" data-i18n="chat.review">Review</button>
                         </div>
                     </details>
                 </div>
                 <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
-                    <span class="chat-budget-text" id="chat-budget-text">Loading…</span>
+                    <span class="chat-budget-text" id="chat-budget-text" data-i18n="chat.loading">Loading…</span>
                     <div class="chat-budget-bar">
                         <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
                     </div>
                 </button>
-                <span id="chat-status" class="status-badge offline">Connecting...</span>
+                <span id="chat-status" class="status-badge offline" data-i18n="chat.connecting">Connecting...</span>
             `,
         });
     page.innerHTML = `
@@ -434,10 +435,10 @@ export function createChatInstance({
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending." data-i18n="chat.swarm">Swarm</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
-                            <button class="chat-seg" type="button" data-mode="low">Low</button>
-                            <button class="chat-seg" type="button" data-mode="max">Max</button>
+                            <button class="chat-seg" type="button" data-mode="low" data-i18n="chat.low">Low</button>
+                            <button class="chat-seg" type="button" data-mode="max" data-i18n="chat.max">Max</button>
                         </div>
                     </div>
                 </div>
@@ -451,12 +452,15 @@ export function createChatInstance({
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
                         </button>
-                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
+                        <button class="chat-send-inline" id="chat-send" title="Send message" data-i18n="chat.send">Send</button>
                     </div>
                 </div>
             </div>
         </div>
     `;
+    // Chrome only — this pass touches nothing but elements carrying data-i18n,
+    // so message bodies, model names, and task titles are never rewritten.
+    applyStaticTranslations(page);
     if (idPrefix !== 'chat') {
         // Instance-namespaced ids + mirror classes so the shared #chat-* CSS
         // (extended with .chat-* twins) keeps styling secondary instances.
@@ -865,7 +869,7 @@ export function createChatInstance({
                     <span class="skill-review-summary-main">${summary.headline}</span>
                     <span class="skill-review-summary-side">
                         <span class="skill-review-meta">${summary.meta}</span>
-                        <span class="skill-review-toggle-label">Show review</span>
+                        <span class="skill-review-toggle-label" data-i18n="chat.show_review">Show review</span>
                     </span>
                 </button>
                 <div class="skill-review-full" data-skill-review-full hidden>${renderMarkdown(text)}</div>
@@ -1363,7 +1367,7 @@ export function createChatInstance({
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
         if (actions) {
             withStableViewport(() => {
-                actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
+                actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled data-i18n="chat.creating_project">Creating project…</button>';
                 record.cancelRunBtn = null;
             });
         }
@@ -1384,7 +1388,7 @@ export function createChatInstance({
             delete record.root.dataset.projectCreating;
             if (actions) {
                 withStableViewport(() => {
-                    actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
+                    actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project data-i18n="chat.turn_into_project">Turn into project</button>';
                     record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
                     // Re-wire the click handler — innerHTML replaced the original node,
                     // so without this the restored button would be dead after a
@@ -1451,7 +1455,7 @@ export function createChatInstance({
         btn.type = 'button';
         btn.className = 'btn btn-xs btn-danger';
         btn.dataset.cancelRun = '1';
-        btn.textContent = 'Cancel run';
+        btn.textContent = t('chat.cancel_run', 'Cancel run');
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
             cancelRunFromCard(record);
@@ -1567,7 +1571,7 @@ export function createChatInstance({
         nameEl.textContent = name;  // textContent — no HTML injection from a project name
         const status = document.createElement('span');
         status.className = 'chat-live-project-status';
-        status.textContent = 'running in background ↗';
+        status.textContent = t('chat.running_in_background', 'running in background ↗');
         chip.append(icon, nameEl, status);
         chip.addEventListener('click', () => {
             window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } }));
@@ -1618,21 +1622,21 @@ export function createChatInstance({
             && !alreadyBound
             && !ephemeralDecisionTaskIds.has(normalizedGroupId)
         )
-            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button></div>`
+            ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project data-i18n="chat.turn_into_project">Turn into project</button></div>`
             : '';
         root.innerHTML = `
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
-                        <span class="chat-live-phase working" data-live-phase>Working</span>
+                        <span class="chat-live-phase working" data-live-phase data-i18n="chat.working">Working</span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
                         </div>
-                        <span class="chat-live-title" data-live-title>Waiting for work</span>
+                        <span class="chat-live-title" data-live-title data-i18n="chat.waiting_for_work">Waiting for work</span>
                     </div>
                     <div class="chat-live-summary-side">
-                        <span class="chat-live-count" data-live-count hidden>2 notes</span>
-                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
+                        <span class="chat-live-count" data-live-count hidden data-i18n="chat.2_notes">2 notes</span>
+                        <span class="chat-live-toggle" data-live-toggle data-i18n="chat.show_details">Show details</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
@@ -1845,9 +1849,9 @@ export function createChatInstance({
         record.expandedLineKeys.clear();
         record._anchorOrderDirty = false;
         clearStickyCardState(record);
-        record.titleEl.textContent = 'Working...';
+        record.titleEl.textContent = t('chat.working_ellipsis', 'Working...');
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Working';
+        record.phaseEl.textContent = t('chat.working', 'Working');
         record.phaseEl.className = 'chat-live-phase working';
         record.countEl.hidden = true;
         record.countEl.textContent = '0 notes';
@@ -3405,8 +3409,8 @@ export function createChatInstance({
             sendBtn.textContent = label || 'Sending';
             sendBtn.title = label || 'Sending';
         } else {
-            sendBtn.textContent = 'Send';
-            sendBtn.title = 'Send message';
+            sendBtn.textContent = t('chat.send', 'Send');
+            sendBtn.title = t('chat.send_message', 'Send message');
         }
     }
 

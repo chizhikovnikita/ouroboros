@@ -1511,6 +1511,34 @@ settings state.
 
 ---
 
+## Interface Text (localization)
+
+Adding user-visible text to `web/`:
+
+- **Markup** — put the English text in the element and add the key:
+  `<span data-i18n="nav.files">Files</span>`. Attributes use
+  `data-i18n-attr="title:nav.files,aria-label:nav.files"`. The page's own
+  `applyStaticTranslations(root)` pass resolves them right after `innerHTML`,
+  BEFORE any binding writes dynamic text.
+- **Imperative** — `el.textContent = t('settings.show', 'Show')`.
+- Then add the key to `web/locales/ru.json`. There is no `en.json`: English is the
+  default argument, so an untranslated key renders correct English.
+
+Two rules the tests enforce mechanically (`web/tests/i18n.test.js`):
+
+1. **The key is always a string literal.** Never `t(someVariable)` or a key built
+   from data. `t()` localizes interface CHROME; if a key could be an expression,
+   a model name, chat message, or log line could be routed through the catalog and
+   silently rewritten. The onboarding wizard is the single exception and composes
+   keys only from its own fixed step ids.
+2. **No orphans, no gaps.** Every key used in a localized module must exist in
+   `ru.json`, and `ru.json` must contain no key the UI stopped rendering.
+
+Never translate content: message bodies, model/provider names, task titles, file
+paths, log payloads. If you are tempted to translate something by rewriting DOM text
+nodes, that is the anti-pattern this design exists to avoid — such a layer cannot
+tell a label from the agent's own output.
+
 ## Design System
 
 Ouroboros uses **glassmorphism** as its visual language. All interactive surfaces follow this pattern:

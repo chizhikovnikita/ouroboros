@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -182,7 +183,9 @@ def test_project_sidebar_and_menu_static_contracts():
 
     assert 'class="nav-projects-header"' in html
     assert '<svg class="nav-chevron"' in html
-    assert 'aria-label="New project"><svg' in html
+    # Icon-only accessible button: the label and the inline svg still belong to the
+    # same element, tolerating attributes added between them (data-i18n-attr).
+    assert re.search(r'aria-label="New project"[^>]*><svg', html)
     assert ".nav-projects-header" in css
     assert ".nav-projects-header .nav-row-meta:not(:empty)" in css
     projects_css = css[css.index(".nav-projects-header"):css.index("/* New Project dialog */")]

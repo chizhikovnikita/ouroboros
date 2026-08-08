@@ -173,6 +173,14 @@ A source run needs no `repo.bundle` — the launcher seeds `~/Ouroboros/repo/` f
 checkout it lives in, so its provenance is whatever that checkout has committed rather
 than a signed release.
 
+### Interface language
+
+The web UI ships English and Russian. **Settings → Behavior → Interface Language**
+selects one, or leave it on automatic to follow the browser; the choice applies after
+the page reloads. It changes the interface only — not the language Ouroboros thinks or
+answers in, and never the content it produces. Screens that are not translated yet stay
+in English rather than falling back to blank labels.
+
 ### Google Colab
 
 Use [`notebooks/colab_quickstart.py`](notebooks/colab_quickstart.py) as a Colab-compatible cell script when you need a source-mode runtime without the desktop UI. It keeps runtime data on Google Drive and preserves the original Colab path without making it the primary installation flow.

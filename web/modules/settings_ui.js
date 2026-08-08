@@ -5,12 +5,12 @@ import { renderReviewerSlotsSection } from './reviewer_slots.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 
 const SETTINGS_TABS = [
-    { value: 'providers', label: 'Providers' },
-    { value: 'secrets', label: 'Secrets' },
-    { value: 'models', label: 'Models' },
-    { value: 'behavior', label: 'Behavior' },
-    { value: 'advanced', label: 'Advanced' },
-    { value: 'about', label: 'About' },
+    { value: 'providers', label: 'Providers', i18nKey: 'settings.tab.providers' },
+    { value: 'secrets', label: 'Secrets', i18nKey: 'settings.tab.secrets' },
+    { value: 'models', label: 'Models', i18nKey: 'settings.tab.models' },
+    { value: 'behavior', label: 'Behavior', i18nKey: 'settings.tab.behavior' },
+    { value: 'advanced', label: 'Advanced', i18nKey: 'settings.tab.advanced' },
+    { value: 'about', label: 'About', i18nKey: 'settings.tab.about' },
 ];
 // Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
 
@@ -55,8 +55,8 @@ function secretField({ id, settingKey, label, placeholder }) {
             <label>${label}</label>
             <div class="secret-input-row">
                 <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
-                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}">Show</button>
-                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}">Clear</button>
+                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}" data-i18n="settings.show">Show</button>
+                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}" data-i18n="settings.clear">Clear</button>
             </div>
         </div>
     `;
@@ -120,10 +120,10 @@ const PROVIDER_CARDS = [
         note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
         extra: `
             <div class="settings-toolbar" id="settings-claude-code-panel" hidden>
-                <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
-                <span id="settings-claude-code-status" class="settings-inline-status">Checking Claude runtime...</span>
+                <button type="button" class="settings-ghost-btn" id="btn-claude-code-install" data-i18n="settings.repair_runtime">Repair Runtime</button>
+                <span id="settings-claude-code-status" class="settings-inline-status" data-i18n="settings.checking_claude_runtime">Checking Claude runtime...</span>
             </div>
-            <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
+            <div class="settings-inline-note" id="settings-claude-code-copy" hidden data-i18n="settings.claude_runtime_powers_the_advisory_pre_revie">Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
         `,
     },
 ];
@@ -208,8 +208,8 @@ export const SECRET_KEYS = [
 function secretSettingsSection() {
     return `
         <section class="settings-card">
-            <h3>Stored Secrets</h3>
-            <div class="settings-section-copy">
+            <h3 data-i18n="settings.stored_secrets">Stored Secrets</h3>
+            <div class="settings-section-copy" data-i18n="settings.central_place_for_api_keys_bridge_tokens_pas">
                 Central place for API keys, bridge tokens, passwords, and future skill-requested secrets.
                 Skills only receive grant-only keys after explicit human approval.
             </div>
@@ -223,8 +223,8 @@ function secretSettingsSection() {
             </div>
         </section>
         <section class="settings-card">
-            <h3>Requested By Skills</h3>
-            <div class="settings-section-copy">
+            <h3 data-i18n="settings.requested_by_skills">Requested By Skills</h3>
+            <div class="settings-section-copy" data-i18n="settings.secrets_requested_by_installed_skills_appear">
                 Secrets requested by installed skills appear here only when a skill asks for them.
             </div>
             <div id="skill-requested-secrets" class="settings-secret-list">
@@ -234,12 +234,12 @@ function secretSettingsSection() {
         <section class="settings-card">
             <div class="settings-card-head">
                 <div>
-                    <h3>Custom Keys</h3>
+                    <h3 data-i18n="settings.custom_keys">Custom Keys</h3>
                     <div class="settings-section-copy">
                         Optional key/value storage for future skills. Use uppercase names such as <code>SLACK_WEBHOOK_URL</code>.
                     </div>
                 </div>
-                <button type="button" class="btn btn-default btn-sm" id="btn-add-custom-secret">Add custom key</button>
+                <button type="button" class="btn btn-default btn-sm" id="btn-add-custom-secret" data-i18n="settings.add_custom_key">Add custom key</button>
             </div>
             <div id="custom-secrets-list" class="settings-secret-list settings-custom-secret-list"></div>
         </section>
@@ -250,11 +250,13 @@ export function renderSettingsPage() {
     return `
         ${renderPageHeader({
             title: 'Settings',
+            titleKey: 'settings.settings',
             icon: PAGE_ICONS.settings,
             description: 'Configure providers, secrets, models, behavior, source control, and runtime controls.',
+            descriptionKey: 'settings.page_description',
             tabsHtml: `
                 <div class="settings-tabs-bar">
-                    <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
+                    <button type="button" class="settings-mobile-back" data-settings-back hidden data-i18n="settings.settings">Settings</button>
                     ${renderTabStrip({
                         items: SETTINGS_TABS,
                         active: 'providers',
@@ -276,8 +278,8 @@ export function renderSettingsPage() {
                     ${PROVIDER_CARDS.filter((card) => !card.advanced).map(providerSettingsCard).join('')}
                     <details class="settings-more-providers" id="settings-more-providers">
                         <summary>
-                            <span class="settings-provider-title"><span>More providers</span></span>
-                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, and GigaChat</span>
+                            <span class="settings-provider-title"><span data-i18n="settings.more_providers">More providers</span></span>
+                            <span class="settings-provider-hint" data-i18n="settings.cloud_ru_foundation_models_minimax_and_gigac">Cloud.ru Foundation Models, MiniMax, and GigaChat</span>
                         </summary>
                         <div class="settings-more-providers-body">
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
@@ -285,17 +287,17 @@ export function renderSettingsPage() {
                     </details>
                     ${renderHarnessAccountsSection()}
                     <div class="form-section compact">
-                        <h3>Legacy Compatibility</h3>
+                        <h3 data-i18n="settings.legacy_compatibility">Legacy Compatibility</h3>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Legacy OpenAI Base URL</label>
+                                <label data-i18n="settings.legacy_openai_base_url">Legacy OpenAI Base URL</label>
                                 <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint">
                             </div>
                         </div>
                         <div class="settings-inline-note">Backward-compatibility escape hatch for older installs. For new custom providers, use the dedicated <code>OpenAI Compatible</code> card instead.</div>
                     </div>
                     <div class="form-section compact">
-                        <h3>Network Gate</h3>
+                        <h3 data-i18n="settings.network_gate">Network Gate</h3>
                         <div class="form-row">${secretField({
                             id: 's-network-password',
                             settingKey: 'OUROBOROS_NETWORK_PASSWORD',
@@ -304,12 +306,12 @@ export function renderSettingsPage() {
                         })}</div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Server Bind Host</label>
+                                <label data-i18n="settings.server_bind_host">Server Bind Host</label>
                                 <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0">
                                 <div class="settings-inline-note">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
                             </div>
                         </div>
-                        <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
+                        <div class="settings-inline-note" data-i18n="settings.adds_a_password_wall_only_for_non_localhost">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
                         <div id="settings-lan-hint" class="settings-lan-hint" hidden></div>
                     </div>
                 </section>
@@ -320,14 +322,14 @@ export function renderSettingsPage() {
 
                 <section class="settings-panel" data-settings-panel="models">
                     <div class="form-section">
-                        <h3>Model Routing</h3>
+                        <h3 data-i18n="settings.model_routing">Model Routing</h3>
                         <div class="settings-section-copy">
                             These fields are cloud model IDs. Enable <code>Local</code> to route that model
                             through the GGUF server configured in Advanced.
                         </div>
                         <div class="settings-toolbar">
-                            <button type="button" class="settings-ghost-btn" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
-                            <span id="settings-model-catalog-status" class="settings-inline-status">Model catalog is optional and failure-tolerant.</span>
+                            <button type="button" class="settings-ghost-btn" id="btn-refresh-model-catalog" data-i18n="settings.refresh_model_catalog">Refresh Model Catalog</button>
+                            <span id="settings-model-catalog-status" class="settings-inline-status" data-i18n="settings.model_catalog_is_optional_and_failure_tolera">Model catalog is optional and failure-tolerant.</span>
                         </div>
                         <div class="settings-model-grid">
                             ${MODEL_CARDS.map(([title, copy, inputId, toggleId, defaultValue]) => modelCard({ title, copy, inputId, toggleId, defaultValue })).join('')}
@@ -339,15 +341,15 @@ export function renderSettingsPage() {
                     ${renderSubagentsSection()}
 
                     <div class="form-section">
-                        <h3>Other Model Slots</h3>
+                        <h3 data-i18n="settings.other_model_slots">Other Model Slots</h3>
                         <div class="form-grid two">
                             <div class="form-field">
-                                <label>Deep Self-Review Model</label>
+                                <label data-i18n="settings.deep_self_review_model">Deep Self-Review Model</label>
                                 <input id="s-deep-self-review-model" placeholder="openai/gpt-5.6-sol-pro">
-                                <div class="settings-inline-note">Dedicated model slot for deep self-review. Empty uses the shipped default.</div>
+                                <div class="settings-inline-note" data-i18n="settings.dedicated_model_slot_for_deep_self_review_em">Dedicated model slot for deep self-review. Empty uses the shipped default.</div>
                             </div>
                             <div class="form-field">
-                                <label>Web Search Model</label>
+                                <label data-i18n="settings.web_search_model">Web Search Model</label>
                                 <input id="s-websearch-model" placeholder="gpt-5.2">
                                 <div class="settings-inline-note">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
                             </div>
@@ -357,18 +359,33 @@ export function renderSettingsPage() {
 
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
-                        <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
+                        <h3 data-i18n="settings.interface_language">Interface Language</h3>
+                        <div class="settings-section-copy" data-i18n="settings.interface_language_copy">Language of the interface only. It does not change the language Ouroboros thinks or answers in. Takes effect after the page reloads.</div>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label for="s-ui-language" data-i18n="settings.language">Language</label>
+                                <select id="s-ui-language">
+                                    <option value="" data-i18n="settings.language_auto">Automatic (browser language)</option>
+                                    <option value="en">English</option>
+                                    <option value="ru">Русский</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3 data-i18n="settings.reasoning_effort">Reasoning Effort</h3>
+                        <div class="settings-section-copy" data-i18n="settings.controls_how_deeply_the_model_thinks_per_tas">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
                         <div class="settings-effort-grid">
                             ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Review Enforcement</h3>
+                        <h3 data-i18n="settings.review_enforcement">Review Enforcement</h3>
                         <div class="settings-section-copy"><code>Advisory</code> keeps review visible but non-blocking. <code>Blocking</code> stops commits and reviewed-skill activation when critical findings remain unresolved.</div>
                         <div class="settings-effort-card">
-                            <label>Enforcement Mode</label>
+                            <label data-i18n="settings.enforcement_mode">Enforcement Mode</label>
                             <input id="s-review-enforcement" type="hidden" value="advisory">
                             ${renderSegmentedField({
                                 target: 's-review-enforcement',
@@ -382,10 +399,10 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Task Result Review</h3>
-                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped; Required additionally enforces the selected Advisory or Blocking improvement policy.</div>
+                        <h3 data-i18n="settings.task_result_review">Task Result Review</h3>
+                        <div class="settings-section-copy" data-i18n="settings.auto_and_required_run_the_root_owned_review">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped; Required additionally enforces the selected Advisory or Blocking improvement policy.</div>
                         <div class="settings-effort-card">
-                            <label>Task Result Review</label>
+                            <label data-i18n="settings.task_result_review">Task Result Review</label>
                             <input id="s-task-review-mode" type="hidden" value="auto">
                             ${renderSegmentedField({
                                 target: 's-task-review-mode',
@@ -400,10 +417,10 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Image Input</h3>
-                        <div class="settings-section-copy">Auto sends images inline to vision-capable models and captions them for blind models. Caption always uses text captions; Inline refuses caption fallback; Off emits placeholders.</div>
+                        <h3 data-i18n="settings.image_input">Image Input</h3>
+                        <div class="settings-section-copy" data-i18n="settings.auto_sends_images_inline_to_vision_capable_m">Auto sends images inline to vision-capable models and captions them for blind models. Caption always uses text captions; Inline refuses caption fallback; Off emits placeholders.</div>
                         <div class="settings-effort-card">
-                            <label>Image Input Mode</label>
+                            <label data-i18n="settings.image_input_mode">Image Input Mode</label>
                             <input id="s-image-input-mode" type="hidden" value="auto">
                             ${renderSegmentedField({
                                 target: 's-image-input-mode',
@@ -419,8 +436,8 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Skills</h3>
-                        <div class="settings-section-copy">
+                        <h3 data-i18n="settings.skills">Skills</h3>
+                        <div class="settings-section-copy" data-i18n="settings.closed_loop_skill_development_can_auto_grant">
                             Closed-loop skill development can auto-grant the keys and host permissions a skill declares after a fresh executable review for the current content hash.
                             Leave this off when every skill permission should require a separate human approval.
                         </div>
@@ -431,7 +448,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Context Mode</h3>
+                        <h3 data-i18n="settings.context_mode">Context Mode</h3>
                         <div class="settings-section-copy">
                             Working-context size profile (separate axis from Runtime Mode and Review Enforcement).
                             <code>Max</code> inlines ARCHITECTURE and DEVELOPMENT in full &mdash; for ~1M-context models (today's behavior).
@@ -439,7 +456,7 @@ export function renderSettingsPage() {
                             <br><strong>Human controlled:</strong> saved via the owner endpoint; saves immediately (no restart), and lowering to Low requires Ouroboros to be idle.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Context Mode</label>
+                            <label data-i18n="settings.context_mode">Context Mode</label>
                             <input id="s-context-mode" type="hidden" value="max">
                             ${renderSegmentedField({
                                 target: 's-context-mode',
@@ -453,7 +470,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Safety Supervisor</h3>
+                        <h3 data-i18n="settings.safety_supervisor">Safety Supervisor</h3>
                         <div class="settings-section-copy">
                             Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).
                             <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
@@ -462,7 +479,7 @@ export function renderSettingsPage() {
                             <br><strong>Human controlled:</strong> saved via the owner endpoint (the agent cannot lower its own supervision); applies on the next task.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Safety Supervisor</label>
+                            <label data-i18n="settings.safety_supervisor">Safety Supervisor</label>
                             <input id="s-safety-mode" type="hidden" value="full">
                             ${renderSegmentedField({
                                 target: 's-safety-mode',
@@ -478,7 +495,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Update Channel</h3>
+                        <h3 data-i18n="settings.update_channel">Update Channel</h3>
                         <div class="settings-section-copy">
                             Chooses which official branch Update checks. Your local work branch stays <code>ouroboros</code>.
                             <code>Stable</code> follows released code on <code>main</code> (default),
@@ -486,7 +503,7 @@ export function renderSettingsPage() {
                             <code>Development</code> follows <code>ouroboros</code>.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Official Update Source</label>
+                            <label data-i18n="settings.official_update_source">Official Update Source</label>
                             <input id="s-update-channel" type="hidden" value="stable">
                             ${renderSegmentedField({
                                 target: 's-update-channel',
@@ -502,7 +519,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Runtime Mode</h3>
+                        <h3 data-i18n="settings.runtime_mode">Runtime Mode</h3>
                         <div class="settings-section-copy">
                             Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.
                             <code>Light</code> blocks repo self-modification but allows reviewed + enabled skills to run.
@@ -512,7 +529,7 @@ export function renderSettingsPage() {
                             Web/Docker sessions save mode changes through the owner endpoint; the new mode takes effect after restart.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Runtime Mode</label>
+                            <label data-i18n="settings.runtime_mode">Runtime Mode</label>
                             <input id="s-runtime-mode" type="hidden" value="advanced">
                             ${renderSegmentedField({
                                 target: 's-runtime-mode',
@@ -532,13 +549,13 @@ export function renderSettingsPage() {
                          setting would have carried two drafts. -->
 
                     <div class="form-section">
-                        <h3>Post-Task Self-Evolution</h3>
+                        <h3 data-i18n="settings.post_task_self_evolution">Post-Task Self-Evolution</h3>
                         <div class="settings-section-copy">
                             After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks a light model whether to promote a backlog item, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
                             <br><strong>Human controlled:</strong> the agent cannot self-enable this (shell/browser/settings self-elevation is blocked). These controls apply on the next task.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Self-Improvement Trigger</label>
+                            <label data-i18n="settings.self_improvement_trigger">Self-Improvement Trigger</label>
                             <input id="s-post-task-evolution-mode" type="hidden" value="off">
                             ${renderSegmentedField({
                                 target: 's-post-task-evolution-mode',
@@ -553,40 +570,40 @@ export function renderSettingsPage() {
                         <div class="form-row">
                             <div class="form-field">
                                 <div data-evo-every-n-row>
-                                <label>Every N Tasks</label>
+                                <label data-i18n="settings.every_n_tasks">Every N Tasks</label>
                                 <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3">
-                                <div class="settings-inline-note">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
+                                <div class="settings-inline-note" data-i18n="settings.visible_only_when_self_improvement_trigger_e">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
                                 </div>
                             </div>
                             <div class="form-field">
-                                <label>Per-Cycle Budget Reserve (USD)</label>
+                                <label data-i18n="settings.per_cycle_budget_reserve_usd">Per-Cycle Budget Reserve (USD)</label>
                                 <input id="s-evo-budget" placeholder="0">
                                 <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task soft cap and the supervisor's reserved-budget floor.</div>
                             </div>
                         </div>
                         <div class="form-field">
-                            <label>Standing Objective (optional)</label>
+                            <label data-i18n="settings.standing_objective_optional">Standing Objective (optional)</label>
                             <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency">
-                            <div class="settings-inline-note">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
+                            <div class="settings-inline-note" data-i18n="settings.optional_steer_appended_to_every_evolution_c">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Background Cognition</h3>
-                        <div class="settings-section-copy">
+                        <h3 data-i18n="settings.background_cognition">Background Cognition</h3>
+                        <div class="settings-section-copy" data-i18n="settings.cadence_for_ouroboros_s_background_cognition">
                             Cadence for Ouroboros's background cognition loop. These values are read at startup; save them, then restart for the new timing to take effect.
                         </div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>BG Wakeup Min (sec)</label>
+                                <label data-i18n="settings.bg_wakeup_min_sec">BG Wakeup Min (sec)</label>
                                 <input id="s-bg-wakeup-min" type="number" min="1" step="1" placeholder="30">
                             </div>
                             <div class="form-field">
-                                <label>BG Wakeup Max (sec)</label>
+                                <label data-i18n="settings.bg_wakeup_max_sec">BG Wakeup Max (sec)</label>
                                 <input id="s-bg-wakeup-max" type="number" min="1" step="1" placeholder="7200">
                             </div>
                             <div class="form-field">
-                                <label>BG Max Rounds</label>
+                                <label data-i18n="settings.bg_max_rounds">BG Max Rounds</label>
                                 <input id="s-bg-max-rounds" type="number" min="1" step="1" placeholder="10">
                             </div>
                         </div>
@@ -594,7 +611,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>External Skills Repo</h3>
+                        <h3 data-i18n="settings.external_skills_repo">External Skills Repo</h3>
                         <div class="settings-section-copy">
                             Optional EXTRA discovery path on top of the in-data-plane
                             <code>data/skills/{native,clawhub,external}/</code> tree.
@@ -603,7 +620,7 @@ export function renderSettingsPage() {
                         </div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Skills Repo Path</label>
+                                <label data-i18n="settings.skills_repo_path">Skills Repo Path</label>
                                 <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills">
                                 <div class="settings-inline-note">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
                             </div>
@@ -611,7 +628,7 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>ClawHub Marketplace</h3>
+                        <h3 data-i18n="settings.clawhub_marketplace">ClawHub Marketplace</h3>
                         <div class="settings-section-copy">
                             Always-on surface for installing community skills from
                             <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
@@ -623,7 +640,7 @@ export function renderSettingsPage() {
                         </div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>Registry URL</label>
+                                <label data-i18n="settings.registry_url">Registry URL</label>
                                 <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1">
                                 <div class="settings-inline-note">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
                             </div>
@@ -635,7 +652,7 @@ export function renderSettingsPage() {
                     <div class="form-section">
                         <div class="settings-card-head">
                             <div>
-                                <h3>MCP Servers</h3>
+                                <h3 data-i18n="settings.mcp_servers">MCP Servers</h3>
                                 <div class="settings-section-copy">
                                     External Model Context Protocol tool servers. MCP is a base-runtime client:
                                     it borrows tools from trusted HTTP/SSE servers and exposes them as non-core
@@ -644,8 +661,8 @@ export function renderSettingsPage() {
                                 </div>
                             </div>
                             <div class="settings-toolbar">
-                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-add-server">Add server</button>
-                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-refresh-all">Refresh all</button>
+                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-add-server" data-i18n="settings.add_server">Add server</button>
+                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-refresh-all" data-i18n="settings.refresh_all">Refresh all</button>
                             </div>
                         </div>
                         <div class="form-grid two">
@@ -654,7 +671,7 @@ export function renderSettingsPage() {
                                 Enable MCP client
                             </label>
                             <div class="form-field">
-                                <label>Per-tool timeout (s)</label>
+                                <label data-i18n="settings.per_tool_timeout_s">Per-tool timeout (s)</label>
                                 <input id="s-mcp-tool-timeout" type="number" min="1" value="60">
                             </div>
                         </div>
@@ -663,118 +680,118 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Source Control</h3>
-                        <div class="settings-section-copy">Repository metadata for GitHub integration. Tokens live in Secrets; this is not secret.</div>
+                        <h3 data-i18n="settings.source_control">Source Control</h3>
+                        <div class="settings-section-copy" data-i18n="settings.repository_metadata_for_github_integration_t">Repository metadata for GitHub integration. Tokens live in Secrets; this is not secret.</div>
                         <div class="form-row">
                             <div class="form-field">
-                                <label>GitHub Repo</label>
+                                <label data-i18n="settings.github_repo">GitHub Repo</label>
                                 <input id="s-gh-repo" placeholder="owner/repo-name">
                             </div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Local Model Runtime</h3>
-                        <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
+                        <h3 data-i18n="settings.local_model_runtime">Local Model Runtime</h3>
+                        <div class="settings-section-copy" data-i18n="settings.only_fill_this_in_when_you_want_ouroboros_to">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
                         <div class="form-grid two">
                             <div class="form-field">
-                                <label>Model Source</label>
+                                <label data-i18n="settings.model_source">Model Source</label>
                                 <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf">
                             </div>
                             <div class="form-field">
-                                <label>GGUF Filename (for HF repos)</label>
+                                <label data-i18n="settings.gguf_filename_for_hf_repos">GGUF Filename (for HF repos)</label>
                                 <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf">
                             </div>
                         </div>
                         <div class="form-grid four">
                             <div class="form-field">
-                                <label>Port</label>
+                                <label data-i18n="settings.port">Port</label>
                                 <input id="s-local-port" type="number" value="8766">
                             </div>
                             <div class="form-field">
-                                <label>GPU Layers (-1 = all)</label>
+                                <label data-i18n="settings.gpu_layers_1_all">GPU Layers (-1 = all)</label>
                                 <input id="s-local-gpu-layers" type="number" value="-1">
                             </div>
                             <div class="form-field">
-                                <label>Context Length</label>
+                                <label data-i18n="settings.context_length">Context Length</label>
                                 <input id="s-local-ctx" type="number" value="16384">
                             </div>
                             <div class="form-field">
-                                <label>Chat Format</label>
+                                <label data-i18n="settings.chat_format">Chat Format</label>
                                 <input id="s-local-chat-format" placeholder="auto-detect">
                             </div>
                         </div>
                         <div class="settings-toolbar">
-                            <button class="btn btn-primary" id="btn-local-start">Start</button>
-                            <button class="btn btn-primary" id="btn-local-stop">Stop</button>
-                            <button class="btn btn-primary" id="btn-local-test">Test Tool Calling</button>
+                            <button class="btn btn-primary" id="btn-local-start" data-i18n="settings.start">Start</button>
+                            <button class="btn btn-primary" id="btn-local-stop" data-i18n="settings.stop">Stop</button>
+                            <button class="btn btn-primary" id="btn-local-test" data-i18n="settings.test_tool_calling">Test Tool Calling</button>
                         </div>
                         <div id="local-model-status" class="settings-inline-status">Status: Offline</div>
                         <div id="local-model-progress-wrap" class="local-model-progress-wrap local-model-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
                             <div id="local-model-progress-bar" class="local-model-progress-bar"></div>
                         </div>
-                        <button class="btn btn-secondary local-model-install-btn local-model-hidden" id="btn-local-install-runtime">Install Local Runtime</button>
+                        <button class="btn btn-secondary local-model-install-btn local-model-hidden" id="btn-local-install-runtime" data-i18n="settings.install_local_runtime">Install Local Runtime</button>
                         <div id="local-model-test-result" class="settings-test-result"></div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Runtime Limits</h3>
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds.</div>
+                        <h3 data-i18n="settings.runtime_limits">Runtime Limits</h3>
+                        <div class="settings-section-copy" data-i18n="settings.workers_control_parallel_task_capacity_task">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds.</div>
                         <div class="form-grid two">
                             <div class="form-field">
-                                <label>Max Workers</label>
+                                <label data-i18n="settings.max_workers">Max Workers</label>
                                 <input id="s-workers" type="number" min="1" max="50" value="10">
                             </div>
                             <div class="form-field">
-                                <label>Active Subagents / Root</label>
+                                <label data-i18n="settings.active_subagents_root">Active Subagents / Root</label>
                                 <input id="s-active-subagents" type="number" min="1" max="500" value="6">
                             </div>
                             <div class="form-field">
-                                <label>Subagent Depth</label>
+                                <label data-i18n="settings.subagent_depth">Subagent Depth</label>
                                 <!-- 0 is a real owner choice ("no delegation at all"), honoured
                                      structurally since v6.79.0 — it must be reachable here. -->
                                 <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
                             </div>
                             <div class="form-field">
-                                <label>Tool Timeout (s)</label>
+                                <label data-i18n="settings.tool_timeout_s">Tool Timeout (s)</label>
                                 <input id="s-tool-timeout" type="number" value="600">
                             </div>
                             <div class="form-field">
-                                <label>Total Budget (USD)</label>
+                                <label data-i18n="settings.total_budget_usd">Total Budget (USD)</label>
                                 <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
                             </div>
                             <div class="form-field">
-                                <label>Per-Task Soft Threshold (USD)</label>
+                                <label data-i18n="settings.per_task_soft_threshold_usd">Per-Task Soft Threshold (USD)</label>
                                 <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
                             </div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Cleanup &amp; Subagent Workspaces</h3>
+                        <h3 data-i18n="settings.cleanup_amp_subagent_workspaces">Cleanup &amp; Subagent Workspaces</h3>
                         <div class="settings-section-copy">
                             <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365).
                             The roots are where acting subagents check out a git worktree of this repo or build a from-scratch (<code>genesis</code>) project; both live outside the app repo and data. Genesis projects are durable and never auto-removed. Leave a root blank for the default under <code>~/Ouroboros/</code>.
                         </div>
                         <div class="form-grid two">
                             <div class="form-field">
-                                <label>GC Retention (days)</label>
+                                <label data-i18n="settings.gc_retention_days">GC Retention (days)</label>
                                 <input id="s-gc-retention-days" type="number" min="1" max="365" value="7">
                             </div>
                             <div class="form-field">
-                                <label>Subagent Worktree Root</label>
+                                <label data-i18n="settings.subagent_worktree_root">Subagent Worktree Root</label>
                                 <input id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
                             </div>
                             <div class="form-field">
-                                <label>Subagent Projects Root (genesis)</label>
+                                <label data-i18n="settings.subagent_projects_root_genesis">Subagent Projects Root (genesis)</label>
                                 <input id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
                             </div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Extension Settings</h3>
-                        <div class="settings-section-copy">
+                        <h3 data-i18n="settings.extension_settings">Extension Settings</h3>
+                        <div class="settings-section-copy" data-i18n="settings.live_extensions_can_register_reviewed_host_r">
                             Live extensions can register reviewed, host-rendered settings sections.
                             Sections appear here after the owning skill is reviewed, enabled, and loaded.
                         </div>
@@ -784,9 +801,9 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section danger">
-                        <h3>Danger Zone</h3>
-                        <div class="settings-inline-note">Reset still uses the current restart-based flow. This clears runtime data but keeps the repo.</div>
-                        <button class="btn btn-danger" id="btn-reset">Reset All Data</button>
+                        <h3 data-i18n="settings.danger_zone">Danger Zone</h3>
+                        <div class="settings-inline-note" data-i18n="settings.reset_still_uses_the_current_restart_based_f">Reset still uses the current restart-based flow. This clears runtime data but keeps the repo.</div>
+                        <button class="btn btn-danger" id="btn-reset" data-i18n="settings.reset_all_data">Reset All Data</button>
                     </div>
                 </section>
 
@@ -815,11 +832,11 @@ export function renderSettingsPage() {
 
             <div class="settings-footer">
                 <div class="settings-footer-actions">
-                    <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
-                    <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
+                    <button type="button" class="btn btn-secondary" id="btn-reload-settings" data-i18n="settings.reload_settings">Reload Settings</button>
+                    <button class="btn btn-save" id="btn-save-settings" data-i18n="settings.save_settings">Save Settings</button>
                 </div>
                 <div class="settings-footer-status">
-                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
+                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true" data-i18n="settings.unsaved_changes">Unsaved changes</span>
                     <div id="settings-status" class="settings-inline-status"></div>
                 </div>
             </div>

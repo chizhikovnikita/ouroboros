@@ -19,6 +19,7 @@ import { initActivity } from './modules/activity.js';
 import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
+import { applyStaticTranslations } from './modules/i18n.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 
@@ -204,6 +205,11 @@ const ctx = {
         };
     },
 };
+
+// Translate the static shell (nav labels, titles, reconnect overlay) before any
+// page renders. The i18n module already awaited its catalog at import time, so
+// this is a single synchronous pass with no flash of English.
+applyStaticTranslations(document);
 
 initChat(ctx);
 initFiles(ctx);

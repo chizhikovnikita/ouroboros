@@ -38,7 +38,8 @@ def settings_css() -> str:
 
 
 def test_settings_ui_has_mcp_section(settings_ui_source: str) -> None:
-    assert "<h3>MCP Servers</h3>" in settings_ui_source
+    # Attribute-tolerant: the heading now also carries a data-i18n key.
+    assert ">MCP Servers</h3>" in settings_ui_source
     assert 'id="s-mcp-enabled"' in settings_ui_source
     assert 'id="s-mcp-tool-timeout"' in settings_ui_source
     assert 'id="btn-mcp-add-server"' in settings_ui_source
@@ -52,7 +53,7 @@ def test_settings_ui_mcp_section_sits_in_advanced_panel(settings_ui_source: str)
     assert "Integrations" not in settings_ui_source
     advanced_index = settings_ui_source.find('data-settings-panel="advanced"')
     about_index = settings_ui_source.find('data-settings-panel="about"')
-    mcp_index = settings_ui_source.find("<h3>MCP Servers</h3>")
+    mcp_index = settings_ui_source.find(">MCP Servers</h3>")
     assert advanced_index >= 0 and about_index >= 0 and mcp_index >= 0
     assert advanced_index < mcp_index < about_index
 

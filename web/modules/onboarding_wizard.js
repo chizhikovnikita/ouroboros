@@ -10,6 +10,46 @@
             .replace(/`/g, '&#96;');
     }
 
+    // Self-contained i18n mirror of modules/i18n_core.js. This file is INLINED into a
+    // plain <script> by build_onboarding_html (both the desktop launcher window and
+    // the SPA's setup iframe come through there), so it has no imports to reach the
+    // shared module with. The catalog is inlined next to it; English lives at every
+    // call site, so a missing catalog degrades to English instead of blank chrome.
+    const I18N = window.__OURO_ONBOARDING_I18N__ || {};
+
+    function normalizeLanguage(raw) {
+        const tag = String(raw == null ? '' : raw).trim().toLowerCase();
+        if (!tag) return '';
+        const base = tag.split(/[-_]/)[0];
+        return ['en', 'ru'].includes(base) ? base : '';
+    }
+
+    const WIZARD_LANGUAGE = normalizeLanguage(I18N.language)
+        || normalizeLanguage(typeof navigator !== 'undefined' ? navigator.language : '')
+        || 'en';
+    const WIZARD_CATALOG = (I18N.catalogs || {})[WIZARD_LANGUAGE] || {};
+
+    function t(key, defaultMessage) {
+        const override = WIZARD_CATALOG[key];
+        return typeof override === 'string' && override !== ''
+            ? override
+            : (defaultMessage == null ? key : defaultMessage);
+    }
+
+    function applyWizardTranslations(root) {
+        if (!root || typeof root.querySelectorAll !== 'function') return;
+        root.querySelectorAll('[data-i18n]').forEach((el) => {
+            const key = el.getAttribute('data-i18n');
+            if (key) el.textContent = t(key, el.textContent);
+        });
+        root.querySelectorAll('[data-i18n-attr]').forEach((el) => {
+            (el.getAttribute('data-i18n-attr') || '').split(',').forEach((pair) => {
+                const [attr, key] = pair.split(':').map((part) => (part || '').trim());
+                if (attr && key) el.setAttribute(attr, t(key, el.getAttribute(attr) || ''));
+            });
+        });
+    }
+
         const bootstrap = window.__OURO_ONBOARDING_BOOTSTRAP__ || {};
         const SETUP_CONTRACT = bootstrap.contract || {};
         const HOST_MODE = bootstrap.hostMode || 'desktop';
@@ -473,10 +513,10 @@
         if (!LOCAL_RUNTIME_CONTROLS) return '';
         return `
             <div class="wizard-runtime-strip">
-                <button type="button" class="btn btn-ghost" id="wizard-local-start">Start local runtime</button>
-                <button type="button" class="btn btn-ghost" id="wizard-local-stop" disabled>Stop</button>
-                <button type="button" class="btn btn-ghost" id="wizard-local-test" disabled>Test tool calling</button>
-                <span id="wizard-local-status" class="wizard-runtime-status">Status: Offline</span>
+                <button type="button" class="btn btn-ghost" id="wizard-local-start" data-i18n="onboarding.start_local_runtime">Start local runtime</button>
+                <button type="button" class="btn btn-ghost" id="wizard-local-stop" disabled data-i18n="onboarding.stop">Stop</button>
+                <button type="button" class="btn btn-ghost" id="wizard-local-test" disabled data-i18n="onboarding.test_tool_calling">Test tool calling</button>
+                <span id="wizard-local-status" class="wizard-runtime-status" data-i18n="onboarding.status_offline">Status: Offline</span>
             </div>
             <div id="wizard-local-test-result" class="wizard-test-result"></div>
         `;
@@ -494,13 +534,13 @@
             : escapeHtml(state.harnessAccountsLine || 'Checking connected accounts…');
         return `
             <div class="panel-card" id="wizard-harness-card">
-                <h3>Coding-agent subscriptions (optional)</h3>
+                <h3 data-i18n="onboarding.coding_agent_subscriptions_optional">Coding-agent subscriptions (optional)</h3>
                 <p>Run delegated subagents and reviewers on your Codex CLI / Claude Code / Cursor
                 subscriptions instead of API tokens. Accounts are connected to Ouroboros's own
                 agent home — your personal logins are never imported.</p>
                 <div class="wizard-runtime-strip">
                     <span class="wizard-runtime-status">${liveLine}</span>
-                    <button type="button" class="btn btn-secondary" id="wizard-harness-skip">Skip for now</button>
+                    <button type="button" class="btn btn-secondary" id="wizard-harness-skip" data-i18n="onboarding.skip_for_now">Skip for now</button>
                 </div>
             </div>
         `;
@@ -525,13 +565,13 @@
     function renderClaudeCliControls() {
         return `
             <div class="panel-card" id="wizard-claude-card"${shouldShowClaudeCliCta() ? '' : ' hidden'}>
-                <h3>Claude Runtime</h3>
+                <h3 data-i18n="onboarding.claude_runtime">Claude Runtime</h3>
                 <p>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</p>
                 <div class="wizard-runtime-strip">
                     <button type="button" class="btn btn-ghost" id="wizard-claude-install" ${state.claudeCliBusy || state.claudeCliInstalled ? 'disabled' : ''}>
                         ${escapeHtml(state.claudeCliBusy ? 'Repairing...' : (state.claudeCliInstalled ? 'Runtime OK' : 'Repair Runtime'))}
                     </button>
-                    <button type="button" class="btn btn-secondary" id="wizard-claude-skip" ${state.claudeCliBusy || state.claudeCliInstalled ? 'hidden' : ''}>Skip for now</button>
+                    <button type="button" class="btn btn-secondary" id="wizard-claude-skip" ${state.claudeCliBusy || state.claudeCliInstalled ? 'hidden' : ''} data-i18n="onboarding.skip_for_now">Skip for now</button>
                     <span id="wizard-claude-status" class="wizard-runtime-status" data-tone="${escapeHtml(state.claudeCliTone || 'muted')}">${escapeHtml(state.claudeCliStatusText || 'Checking Claude runtime...')}</span>
                 </div>
             </div>
@@ -575,7 +615,7 @@
                 <div class="field">
                 <div class="field-label-row">
                     <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
-                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button">Clear</button>
+                    <button class="field-clear" data-clear="${escapeHtml(id)}" type="button" data-i18n="onboarding.clear">Clear</button>
                 </div>
                 <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
                 <div class="field-note">${escapeHtml(note)}</div>
@@ -585,7 +625,7 @@
 
         function localInputField([id, stateKey, label, placeholder, note, className, type = 'text', min = '', step = '']) {
             const clear = ['local-source', 'local-filename', 'local-chat-format'].includes(id)
-                ? `<button class="field-clear" data-clear="${id}" type="button">Clear</button>`
+                ? `<button class="field-clear" data-clear="${id}" type="button" data-i18n="onboarding.clear">Clear</button>`
                 : '';
             return `
                 <div class="${className}">
@@ -604,12 +644,12 @@
         return `
             <div class="step-header">
                 <div>
-                    <h2 class="step-title">${escapeHtml(STEP_META.providers.title)}</h2>
-                    <p class="step-copy">${escapeHtml(STEP_META.providers.copy)}</p>
+                    <h2 class="step-title">${escapeHtml(t('onboarding.step.providers.title', STEP_META.providers.title))}</h2>
+                    <p class="step-copy">${escapeHtml(t('onboarding.step.providers.copy', STEP_META.providers.copy))}</p>
                 </div>
             </div>
                 <div class="panel-card">
-                    <h3>Keys first, routing second</h3>
+                    <h3 data-i18n="onboarding.keys_first_routing_second">Keys first, routing second</h3>
                     <p>${escapeHtml(PROVIDER_PROFILES[selectedProfile]?.providerCopy || '')}</p>
                 </div>
                 <div class="field-grid">
@@ -620,7 +660,7 @@
                 </div>
             <details class="wizard-collapse" data-collapse="more-providers" ${moreProvidersOpen ? 'open' : ''}>
                 <summary>
-                    <span>More options</span>
+                    <span data-i18n="onboarding.more_options">More options</span>
                     <span class="selection-badge">${hasMoreProviderValue() ? 'Configured' : 'Optional'}</span>
                 </summary>
                 <div class="wizard-collapse-body">
@@ -636,25 +676,25 @@
             ${renderHarnessAccountsCard()}
             <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
-                    <span>Local model settings</span>
+                    <span data-i18n="onboarding.local_model_settings">Local model settings</span>
                     <span class="selection-badge">${hasLocalModel() ? 'Configured' : 'Optional'}</span>
                 </summary>
                 <div class="wizard-collapse-body">
                     <div class="field-grid">
                         <div class="field">
                             <div class="field-label-row">
-                                <label for="local-preset">Preset</label>
-                                <button class="field-clear" data-clear="local-preset" type="button">Clear</button>
+                                <label for="local-preset" data-i18n="onboarding.preset">Preset</label>
+                                <button class="field-clear" data-clear="local-preset" type="button" data-i18n="onboarding.clear">Clear</button>
                             </div>
                                 <select id="local-preset">
-                                    <option value="" ${localPreset === '' ? 'selected' : ''}>None</option>
+                                    <option value="" ${localPreset === '' ? 'selected' : ''} data-i18n="onboarding.none">None</option>
                                     ${Object.entries(LOCAL_PRESETS).map(([id, preset]) => `<option value="${escapeHtml(id)}" ${localPreset === id ? 'selected' : ''}>${escapeHtml(preset.label)}</option>`).join('')}
-                                    <option value="custom" ${localPreset === 'custom' ? 'selected' : ''}>Custom source</option>
+                                    <option value="custom" ${localPreset === 'custom' ? 'selected' : ''} data-i18n="onboarding.custom_source">Custom source</option>
                                 </select>
                             <div class="field-note">Most people can ignore this. Open it only if you want local GGUF routing.</div>
                         </div>
                         <div class="field">
-                                <div class="field-label-row"><label>Local routing</label></div>
+                                <div class="field-label-row"><label data-i18n="onboarding.local_routing">Local routing</label></div>
                                 <div class="selection-row">
                                     ${LOCAL_ROUTING_MODES.map((mode) => `<button class="selection-pill ${state.localRoutingMode === mode.value ? 'active' : ''}" data-local-mode="${escapeHtml(mode.value)}" type="button">${escapeHtml(mode.buttonLabel || mode.label)}</button>`).join('')}
                                 </div>
@@ -682,10 +722,10 @@
         function renderCompatibleModelLoader() {
             return `
             <div class="panel-card" id="compatible-model-loader">
-                <h3>Load models from endpoint</h3>
+                <h3 data-i18n="onboarding.load_models_from_endpoint">Load models from endpoint</h3>
                 <p class="field-note">Fetch the model list from your configured URL, then click a model to fill all empty slots.</p>
                 <div class="compatible-model-actions">
-                    <button type="button" class="btn btn-secondary" id="load-compatible-models">Load models</button>
+                    <button type="button" class="btn btn-secondary" id="load-compatible-models" data-i18n="onboarding.load_models">Load models</button>
                     <span id="compatible-load-status" class="field-note compatible-load-status"></span>
                 </div>
                 <div id="compatible-model-list" class="compatible-model-list" hidden></div>
@@ -698,12 +738,12 @@
             return `
             <div class="step-header">
                 <div>
-                    <h2 class="step-title">${escapeHtml(STEP_META.models.title)}</h2>
-                    <p class="step-copy">${escapeHtml(STEP_META.models.copy)}</p>
+                    <h2 class="step-title">${escapeHtml(t('onboarding.step.models.title', STEP_META.models.title))}</h2>
+                    <p class="step-copy">${escapeHtml(t('onboarding.step.models.copy', STEP_META.models.copy))}</p>
                 </div>
             </div>
                 <div class="panel-card">
-                    <h3>Current profile</h3>
+                    <h3 data-i18n="onboarding.current_profile">Current profile</h3>
                     <p>${escapeHtml(PROVIDER_PROFILES[profile]?.modelCopy || '')}</p>
                 </div>
                 ${profile === 'openai-compatible' ? renderCompatibleModelLoader() : ''}
@@ -727,8 +767,8 @@
         return `
             <div class="step-header">
                 <div>
-                    <h2 class="step-title">${escapeHtml(STEP_META.review_mode.title)}</h2>
-                    <p class="step-copy">${escapeHtml(STEP_META.review_mode.copy)}</p>
+                    <h2 class="step-title">${escapeHtml(t('onboarding.step.review_mode.title', STEP_META.review_mode.title))}</h2>
+                    <p class="step-copy">${escapeHtml(t('onboarding.step.review_mode.copy', STEP_META.review_mode.copy))}</p>
                 </div>
                 </div>
                 <div class="wizard-choice-grid">
@@ -741,7 +781,7 @@
                     `).join('')}
                 </div>
             <div class="panel-card runtime-mode-card">
-                <h3>Runtime mode</h3>
+                <h3 data-i18n="onboarding.runtime_mode">Runtime mode</h3>
                     <p class="field-note">${escapeHtml(runtimeModeCopy)}</p>
                     <div class="wizard-choice-grid three">
                         ${RUNTIME_MODES.map((mode) => `
@@ -754,8 +794,8 @@
                     </div>
                 <div class="field">
                     <div class="field-label-row">
-                        <label for="skills-repo-path">External skills repo (optional)</label>
-                        <button class="field-clear" data-clear="skills-repo-path" type="button">Clear</button>
+                        <label for="skills-repo-path" data-i18n="onboarding.external_skills_repo_optional">External skills repo (optional)</label>
+                        <button class="field-clear" data-clear="skills-repo-path" type="button" data-i18n="onboarding.clear">Clear</button>
                     </div>
                     <input id="skills-repo-path" type="text" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" value="${escapeHtml(state.skillsRepoPath || '')}">
                     <div class="field-note">Optional. Extra discovery root on top of the in-data-plane <code>data/skills/{native,clawhub,external}/</code> tree. Leave empty if you do not maintain your own skills checkout — Ouroboros never clones/pulls this directory.</div>
@@ -768,8 +808,8 @@
             return `
             <div class="step-header">
                 <div>
-                    <h2 class="step-title">${escapeHtml(STEP_META.budget.title)}</h2>
-                    <p class="step-copy">${escapeHtml(STEP_META.budget.copy)}</p>
+                    <h2 class="step-title">${escapeHtml(t('onboarding.step.budget.title', STEP_META.budget.title))}</h2>
+                    <p class="step-copy">${escapeHtml(t('onboarding.step.budget.copy', STEP_META.budget.copy))}</p>
                 </div>
                 </div>
                 <div class="grid two">
@@ -797,8 +837,8 @@
         return `
             <div class="step-header">
                 <div>
-                    <h2 class="step-title">${escapeHtml(STEP_META.summary.title)}</h2>
-                    <p class="step-copy">${escapeHtml(STEP_META.summary.copy)}</p>
+                    <h2 class="step-title">${escapeHtml(t('onboarding.step.summary.title', STEP_META.summary.title))}</h2>
+                    <p class="step-copy">${escapeHtml(t('onboarding.step.summary.copy', STEP_META.summary.copy))}</p>
                 </div>
             </div>
             <div class="summary-card">${summary}</div>
@@ -820,9 +860,9 @@
             const meta = STEP_META[stepId];
             return `
                 <div class="wizard-step ${active ? 'active' : ''} ${done ? 'done' : ''}">
-                    <div class="wizard-step-index">Step ${index + 1}</div>
-                    <p class="wizard-step-title">${escapeHtml(meta.title)}</p>
-                    <p class="wizard-step-copy">${escapeHtml(meta.railCopy || '')}</p>
+                    <div class="wizard-step-index">${escapeHtml(t('onboarding.step_index', 'Step {n}').replace('{n}', String(index + 1)))}</div>
+                    <p class="wizard-step-title">${escapeHtml(t('onboarding.step.' + stepId + '.title', meta.title))}</p>
+                    <p class="wizard-step-copy">${escapeHtml(t('onboarding.step.' + stepId + '.rail', meta.railCopy || ''))}</p>
                 </div>
             `;
         }).join('');
@@ -832,24 +872,24 @@
         const meta = STEP_META[state.currentStep];
         const index = STEP_ORDER.indexOf(state.currentStep);
         const nextLabel = state.currentStep === 'summary'
-            ? (state.saving ? 'Saving...' : 'Start Ouroboros')
-            : 'Continue';
+            ? (state.saving ? t('onboarding.saving', 'Saving...') : t('onboarding.start', 'Start Ouroboros'))
+            : t('onboarding.continue', 'Continue');
         root.innerHTML = `
             <div class="wizard-shell">
                 <div class="wizard-header">
                     <div>
                         <h1 class="wizard-title">Ouroboros</h1>
-                        <p class="wizard-subtitle">Shared desktop and web onboarding with the same model, review, and budget flow in both hosts.</p>
+                        <p class="wizard-subtitle" data-i18n="onboarding.subtitle">Shared desktop and web onboarding with the same model, review, and budget flow in both hosts.</p>
                     </div>
-                    <div class="wizard-badge">Step ${index + 1} of ${STEP_ORDER.length}</div>
+                    <div class="wizard-badge">${escapeHtml(t('onboarding.step_counter', 'Step {n} of {total}').replace('{n}', String(index + 1)).replace('{total}', String(STEP_ORDER.length)))}</div>
                 </div>
                 <div class="wizard-steps">${stepCards()}</div>
                 <div class="wizard-content">
                     ${renderStepContent()}
                     <div class="wizard-footer">
-                        <div class="footer-copy">${escapeHtml(meta.footer)}</div>
+                        <div class="footer-copy">${escapeHtml(t('onboarding.step.' + state.currentStep + '.footer', meta.footer))}</div>
                         <div class="footer-actions">
-                            <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving ? 'disabled' : ''}>Back</button>
+                            <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving ? 'disabled' : ''} data-i18n="onboarding.back">Back</button>
                             <button class="btn btn-primary" id="next-btn" type="button" ${nextButtonShouldBeDisabled() ? 'disabled' : ''}>${escapeHtml(nextLabel)}</button>
                         </div>
                     </div>
@@ -857,6 +897,7 @@
                 </div>
             </div>
         `;
+        applyWizardTranslations(root);
         bindEvents();
         renderLocalStatus();
         renderClaudeCliStatus();
