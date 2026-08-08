@@ -26,18 +26,31 @@ log = logging.getLogger(__name__)
 _MAX_IMPORT_ROWS = 1000
 
 
-def _row_payload(connection: registry.Connection) -> Dict[str, Any]:
-    """Catalog row + credential PRESENCE. The value itself is never included."""
+def _row_payload(connection: registry.Connection, stats: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Catalog row + credential PRESENCE + measured rating. No secret, ever."""
     row = connection.to_public_dict()
     row["credential_configured"] = registry.has_credential(connection)
     row["editable"] = connection.origin != registry.ORIGIN_LEGACY
+    # `rating` stays null for a connection nobody has used yet — "not measured"
+    # is a different statement from "measured badly", and the UI must show it as
+    # such rather than as a zero.
+    row["rating"] = (stats or {}).get(connection.connection_id)
     return row
 
 
 async def api_connections_list(request: Request) -> JSONResponse:
     """GET /api/connections — the catalog plus the legacy projection."""
     try:
-        rows = [_row_payload(conn) for conn in registry.all_connections()]
+        from ouroboros.connection_rating import collect_stats
+
+        try:
+            stats = {cid: item.to_public_dict() for cid, item in collect_stats().items()}
+        except Exception:
+            # Ratings are an overlay on the catalog; losing them must not take the
+            # page down with them.
+            log.warning("connection ratings unavailable", exc_info=True)
+            stats = {}
+        rows = [_row_payload(conn, stats) for conn in registry.all_connections()]
     except Exception as exc:  # storage-level failure must not 500 the whole UI
         log.warning("connections list failed", exc_info=True)
         return json_error(f"could not read the connection registry: {exc}", 500)

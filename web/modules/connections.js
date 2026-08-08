@@ -57,6 +57,21 @@ function privacyLabel(value) {
     return t('connections.privacy.unknown', 'Unknown');
 }
 
+/** Rating chip. An unmeasured connection says so — it never shows as 0%. */
+function ratingHtml(rating) {
+    if (!rating || rating.success_rate === null || rating.success_rate === undefined) {
+        const attempts = rating ? rating.observations || 0 : 0;
+        return `<span class="connections-chip muted">${escapeHtml(
+            t('connections.rating_pending', 'not rated yet ({n})', { n: attempts }),
+        )}</span>`;
+    }
+    const percent = Math.round(rating.success_rate * 100);
+    const tone = percent >= 90 ? 'ok' : (percent >= 60 ? 'muted' : 'warn');
+    return `<span class="connections-chip ${tone}">${escapeHtml(
+        t('connections.rating', '{percent}% of {n}', { percent, n: rating.observations }),
+    )}</span>`;
+}
+
 function rowHtml(row) {
     const credential = row.credential_configured
         ? `<span class="connections-chip ok" data-i18n="connections.credential_set">key set</span>`
@@ -78,6 +93,7 @@ function rowHtml(row) {
                 <div class="connections-row-meta">
                     <span class="connections-chip ${PRIVACY_TONE[row.privacy] || 'muted'}">${escapeHtml(privacyLabel(row.privacy))}</span>
                     ${credential}
+                    ${ratingHtml(row.rating)}
                     ${legacy}
                     ${tags}
                 </div>

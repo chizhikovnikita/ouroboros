@@ -44,6 +44,14 @@ log = logging.getLogger(__name__)
 DEFAULT_COOLDOWN_SEC = 60.0
 AUTH_COOLDOWN_SEC = 900.0
 
+# Share of calls that ignore the rating entirely. Without it the pool would stop
+# sampling its other members and could not learn that the current favourite has
+# degraded — or that a newly added connection is good.
+EXPLORATION_SHARE = 0.15
+# Success rate is a noisy estimate; connections within this band of the best are
+# treated as equally good so a hair's difference does not starve one.
+RATING_TIE_BAND = 0.05
+
 _COOLDOWN_LOCK = threading.Lock()
 # connection_id -> unix time when it may be tried again. Process-local ON PURPOSE:
 # a cooldown is a hint that decays, not durable state worth a disk write on every
@@ -152,6 +160,38 @@ def _at_concurrency_limit(connection: registry.Connection, counts: Mapping[str, 
     return counts.get(connection.connection_id, 0) >= connection.max_concurrent
 
 
+def _prefer_better_rated(
+    pool: Sequence[registry.Connection], root: pathlib.Path | str | None
+) -> list:
+    """Narrow to the best-rated connections, keeping an exploration share.
+
+    Pure exploitation would starve every connection that has not proven itself,
+    including the ones an owner just added — and a pool that never tries its other
+    members cannot notice the favourite degrading. So a slice of calls deliberately
+    ignores the ranking.
+    """
+    ranked = list(pool)
+    if len(ranked) < 2:
+        return ranked
+    try:
+        from ouroboros.connection_rating import rank_value, collect_stats
+
+        if random.random() < EXPLORATION_SHARE:
+            return ranked
+        stats = collect_stats(root)
+        best = max(rank_value(stats.get(conn.connection_id)) for conn in ranked)
+        # Everything within the band counts as "as good as the best": success rate
+        # is a noisy estimate and a hair's difference is not a reason to starve one.
+        top = [
+            conn for conn in ranked
+            if rank_value(stats.get(conn.connection_id)) >= best - RATING_TIE_BAND
+        ]
+        return top or ranked
+    except Exception:
+        log.debug("rating unavailable; routing without it", exc_info=True)
+        return ranked
+
+
 def candidates(
     model: str,
     root: pathlib.Path | str | None = None,
@@ -202,6 +242,8 @@ def select(
         # Everything is at its declared ceiling. Refusing here would fail a send
         # the provider might well accept, so the least-loaded one still goes.
         open_slots = list(pool)
+
+    open_slots = _prefer_better_rated(open_slots, root)
 
     fewest = min(counts.get(conn.connection_id, 0) for conn in open_slots)
     least_loaded = [conn for conn in open_slots if counts.get(conn.connection_id, 0) == fewest]

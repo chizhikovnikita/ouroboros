@@ -228,5 +228,7 @@
   "connections.field.kind": "Тип",
   "connections.field.privacy": "Приватность данных",
   "connections.field.base_url": "Базовый URL",
-  "connections.field.secret": "Учётные данные"
+  "connections.field.secret": "Учётные данные",
+  "connections.rating_pending": "нет оценки ({n})",
+  "connections.rating": "{percent}% из {n}"
 }

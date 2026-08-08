@@ -895,6 +895,9 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "state": state,
             "model": reservation.model,
             "provider": reservation.provider,
+            # Carried forward so EVERY row is self-describing: a reader that only
+            # sees terminal rows must still know which connection was billed.
+            "connection_id": str(current.get("connection_id") or reservation.connection_id or ""),
             "reservation_upper_bound_usd": reservation.reservation_upper_bound_usd,
             "pricing_known": current.get("pricing_known"),
             "reservation_basis": current.get("reservation_basis"),

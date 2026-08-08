@@ -121,6 +121,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── provider_models.py   ← Provider-specific model ID helpers, direct-provider defaults (OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat)
       ├── connections.py       ← Connection registry (stage 1): every usable route to models — API keys, subscription accounts, endpoints — as a first-class entity with a stable id, an owner-declared data-privacy value and its own limits. Catalog in `state/connections.json`, credentials in a sibling `state/connections_secrets.json` (0600); legacy single-provider keys are PROJECTED, never copied, so a one-key install keeps working with an empty registry
       ├── connection_pool.py   ← Connection selection (stage 2): eligibility, load spreading, per-connection concurrency ceilings, cooldown/failover, and the overlay onto the provider target. In-flight is DERIVED from reserved/dispatched ledger rows (cross-process by construction), never stored separately
+      ├── connection_rating.py ← Per-connection rating (stage 3) folded from the usage ledger: success rate, failures, realized cost. Absence of data is None, NEVER zero — an unrated connection is ranked optimistically and keeps an exploration share, or it would never earn the traffic that rates it
       ├── runtime_mode_policy.py ← Runtime-mode protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by registry, git tools, and Claude gateway guards
       ├── schedule_contract.py ← Schedule id, 5-field cron, and IANA timezone validation SSOT shared by gateway, manifests, and supervisor queue
       ├── reflection.py        ← Execution reflection and pattern capture
@@ -1034,6 +1035,30 @@ page keeps working with an empty registry — the provider-independence invarian
 value: whether a vendor trains on submitted data is a contractual fact no probe can
 discover, so an omitted declaration is never read as permission. The sensitivity
 gate (stage 4) keys off an explicit `no_training` only.
+
+### Connection rating
+
+`connection_rating.collect_stats()` folds `state/usage_attempts.jsonl` into
+per-connection behavior — success rate, failures, realized cost. It needs no new
+telemetry: every physical send already lands there, and it is the one authority
+that cannot quietly disagree with the bill.
+
+The rule that shapes the whole module: **absence of data is `None`, never zero.**
+A connection nobody has used has no success rate, not a rate of 0. A zero would
+sort it last forever, so it would never receive the traffic that would rate it —
+the pool would collapse onto whichever connection was tried first and stop
+noticing the others degrade. Unrated connections are therefore ranked
+optimistically (just under a perfect record: better than anything with real
+failures, worse than a proven one), and a rate computed from fewer than
+`MIN_OBSERVATIONS` sends stays unrated because it is noise.
+
+A released reservation — reserved, then handed back without a send — is tracked
+but is never a failure: it is a budget decision, not evidence about the provider.
+
+Selection narrows to the best-rated band, but `EXPLORATION_SHARE` of calls ignore
+the ranking outright. Without that a pool never samples its alternatives, so it
+cannot learn that its favourite has rotted or that a newly added key is good. The
+UI shows an unmeasured connection as "not rated yet", never as 0%.
 
 ### Connection selection (the pool orchestrator)
 
