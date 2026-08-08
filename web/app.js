@@ -248,7 +248,10 @@ async function openProjectPanel(project, { closeDrawer = true } = {}) {
             idPrefix: `pchat-${project.id}`,
             mountEl: projectPanelBody,
             asPanel: true,
+            // The title here is the project NAME — content, never chrome. Empty key
+            // so it can never be looked up in a translation catalog.
             title: project.name || project.id,
+            titleKey: '',
         });
         projectInstances.set(project.id, inst);
     }

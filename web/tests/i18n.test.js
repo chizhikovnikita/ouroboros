@@ -137,7 +137,9 @@ function keysUsedInSource(blob) {
     // Declarative descriptors (renderTabStrip items, renderPageHeader) name their
     // key as data. Listed explicitly rather than matched as `*Key:` so unrelated
     // descriptor fields (settingKey, stateKey, …) can never be read as i18n keys.
-    for (const m of blob.matchAll(/(?:i18nKey|titleKey|descriptionKey):\s*'([a-z0-9_.]+)'/g)) keys.add(m[1]);
+    // `[:=]` covers both forms: an object property (`titleKey: 'x'`) and a default
+    // parameter value (`titleKey = 'x'`).
+    for (const m of blob.matchAll(/(?:i18nKey|titleKey|descriptionKey)\s*[:=]\s*'([a-z0-9_.]+)'/g)) keys.add(m[1]);
     for (const m of blob.matchAll(/data-i18n-attr="([^"]+)"/g)) {
         for (const pair of m[1].split(',')) {
             const parts = pair.split(':');

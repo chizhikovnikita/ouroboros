@@ -382,7 +382,7 @@ export function initChat(ctx) {
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
-    asPanel = false, title = 'Chat',
+    asPanel = false, title = 'Chat', titleKey = 'chat.page_title',
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
@@ -402,6 +402,7 @@ export function createChatInstance({
         ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline" data-i18n="chat.connecting">Connecting...</span></div>`
         : renderPageHeader({
             title: title,
+            titleKey: titleKey,
             icon: PAGE_ICONS.chat,
             variant: 'overlay',
             className: 'chat-page-header',
@@ -447,7 +448,7 @@ export function createChatInstance({
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
                     <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                    <textarea id="chat-input" placeholder="Message Ouroboros..." data-i18n-attr="placeholder:chat.input_placeholder" rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
                     <div class="chat-send-group">
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
@@ -2313,14 +2314,14 @@ export function createChatInstance({
             }
             syncLiveCardToggle(record);
             if (drivesComposerStatus) {
-                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? 'Attention' : 'Online');
+                setStatus(summary.phase === 'error' || summary.phase === 'timeout' ? 'error' : 'online', summary.phase === 'error' || summary.phase === 'timeout' ? t('chat.status_attention', 'Attention') : t('chat.status_online', 'Online'));
             }
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
                 setStatus('thinking', 'Working...');
             } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Online');
+                setStatus('online', t('chat.status_online', 'Online'));
             }
         }
         if (summary.expandByDefault) {
@@ -2360,7 +2361,7 @@ export function createChatInstance({
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
         if (!hasActiveLiveCard()) {
             setStatus(activePhase === 'error' || activePhase === 'timeout' ? 'error' : 'online',
-                      activePhase === 'error' || activePhase === 'timeout' ? 'Attention' : 'Online');
+                      activePhase === 'error' || activePhase === 'timeout' ? t('chat.status_attention', 'Attention') : t('chat.status_online', 'Online'));
         }
     }
 
@@ -3667,7 +3668,7 @@ export function createChatInstance({
         // the live socket so a late-created panel never gets stuck on
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
-        if (ws.isConnected?.()) setStatus('online', 'Online');
+        if (ws.isConnected?.()) setStatus('online', t('chat.status_online', 'Online'));
     } else {
         refreshHeaderControlState(true);
         setInterval(refreshHeaderControlState, 3000);
@@ -3701,7 +3702,7 @@ export function createChatInstance({
     function hideTyping() {
         hideTypingIndicatorOnly();
         if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Online');
+            setStatus('online', t('chat.status_online', 'Online'));
         }
     }
 
@@ -4021,7 +4022,7 @@ export function createChatInstance({
     let wsHasConnectedOnce = false;
 
     ws.on('open', () => {
-        setStatus('online', 'Online');
+        setStatus('online', t('chat.status_online', 'Online'));
         refreshHeaderControlState(true);
         const reconnectBanner =
             pendingReconnectBannerText
