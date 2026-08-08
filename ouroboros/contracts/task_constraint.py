@@ -43,8 +43,18 @@ class TaskConstraint:
     base_sha: str = ""
     protected_paths_grant: bool = False
     external_tool_grants: tuple[str, ...] = ()
+    # How sensitive this work's DATA is ("" / "public" / "sensitive"). Sensitive
+    # work may only travel over connections that explicitly declare they are not
+    # trained on. Machine-enforced in the connection pool's candidate filter, not
+    # in prompt text — and a child can only ever RAISE it (see usage_scope).
+    data_sensitivity: str = ""
     parent_only_commit: bool = True
     return_kind: str = "workspace_patch"
+
+
+def _sensitivity(value: Any) -> str:
+    """Read a declared data-sensitivity label off a raw constraint mapping."""
+    return str(value.get("data_sensitivity") or "").strip().lower()
 
 
 def normalize_task_constraint(value: Any) -> Optional[TaskConstraint]:
@@ -63,7 +73,10 @@ def normalize_task_constraint(value: Any) -> Optional[TaskConstraint]:
         extra = ()
     mode = str(value.get("mode") or "normal").strip() or "normal"
     if mode == _LOCAL_READONLY_SUBAGENT_MODE:
-        return TaskConstraint(mode=_LOCAL_READONLY_SUBAGENT_MODE, allow_enable=False, allow_review=False)
+        return TaskConstraint(
+            mode=_LOCAL_READONLY_SUBAGENT_MODE, allow_enable=False, allow_review=False,
+            data_sensitivity=_sensitivity(value),
+        )
     if mode == _ACTING_SUBAGENT_MODE:
         return _normalize_acting_constraint(value, extra)
     return TaskConstraint(
@@ -73,6 +86,7 @@ def normalize_task_constraint(value: Any) -> Optional[TaskConstraint]:
         allow_enable=_coerce_bool(value.get("allow_enable", True), default=True),
         allow_review=_coerce_bool(value.get("allow_review", True), default=True),
         extra_allowlist=tuple(str(item) for item in extra if str(item).strip()),
+        data_sensitivity=_sensitivity(value),
     )
 
 
@@ -98,6 +112,7 @@ def _normalize_acting_constraint(value: Mapping, extra: Any) -> TaskConstraint:
         external_tool_grants=tuple(str(g).strip() for g in grants_raw if str(g).strip()),
         parent_only_commit=True,
         return_kind=str(value.get("return_kind") or "workspace_patch").strip() or "workspace_patch",
+        data_sensitivity=_sensitivity(value),
     )
 
 

@@ -1036,6 +1036,47 @@ value: whether a vendor trains on submitted data is a contractual fact no probe 
 discover, so an omitted declaration is never read as permission. The sensitivity
 gate (stage 4) keys off an explicit `no_training` only.
 
+### Data-sensitivity gate
+
+Work carries a sensitivity label (`TaskConstraint.data_sensitivity`, ambient on
+`UsageScope.data_sensitivity`). Sensitive work may only travel over a connection
+that **explicitly** declares `privacy: no_training`. `unknown` is not permission:
+whether a vendor trains on submitted data is a contractual fact, so an undeclared
+connection is exactly the one that cannot be vouched for.
+
+The gate lives in the pool's CANDIDATE FILTER and nowhere else. A ranking penalty
+could be outweighed by a cheap, fast, well-rated provider, and prompt text is not
+a fence at all — so a training connection is simply absent from the list.
+
+**It fails closed in every direction**, which is the opposite of how the rest of
+the pool degrades (everything else prefers "route anyway" over failing a send,
+because a slow task beats a dead one — but sending the owner's private data to a
+vendor that trains on it is not a tradeoff availability can buy):
+
+| Situation | Public work | Sensitive work |
+|---|---|---|
+| No cleared connection | environment credential | `NoPermittedConnection` |
+| Registry unreadable | environment credential | `NoPermittedConnection` |
+| Only a legacy/env key (no declaration) | used as before | `NoPermittedConnection` |
+| `OUROBOROS_DISABLE_CONNECTION_POOL=1` | pool off | `NoPermittedConnection` |
+| Unknown/misspelled label | — | treated as the strictest |
+| Sensitivity unreadable | — | assumed sensitive |
+
+Returning `None` there would mean "the pool has no opinion, use the environment
+key" — precisely the send the gate exists to prevent — so the refusal is an
+exception, not an absence.
+
+**The label ratchets.** `usage_scope()` gives a nested scope the stricter of its
+own label and its parent's, so a subtask cannot widen where its parent's data may
+travel. Enforcing it at that one choke point rather than at each call site is
+deliberate: too many places build a child scope for "remember to propagate it" to
+be a guarantee. Every `normalize_task_constraint` branch carries the label for the
+same reason — the restricted-subagent branches build a fresh constraint, and
+dropping it there would be a silent widening.
+
+Self-modification defaults to sensitive: the repository is the owner's private
+work. `OUROBOROS_DEFAULT_DATA_SENSITIVITY` sets the default for everything else.
+
 ### Connection rating
 
 `connection_rating.collect_stats()` folds `state/usage_attempts.jsonl` into

@@ -61,6 +61,49 @@ VALID_PRIVACY: frozenset[str] = frozenset({
 ORIGIN_REGISTRY = "registry"
 ORIGIN_LEGACY = "legacy_settings"
 
+# How sensitive the DATA of a piece of work is. Ordered: a higher rank may only
+# travel over connections cleared for that rank. Kept deliberately two-valued —
+# a gate nobody can reason about is a gate nobody sets correctly.
+SENSITIVITY_PUBLIC = "public"
+SENSITIVITY_SENSITIVE = "sensitive"
+SENSITIVITY_RANK: dict[str, int] = {
+    "": 0,
+    SENSITIVITY_PUBLIC: 0,
+    SENSITIVITY_SENSITIVE: 1,
+}
+VALID_SENSITIVITY: frozenset[str] = frozenset(SENSITIVITY_RANK)
+
+
+def sensitivity_rank(value: Any) -> int:
+    """Rank of a sensitivity label; an unknown label is treated as the STRICTEST.
+
+    Fail-closed on purpose: a typo or a label from a newer version must not
+    silently downgrade to "anything may carry this".
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0
+    return SENSITIVITY_RANK.get(text, max(SENSITIVITY_RANK.values()))
+
+
+def stricter_sensitivity(left: Any, right: Any) -> str:
+    """The more restrictive of two labels."""
+    left_text = str(left or "").strip().lower()
+    right_text = str(right or "").strip().lower()
+    return left_text if sensitivity_rank(left_text) >= sensitivity_rank(right_text) else right_text
+
+
+def connection_allows_sensitivity(connection: "Connection", sensitivity: Any) -> bool:
+    """Whether ``connection`` may carry work of this sensitivity.
+
+    Sensitive work requires an EXPLICIT ``no_training`` declaration. `unknown` is
+    not permission: whether a vendor trains on submitted data is a contractual
+    fact, and an undeclared connection is exactly the one we cannot vouch for.
+    """
+    if sensitivity_rank(sensitivity) <= 0:
+        return True
+    return connection.privacy == PRIVACY_NO_TRAINING
+
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,63}$")
 _ID_MAX_CHARS = 64
 

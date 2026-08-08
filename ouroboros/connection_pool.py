@@ -59,6 +59,16 @@ _COOLDOWN_LOCK = threading.Lock()
 _COOLDOWN_UNTIL: Dict[str, float] = {}
 
 
+class NoPermittedConnection(RuntimeError):
+    """Sensitive work has no connection cleared to carry it.
+
+    Raised rather than returning None, and that distinction is the whole gate:
+    None means "the pool has no opinion, use the environment credential", which
+    for sensitive work would hand the data to whatever key happens to be in the
+    environment — exactly the provider the gate exists to avoid.
+    """
+
+
 @dataclass(frozen=True)
 class Selection:
     """One chosen connection plus the credential material it carries."""
@@ -192,17 +202,56 @@ def _prefer_better_rated(
         return ranked
 
 
+def active_sensitivity() -> str:
+    """Data sensitivity bound to this execution context, if any."""
+    try:
+        from ouroboros.usage_accounting import current_usage_scope
+
+        scope = current_usage_scope()
+        return str(getattr(scope, "data_sensitivity", "") or "") if scope is not None else ""
+    except Exception:
+        # Fail CLOSED: if the ambient sensitivity cannot be read, assume the work
+        # is sensitive rather than assuming it is safe to send anywhere.
+        log.warning("data sensitivity unreadable; treating this work as sensitive", exc_info=True)
+        return registry.SENSITIVITY_SENSITIVE
+
+
 def candidates(
     model: str,
     root: pathlib.Path | str | None = None,
     *,
     env: Mapping[str, str] | None = None,
+    sensitivity: Optional[str] = None,
 ) -> Tuple[registry.Connection, ...]:
-    """Connections eligible to carry ``model`` right now, cooldown applied."""
+    """Connections eligible to carry ``model`` right now.
+
+    The privacy gate is applied HERE, in candidate selection, and nowhere else:
+    a connection that may train on the data is simply absent from the list for
+    sensitive work, however cheap or fast or well-rated it is. A gate expressed as
+    a ranking penalty or as prompt text is one a cheap provider can outweigh.
+    """
     usable = registry.usable_connections(model, root, env=env)
+
+    level = active_sensitivity() if sensitivity is None else sensitivity
+    if registry.sensitivity_rank(level) > 0:
+        permitted = tuple(
+            conn for conn in usable if registry.connection_allows_sensitivity(conn, level)
+        )
+        if not permitted:
+            # Deliberately NOT falling back to the full set. Everything else in
+            # this module degrades toward "route anyway", because failing a send
+            # is worse than a slow one — but here the failure mode is sending the
+            # owner's sensitive data to a vendor that trains on it, which no
+            # amount of availability justifies.
+            log.warning(
+                "no connection cleared for %s work on %s; refusing to route", level, model
+            )
+            return ()
+        usable = permitted
+
     ready = tuple(conn for conn in usable if not cooling_down(conn.connection_id))
     # Every candidate resting is not the same as having none: rather than fail the
-    # send, fall back to the full usable set and let the provider decide.
+    # send, fall back to the full permitted set and let the provider decide.
     return ready or usable
 
 
@@ -212,6 +261,7 @@ def select(
     *,
     env: Mapping[str, str] | None = None,
     exclude: Sequence[str] = (),
+    sensitivity: Optional[str] = None,
 ) -> Optional[Selection]:
     """Choose a connection for ``model``, or None when the pool has no opinion.
 
@@ -219,21 +269,37 @@ def select(
     target exactly as before, which is how an install with no registry keeps
     behaving identically.
     """
+    level = active_sensitivity() if sensitivity is None else sensitivity
+    sensitive = registry.sensitivity_rank(level) > 0
+
     try:
-        pool = candidates(model, root, env=env)
+        pool = candidates(model, root, env=env, sensitivity=level)
+    except NoPermittedConnection:
+        raise
     except Exception:
+        if sensitive:
+            # The environment fallback is not available to sensitive work: an
+            # unreadable registry must stop the send, not silently widen it.
+            raise NoPermittedConnection(
+                f"cannot establish which connections may carry {level} work for {model}"
+            )
         log.warning("connection selection failed; falling back to environment credentials", exc_info=True)
         return None
 
     excluded = {str(item) for item in exclude}
     pool = tuple(conn for conn in pool if conn.connection_id not in excluded)
     if not pool:
+        if sensitive:
+            raise NoPermittedConnection(
+                f"no connection is cleared to carry {level} work for {model}"
+            )
         return None
 
     # A single legacy-projected connection is exactly today's behavior; letting it
     # fall through keeps the environment path untouched instead of rebuilding an
-    # identical target through the overlay.
-    if len(pool) == 1 and pool[0].origin == registry.ORIGIN_LEGACY:
+    # identical target through the overlay. Sensitive work never takes this shortcut
+    # — the environment credential carries no privacy declaration at all.
+    if not sensitive and len(pool) == 1 and pool[0].origin == registry.ORIGIN_LEGACY:
         return None
 
     counts = in_flight_counts(root)
@@ -253,6 +319,10 @@ def select(
 
     credentials = _credentials_for(chosen, root)
     if not credentials and chosen.kind != registry.KIND_ENDPOINT:
+        if sensitive:
+            raise NoPermittedConnection(
+                f"the only connection cleared for {level} work on {model} has no credential"
+            )
         return None
     return Selection(connection=chosen, credentials=credentials)
 
@@ -272,11 +342,21 @@ def apply_to_target(target: Dict[str, Any], model: str, root: pathlib.Path | str
     opinion the target is returned untouched.
     """
     if os.environ.get("OUROBOROS_DISABLE_CONNECTION_POOL", "").strip().lower() in ("1", "true", "yes"):
+        # An availability switch must not double as a privacy bypass: turning the
+        # pool off may not turn a sensitivity gate off with it.
+        if registry.sensitivity_rank(active_sensitivity()) > 0:
+            raise NoPermittedConnection(
+                "the connection pool is disabled, so no connection can be cleared for sensitive work"
+            )
         return target
 
     provider = str(target.get("provider") or provider_for_model(model))
     try:
         selection = select(model, root)
+    except NoPermittedConnection:
+        # Never downgraded to "use the environment key": that is precisely the
+        # send this refusal exists to prevent.
+        raise
     except Exception:
         log.warning("connection overlay skipped", exc_info=True)
         return target

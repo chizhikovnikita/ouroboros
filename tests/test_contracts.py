@@ -1375,3 +1375,21 @@ def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, 
     assert "context mode" in notice.lower(), "the notice must name the control that now decides"
     # The owner's customization is stored even though it is enforcement-inert.
     assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
+
+
+def test_task_constraint_pins_the_data_sensitivity_field():
+    """`data_sensitivity` is the machine-enforced privacy gate's carrier.
+
+    Pinned here because removing or renaming it would not fail any routing test —
+    the pool would simply read an empty label and treat every task as public,
+    which is a silent widening of where the owner's data may travel.
+    """
+    from ouroboros.contracts.task_constraint import (
+        TaskConstraint,
+        normalize_task_constraint,
+    )
+
+    assert hasattr(TaskConstraint(), "data_sensitivity")
+    assert TaskConstraint().data_sensitivity == ""
+    carried = normalize_task_constraint({"mode": "normal", "data_sensitivity": "sensitive"})
+    assert carried.data_sensitivity == "sensitive"

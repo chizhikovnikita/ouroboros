@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import dataclasses
 import hashlib
 import json
 import logging
@@ -110,6 +111,10 @@ class UsageScope:
     source: str = "llm"
     global_limit_usd: Optional[float] = None
     root_limit_usd: Optional[float] = None
+    # Ambient data-sensitivity for everything sent inside this scope. Carried here
+    # rather than threaded through every call site because the transport is many
+    # layers below the task that knows the answer — the same reason task_id is.
+    data_sensitivity: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,7 +153,21 @@ class AttemptReservation:
 
 @contextlib.contextmanager
 def usage_scope(scope: UsageScope) -> Iterator[UsageScope]:
-    """Bind task/root attribution for physical sends in this execution context."""
+    """Bind task/root attribution for physical sends in this execution context.
+
+    Data sensitivity RATCHETS: a nested scope inherits the stricter of its own
+    label and the one already bound. Enforcing it here rather than at each call
+    site is the point — a subtask must not be able to widen where its parent's
+    data may travel, and there are too many places that build a child scope for
+    "remember to propagate it" to be a real guarantee.
+    """
+    parent = _CURRENT_SCOPE.get()
+    if parent is not None:
+        from ouroboros.connections import sensitivity_rank, stricter_sensitivity
+
+        strictest = stricter_sensitivity(scope.data_sensitivity, parent.data_sensitivity)
+        if sensitivity_rank(strictest) > sensitivity_rank(scope.data_sensitivity):
+            scope = dataclasses.replace(scope, data_sensitivity=strictest)
     token = _CURRENT_SCOPE.set(scope)
     try:
         yield scope

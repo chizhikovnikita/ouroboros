@@ -60,6 +60,29 @@ _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
 
 
+def _task_data_sensitivity(task: Dict[str, Any]) -> str:
+    """Data sensitivity for one task: its own label, else the owner's default.
+
+    Self-modification is treated as sensitive unless the owner says otherwise —
+    the repository IS the owner's private work, and defaulting it to "anything may
+    carry this" would be the wrong direction in which to be wrong.
+    """
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+
+    try:
+        constraint = normalize_task_constraint(task.get("task_constraint"))
+        declared = str(getattr(constraint, "data_sensitivity", "") or "").strip().lower()
+    except Exception:
+        declared = ""
+    if declared:
+        return declared
+
+    default = str(os.environ.get("OUROBOROS_DEFAULT_DATA_SENSITIVITY", "") or "").strip().lower()
+    if default:
+        return default
+    return "sensitive" if str(task.get("type") or "") in ("evolution", "self_improvement") else ""
+
+
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> str:
     """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
 
@@ -925,6 +948,7 @@ class OuroborosAgent:
         except (TypeError, ValueError):
             root_limit = 0.0
         scope = UsageScope(
+            data_sensitivity=_task_data_sensitivity(task),
             drive_root=budget_root,
             task_id=task_id,
             root_task_id=root_task_id,
