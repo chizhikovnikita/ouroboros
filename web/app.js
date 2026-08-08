@@ -13,6 +13,7 @@ import { initEvolution } from './modules/evolution.js';
 import { initSettings } from './modules/settings.js';
 import { initCosts } from './modules/costs.js';
 import { initSkills } from './modules/skills.js';
+import { initConnections } from './modules/connections.js';
 import { initWidgets } from './modules/widgets.js';
 import { initUpdates } from './modules/updates.js';
 import { initActivity } from './modules/activity.js';
@@ -646,6 +647,7 @@ initUpdates({ ...ctx, mount: document.getElementById('dashboard-panel-updates') 
 initActivity({ ...ctx, mount: document.getElementById('dashboard-panel-activity') });
 initCosts({ ...ctx, mount: document.getElementById('dashboard-panel-costs') });
 initSkills(ctx);
+initConnections(ctx);
 initWidgets(ctx);
 initUpdateStatus(ctx);
 

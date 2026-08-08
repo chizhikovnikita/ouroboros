@@ -5957,3 +5957,114 @@ textarea.chat-input {
     vertical-align: middle;
     opacity: 0.85;
 }
+
+/* --- Connections page ---------------------------------------------------- */
+/* Built for hundreds of rows: a dense filterable list, not a card wall. Tokens
+   and the glass surface come from the shared design system above. */
+
+.connections-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 0 24px 12px;
+}
+
+.connections-search {
+    flex: 1 1 260px;
+    min-width: 200px;
+}
+
+.connections-summary {
+    padding: 0 24px 10px;
+    color: var(--text-muted, #94a3b8);
+    font-size: 13px;
+}
+
+.connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 24px 24px;
+}
+
+.connections-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.connections-row.is-disabled {
+    opacity: 0.55;
+}
+
+.connections-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.connections-row-title {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.connections-provider,
+.connections-kind {
+    color: var(--text-muted, #94a3b8);
+    font-size: 12px;
+}
+
+.connections-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.connections-chip,
+.connections-tag {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    line-height: 1.6;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.connections-chip.ok {
+    color: #86efac;
+    border-color: rgba(134, 239, 172, 0.35);
+}
+
+.connections-chip.warn {
+    color: #fca5a5;
+    border-color: rgba(252, 165, 165, 0.35);
+}
+
+.connections-chip.muted {
+    color: var(--text-muted, #94a3b8);
+}
+
+.connections-row-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.connections-empty {
+    padding: 24px;
+    color: var(--text-muted, #94a3b8);
+}
+
+@media (max-width: 720px) {
+    .connections-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}

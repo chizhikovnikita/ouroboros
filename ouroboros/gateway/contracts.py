@@ -849,6 +849,12 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/mcp/status",
     "POST /api/mcp/refresh",
     "POST /api/mcp/test",
+    # Connection registry: many keys / accounts / endpoints per provider.
+    "GET /api/connections",
+    "POST /api/connections",
+    "POST /api/connections/import",
+    "DELETE /api/connections/{connection_id}",
+    "POST /api/connections/{connection_id}/enabled",
     "GET /api/reviewer-slots",
     "GET /api/claudexor/status",
     "POST /api/claudexor/login",

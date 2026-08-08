@@ -119,6 +119,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── owner_mailbox.py      ← Per-task user message mailbox (compat module name)
       ├── launcher_bootstrap.py ← Bundle-to-repo bootstrap and managed sync helpers (used by launcher.py)
       ├── provider_models.py   ← Provider-specific model ID helpers, direct-provider defaults (OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat)
+      ├── connections.py       ← Connection registry (stage 1): every usable route to models — API keys, subscription accounts, endpoints — as a first-class entity with a stable id, an owner-declared data-privacy value and its own limits. Catalog in `state/connections.json`, credentials in a sibling `state/connections_secrets.json` (0600); legacy single-provider keys are PROJECTED, never copied, so a one-key install keeps working with an empty registry
       ├── runtime_mode_policy.py ← Runtime-mode protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by registry, git tools, and Claude gateway guards
       ├── schedule_contract.py ← Schedule id, 5-field cron, and IANA timezone validation SSOT shared by gateway, manifests, and supervisor queue
       ├── reflection.py        ← Execution reflection and pattern capture
@@ -999,6 +1000,39 @@ Shown when `settings.json` does not contain any supported remote provider key an
 - v6.27.0 benchmark-harness hardening (rationale, so future maintainers need not dig commits): (1) **Service `keep_alive` / `service_teardown=keep`** lets a service deliberately outlive its task so an external verifier can connect; it stays custody-ledgered and dies on session change/panic, and cancel/hard-timeout worker kills now spare ledgered keep services (`kill_pid_tree(exclude_pids=...)`, POSIX-only — on Windows `kill_pid_tree` tree-kills via `taskkill /T` and does not honor exclusions, so `service_teardown=keep` is not preserved across Windows cancel/hard-timeout). (2) **Safety parse** does a robust bracket-scan + one same-slot repair retry, then fails closed — the worst-status object across candidates wins so an echoed `SAFE` cannot mask a `DANGEROUS` verdict. (3) **Deadline milestones** (50/25/10% remaining) and the deadline-derived `run_command` cap fire only when a task carries `deadline_at`; they are inert on Terminal-Bench leaderboard runs by design (Harbor owns task timeouts). (4) **External-workspace git policy** allows full local git in a task workspace while deterministically blocking any git that targets the Ouroboros self-repo/data via cwd, `-C`, `--git-dir`/`--work-tree`, `GIT_DIR`/`GIT_WORK_TREE` env, positional path, or glued/newline-separated segments. (5) **`search_code`** pre-enumerates a policy-gated file list (each path filtered through `path_allowed` before rg sees it — a security property), skips non-regular and oversized files, caps the scan at `MAX_SEARCH_FILES_SCANNED` with an explicit "scan stopped at N files" note, and hands the list to rg in batches (`batch_size=400`) to stay under `ARG_MAX`, so a search whose root resolves to `/` cannot OOM or `E2BIG` the worker. (6) **Review enforcement** (advisory vs blocking) is owner-only; the agent must not hardcode findings to always-block (BIBLE P3), pinned by item-agnostic invariant tests in the frozen contract suite.
 - When Cloud.ru is the only configured remote runtime, first-run model defaults use explicit `cloudru::...` IDs from `provider_models.CLOUDRU_DIRECT_DEFAULTS`. OpenAI-compatible endpoints are first-run capable but never receive guessed defaults: the wizard asks for the base URL/key, can proxy `/models` through `/api/openai-compatible/models`, and requires explicit `openai-compatible::...` model slot values because arbitrary compatible endpoints have no universal safe model ID.
 - Closing the wizard without saving is non-fatal: the main app still launches and the user can finish configuration in Settings.
+
+### Connection registry
+
+A *connection* is one usable route to models: an API key, a subscription account,
+or an endpoint. Before it, a provider had exactly one credential
+(`provider_models.PROVIDER_ENV_KEYS`), so "several OpenAI keys", "three ChatGPT
+accounts" or "two local endpoints" had nowhere to live — which capped how widely
+parallel agents could be spread.
+
+Two files, deliberately separate, both under `data/state/`:
+
+| File | Holds | Why separate |
+|---|---|---|
+| `connections.json` | the catalog | no secrets, so the gateway can serve it wholesale |
+| `connections_secrets.json` | credentials, keyed by connection id, mode `0600` | never enters a response by construction |
+
+The catalog deliberately does **not** live in `settings.json`: that file is read and
+masked as one blob, and hundreds of rows would not survive it.
+
+`connection_id` is a stable owner-visible identity, never an array index — a row's
+measured history and budget attribution can only line up with one identity, so
+reordering the catalog must not re-point them.
+
+**Legacy keys are projected, not migrated.** A configured `OPENAI_API_KEY` appears
+as a read-only `legacy:openai` connection whose value is read live from settings at
+use time. The settings key stays the single authority for its own value, nothing is
+copied into a second place that could drift, and an install that never opens the new
+page keeps working with an empty registry — the provider-independence invariant.
+
+`privacy` is `no_training | trains_on_data | unknown`, and `unknown` is its own
+value: whether a vendor trains on submitted data is a contractual fact no probe can
+discover, so an omitted declaration is never read as permission. The sensitivity
+gate (stage 4) keys off an explicit `no_training` only.
 
 ### Launcher-managed bundle bootstrap
 

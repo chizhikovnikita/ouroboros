@@ -68,6 +68,13 @@ def collect_routes(
     )
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
+    from ouroboros.gateway.connections import (
+        api_connections_delete,
+        api_connections_import,
+        api_connections_list,
+        api_connections_set_enabled,
+        api_connections_upsert,
+    )
     from ouroboros.gateway.models import (
         api_local_model_install_runtime,
         api_local_model_start,
@@ -241,6 +248,20 @@ def collect_routes(
         Route(
             "/api/local-model/install-runtime",
             endpoint=api_local_model_install_runtime,
+            methods=["POST"],
+        ),
+        # Connection registry: many keys/accounts/endpoints per provider.
+        Route("/api/connections", endpoint=api_connections_list, methods=["GET"]),
+        Route("/api/connections", endpoint=api_connections_upsert, methods=["POST"]),
+        Route("/api/connections/import", endpoint=api_connections_import, methods=["POST"]),
+        Route(
+            "/api/connections/{connection_id}",
+            endpoint=api_connections_delete,
+            methods=["DELETE"],
+        ),
+        Route(
+            "/api/connections/{connection_id}/enabled",
+            endpoint=api_connections_set_enabled,
             methods=["POST"],
         ),
         Route("/api/mcp/status", endpoint=api_mcp_status, methods=["GET"]),
