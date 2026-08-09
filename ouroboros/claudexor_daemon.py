@@ -319,7 +319,15 @@ class OwnedClaudexorDaemon:
                 # a PATH holding only the Node bin dir (the engine then reports
                 # git_missing). Prepend onto whichever key the host actually has.
                 path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
-                env[path_key] = f"{command_bin}{os.pathsep}{env.get(path_key, '')}"
+                # An EMPTY PATH component means the CURRENT WORKING DIRECTORY on
+                # POSIX. A host with no PATH (a scrubbed service manager, a bare
+                # container unit) would otherwise leave a trailing empty entry
+                # here and make CWD an executable search root for a long-lived
+                # daemon that shells out to tools of its own. Drop every empty
+                # component; order is otherwise preserved exactly.
+                inherited = str(env.get(path_key, "") or "")
+                composed = [str(command_bin), *inherited.split(os.pathsep)]
+                env[path_key] = os.pathsep.join(part for part in composed if part)
             runtime = get_runtime_manager().status()
             log_path = config_dir / "daemon.log"
             from ouroboros.config import DATA_DIR

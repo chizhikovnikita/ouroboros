@@ -638,16 +638,41 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     outcome the call was asking for. Recording that as a failure kept ``project_owned``
     true, so the run could never settle, never left ``open_runs``, and was cancelled and
     re-retired on every sweep for as long as the process lived.
+
+    REFCOUNT DEFERRAL (the submarine wave-2 retire loop): a project registration is
+    shared by every run delegated into it, and the daemon refuses to remove a project
+    with live runs — so a run settling while siblings share the project produced a
+    doomed daemon call plus a ``PROJECT_RETIRE_FAILED`` row on EVERY sweep, forever,
+    at $0 LLM but real daemon churn and log spam. While other unsettled runs share
+    the project, only the LOWEST-run_id sharer keeps attempting (one honest retry
+    lane, so the obligation stays disclosed and the removal happens the moment the
+    daemon accepts); the rest defer QUIETLY and stay open for the next sweep. The
+    deterministic tie-break is what makes the deferral safe: some sharer always
+    attempts, so mutual deferral cannot deadlock, and once the canonical sharer
+    removes the project the others discharge on the daemon's 404.
     """
     if not (custody.project_owned and custody.project_id):
         return
+    try:
+        sharers = sorted(
+            run.run_id
+            for run in open_runs(drive_root)
+            if run.project_id == custody.project_id and run.run_id and not run.settled
+        )
+    except Exception:
+        sharers = []
+    if sharers and custody.run_id and custody.run_id != sharers[0]:
+        return  # deferred quietly: the canonical sharer carries the retry lane
     try:
         gateway.remove_project(custody.project_id)
     except Exception as exc:
         if not daemon_says_absent(exc):
             log.warning("Failed to retire delegated project %s", custody.project_id, exc_info=True)
+            # The daemon's own refusal text rides the row: "failed" without the
+            # WHY made every retire loop a forensic dig.
             emit(drive_root, PROJECT_RETIRE_FAILED, {"run_id": custody.run_id, "task_id": custody.task_id,
-                                                     "project_id": custody.project_id})
+                                                     "project_id": custody.project_id,
+                                                     "reason": str(exc)[:500]})
             return
     custody.project_owned = False
     emit(drive_root, PROJECT_RETIRED, {"run_id": custody.run_id, "task_id": custody.task_id,

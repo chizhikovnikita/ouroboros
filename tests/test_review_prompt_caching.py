@@ -11,7 +11,19 @@ import pathlib
 import pytest
 
 from ouroboros.llm import LLMClient, supports_message_cache_control
-from ouroboros.tools.review_helpers import REVIEW_CACHE_TTL, cached_prompt_blocks
+from ouroboros.tools.review_helpers import cached_prompt_blocks
+
+# The shipped global default (config.SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"]):
+# the review lanes' former REVIEW_CACHE_TTL constant collapsed into that setting, so
+# these goldens pin the DEFAULT projection ('1h') plus the explicit-value lanes below.
+_DEFAULT_GLOBAL_TTL = "1h"
+
+
+@pytest.fixture(autouse=True)
+def _pin_shipped_global_ttl(monkeypatch):
+    """Every golden in this file runs on the SHIPPED default unless it sets the
+    global itself — an ambient OUROBOROS_PROMPT_CACHE_TTL must not flip pins."""
+    monkeypatch.delenv("OUROBOROS_PROMPT_CACHE_TTL", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +76,11 @@ def test_cache_policy_empty_text_block_never_carries_marker():
     assert "cache_control" not in out[0]["content"][0]
 
 
-def test_prompt_cache_ttl_reports_extended_tier():
+def test_prompt_cache_ttl_reports_extended_tier(monkeypatch):
+    # Pinned under the explicit 'default' global: this golden is about the
+    # REPORTING contract (declared 1h -> "1h", bare -> "default", none -> None),
+    # not about the global override, which has its own goldens below.
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
     client = LLMClient(api_key="unused")
     target = _openrouter_target("anthropic/claude-fable-5")
     messages = [{
@@ -243,6 +259,7 @@ def test_finalizer_counts_the_sealed_tool_result_anchor_on_direct_anthropic(monk
     lane (`tool_result.content` is itself a list of blocks), so a one-level walker missed
     it: the main loop sits at the Anthropic cap of FOUR real breakpoints while the guard
     reported three and headroom that does not exist."""
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")  # pin the pre-override lane
     payload, usage = _send_direct_anthropic(
         monkeypatch, _main_loop_messages({"type": "ephemeral"}), _tools()
     )
@@ -331,7 +348,8 @@ def test_finalizer_keeps_gemini_markers_bare_and_adds_no_tool_marker():
     assert all("cache_control" not in tool for tool in kwargs["tools"])
 
 
-def test_finalizer_marks_only_the_last_tool_and_never_a_toolless_payload():
+def test_finalizer_marks_only_the_last_tool_and_never_a_toolless_payload(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")  # pin the pre-override lane
     client = LLMClient(api_key="unused")
     target = _openrouter_target("anthropic/claude-fable-5")
     kwargs = client._build_remote_kwargs(
@@ -350,6 +368,256 @@ def test_finalizer_marks_only_the_last_tool_and_never_a_toolless_payload():
     )
     assert client._normalize_payload_cache_ttl(target, toolless) is None
     assert _markers(toolless) == []
+
+
+# ---------------------------------------------------------------------------
+# OUROBOROS_PROMPT_CACHE_TTL — the honest global override (owner decision
+# 2026-08-08 Q2=A): consumed ONLY at the finalizer, stamps EXISTING markers only,
+# runs before the promotion rule, and is a wire NO-OP off the Anthropic family.
+# ---------------------------------------------------------------------------
+
+def _bare_marker_pack() -> list:
+    """The main loop's shape: bare (TTL-less) markers on the stable prefix."""
+    return [
+        {"role": "system", "content": [
+            {"type": "text", "text": "stable governance", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "mutable evidence"},
+        ]},
+        {"role": "user", "content": "task"},
+    ]
+
+
+def test_global_default_1h_stamps_main_loop_bare_markers():
+    """Shipped default: the main loop's bare markers leave the finalizer at 1h —
+    the v4.14.0 economics back through v6.69.0's route gate."""
+    client = LLMClient(api_key="unused")
+    target = _openrouter_target("anthropic/claude-fable-5")
+    kwargs = client._build_remote_kwargs(
+        target, _bare_marker_pack(), "high", 512, "auto", None, _tools(),
+        skip_capability_fetch=True,
+    )
+
+    assert client._normalize_payload_cache_ttl(target, kwargs) == "1h"
+
+    assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in kwargs["tools"][0]  # stamped EXISTING markers only
+    assert "cache_control" not in kwargs["messages"][0]["content"][1]
+
+
+def test_global_5m_overrides_a_caller_declared_1h(monkeypatch):
+    """HONEST override: an owner-selected '5m' really lowers a lane that declared
+    '1h' at the caller (review/safety) — the global is authority, not a floor —
+    and the reported value prices the 5m tier."""
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    client = LLMClient(api_key="unused")
+    target = _openrouter_target("anthropic/claude-fable-5")
+    kwargs = client._build_remote_kwargs(
+        target, _review_pack("1h"), "high", 512, "auto", None, _tools(),
+        skip_capability_fetch=True,
+    )
+
+    assert client._normalize_payload_cache_ttl(target, kwargs) == "5m"
+
+    assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+
+
+def test_global_default_keeps_caller_declared_ttl(monkeypatch):
+    """'default' is the pre-setting behavior byte-for-byte: bare markers stay bare
+    (provider default tier) and a caller-declared 1h still stands + promotes."""
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
+    client = LLMClient(api_key="unused")
+    target = _openrouter_target("anthropic/claude-fable-5")
+
+    bare = client._build_remote_kwargs(
+        target, _bare_marker_pack(), "high", 512, "auto", None, _tools(),
+        skip_capability_fetch=True,
+    )
+    assert client._normalize_payload_cache_ttl(target, bare) == "default"
+    assert bare["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert bare["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    declared = client._build_remote_kwargs(
+        target, _review_pack("1h"), "high", 512, "auto", None, _tools(),
+        skip_capability_fetch=True,
+    )
+    assert client._normalize_payload_cache_ttl(target, declared) == "1h"
+    assert declared["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_global_ttl_never_creates_markers_or_touches_other_routes(monkeypatch):
+    """The override stamps EXISTING breakpoints only (the d32f703d empty-block 400
+    class) and non-normalizing routes stay byte-identical (the v5.30.0 Gemini
+    ttl-field class) even at the strongest global value."""
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+    client = LLMClient(api_key="unused")
+
+    # A marker-free payload on the normalizing family gains nothing.
+    target = _openrouter_target("anthropic/claude-fable-5")
+    toolless = client._build_remote_kwargs(
+        target, [{"role": "user", "content": "hi"}], "high", 512, "auto", None, None,
+        skip_capability_fetch=True,
+    )
+    assert client._normalize_payload_cache_ttl(target, toolless) is None
+    assert _markers(toolless) == []
+
+    # Gemini keeps bare markers; the whole payload is untouched.
+    gemini = _openrouter_target("google/gemini-3.5-flash")
+    kwargs = client._build_remote_kwargs(
+        gemini, _review_pack(), "high", 512, "auto", None, _tools(),
+        skip_capability_fetch=True,
+    )
+    before = copy.deepcopy(kwargs)
+    assert client._normalize_payload_cache_ttl(gemini, kwargs) == "default"
+    assert kwargs == before
+
+
+def test_global_ttl_docstrings_name_every_consumer():
+    """Doc-vs-code pin for the ONE-chokepoint claim (ARCH2 cache-TTL pitfall).
+
+    The finalizer's docstring used to say the global TTL "is consumed HERE and
+    only here" while `review_helpers.cached_prompt_blocks(ttl=None)` reads the
+    same setting — a false sentence that a future reader would take as licence to
+    delete the other reader. Derive the readers from the code and require both
+    docstrings to name them, so the claim cannot drift from the call sites again.
+    """
+    import re
+
+    from ouroboros.config import resolve_prompt_cache_ttl
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    call = re.compile(r"resolve_prompt_cache_ttl\(\)")
+    consumers = sorted(
+        p.relative_to(repo).as_posix()
+        for p in (repo / "ouroboros").rglob("*.py")
+        if p.name != "config.py" and call.search(p.read_text(encoding="utf-8"))
+    )
+    assert consumers == [
+        "ouroboros/llm.py",
+        "ouroboros/tools/review_helpers.py",
+        "ouroboros/usage_accounting.py",
+    ], consumers
+
+    finalizer_doc = LLMClient._normalize_payload_cache_ttl.__doc__ or ""
+    assert "only here" not in finalizer_doc.lower(), (
+        "the finalizer claims exclusive consumption while these modules also read "
+        f"the setting: {consumers}"
+    )
+    assert "cached_prompt_blocks" in finalizer_doc  # names the other reader
+    resolver_doc = resolve_prompt_cache_ttl.__doc__ or ""
+    for name in ("_normalize_payload_cache_ttl", "cached_prompt_blocks", "_reservation_cost"):
+        assert name in resolver_doc, f"config's docstring omits the {name} consumer"
+
+
+def test_cache_write_split_harvested_and_priced_per_tier(monkeypatch):
+    """Anthropic reports SEPARATE 5m/1h write counters (`usage.cache_creation`);
+    a 1h request whose payload also produced 5m writes must bill only the genuine
+    1h share at the extended ratio — never a loosened ratio, never 2x on the 5m share."""
+    import requests
+    from types import SimpleNamespace
+
+    from ouroboros import pricing as pricing_mod
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda _url, headers=None, json=None, timeout=None: SimpleNamespace(
+            status_code=200, reason="OK", json=lambda: {
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 1000,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 400,
+                        "ephemeral_1h_input_tokens": 600,
+                    },
+                },
+            },
+        ),
+    )
+    client = LLMClient()
+    _message, usage = client._chat_anthropic(
+        client._resolve_remote_target("anthropic::claude-sonnet-4.6"),
+        _review_pack(),
+        _tools(),
+        "medium",
+        128,
+        "auto",
+    )
+    assert usage["prompt_cache_ttl"] == "1h"
+    assert usage["cache_write_tokens_by_ttl"] == {"5m": 400, "1h": 600}
+
+    class _P(tuple):
+        tiers = ()
+
+    table = {"anthropic/claude-fable-5": _P((10.0, 1.0, 12.5, 50.0))}
+    monkeypatch.setattr(pricing_mod, "get_pricing", lambda **k: table)
+    split_cost = pricing_mod.estimate_cost_optional(
+        "anthropic/claude-fable-5", 1000, 0,
+        cache_usage={
+            "cache_write_tokens": 1000, "prompt_cache_ttl": "1h",
+            "cache_write_tokens_by_ttl": {"5m": 400, "1h": 600},
+        },
+        allow_live_fetch=False,
+    )
+    # 400 tokens at the catalog (5m) write price + 600 at the 2x/1.25 extended ratio.
+    expected = (400 * 12.5 + 600 * 12.5 * 2.0 / 1.25) / 1_000_000
+    assert split_cost == pytest.approx(expected, abs=1e-9)
+    # Absent split: every write bills the reported tier (the pre-split behavior).
+    full_cost = pricing_mod.estimate_cost_optional(
+        "anthropic/claude-fable-5", 1000, 0,
+        cache_usage={"cache_write_tokens": 1000, "prompt_cache_ttl": "1h"},
+        allow_live_fetch=False,
+    )
+    assert full_cost == pytest.approx(1000 * 12.5 * 2.0 / 1.25 / 1_000_000, abs=1e-9)
+
+
+def test_cache_write_split_on_the_openrouter_lane_is_passthrough_dependent(monkeypatch):
+    """The per-tier split on the PRODUCTION route (anthropic/* via OpenRouter).
+
+    The existing golden above covers the direct-Anthropic lane only; the adversarial
+    read was that `_cache_write_split` must return {} on OpenRouter because the dict
+    there is "OpenAI-shaped". It is not a reshaped dict — `_normalize_remote_response`
+    mutates the RAW provider usage in place, so the harvest is passthrough-DEPENDENT,
+    not structurally dead: when the route forwards Anthropic's `cache_creation`
+    sub-object the split is harvested and priced per tier; when it does not, the
+    absent split conservatively bills every write at the reported (extended) tier.
+    Both branches are pinned so a future reader knows which one a live route hit.
+    """
+    client = LLMClient(api_key="unused")
+    target = _openrouter_target("anthropic/claude-fable-5")
+
+    def _resp(usage):
+        return {
+            "id": "gen-1",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": usage,
+        }
+
+    forwarded = {
+        "prompt_tokens": 100, "completion_tokens": 10, "cost": 0.01,
+        "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 600},
+    }
+    _msg, usage = client._normalize_remote_response(
+        _resp(forwarded), target, skip_cost_fetch=True, prompt_cache_ttl="1h",
+    )
+    assert usage["cache_write_tokens_by_ttl"] == {"5m": 400, "1h": 600}
+
+    # No passthrough (the OpenAI-shaped body OpenRouter documents): silence, and the
+    # caller's pricing then bills all writes at the reported tier — never a guess.
+    plain = {
+        "prompt_tokens": 100, "completion_tokens": 10, "cost": 0.01,
+        "prompt_tokens_details": {"cached_tokens": 90},
+    }
+    _msg2, usage2 = client._normalize_remote_response(
+        _resp(plain), target, skip_cost_fetch=True, prompt_cache_ttl="1h",
+    )
+    assert "cache_write_tokens_by_ttl" not in usage2
+    assert usage2["prompt_cache_ttl"] == "1h"
 
 
 def test_finalizer_reduces_over_cap_breakpoints_and_discloses_the_reduction(monkeypatch):
@@ -672,12 +940,27 @@ def test_build_remote_kwargs_prefers_explicit_affinity():
 
 def test_cached_prompt_blocks_structure():
     blocks = cached_prompt_blocks("STABLE", "DYNAMIC")
-    assert blocks[0]["cache_control"] == {"type": "ephemeral", "ttl": REVIEW_CACHE_TTL}
+    assert blocks[0]["cache_control"] == {"type": "ephemeral", "ttl": _DEFAULT_GLOBAL_TTL}
     assert blocks[0]["text"] == "STABLE"
     assert blocks[1]["text"] == "DYNAMIC"
     assert "cache_control" not in blocks[1]
     only = cached_prompt_blocks("STABLE")
     assert len(only) == 1
+
+
+def test_cached_prompt_blocks_projects_the_global_setting(monkeypatch):
+    """The review TTL is a runtime projection of OUROBOROS_PROMPT_CACHE_TTL (the
+    former REVIEW_CACHE_TTL constant collapsed into it): '5m' honestly lowers the
+    review lanes, 'default' emits the bare marker, an unknown value falls back to
+    the shipped default, and an explicit ttl argument stays a caller decision."""
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    assert cached_prompt_blocks("S")[0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
+    assert cached_prompt_blocks("S")[0]["cache_control"] == {"type": "ephemeral"}
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "24h")  # unknown -> shipped default
+    assert cached_prompt_blocks("S")[0]["cache_control"] == {"type": "ephemeral", "ttl": _DEFAULT_GLOBAL_TTL}
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
+    assert cached_prompt_blocks("S", ttl="1h")[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_reviewer_models_support_cache_markers_where_expected():
@@ -729,7 +1012,7 @@ def test_acceptance_request_messages_are_cache_blocked():
     assert messages[0]["role"] == "system"
     blocks = messages[0]["content"]
     assert isinstance(blocks, list)
-    assert blocks[0]["cache_control"]["ttl"] == REVIEW_CACHE_TTL
+    assert blocks[0]["cache_control"]["ttl"] == _DEFAULT_GLOBAL_TTL
     assert messages[1]["role"] == "user"
     assert '"k": "v"' in messages[1]["content"]
     # Explicit request.messages keep full authority (no rewriting).
@@ -1209,7 +1492,7 @@ def test_plan_review_messages_builder_blocks():
     from ouroboros.tools.review_synthesis import build_plan_review_messages
 
     msgs = build_plan_review_messages("SYSTEM", "STABLEDYNAMIC", 6)
-    assert msgs[0]["content"][0]["cache_control"]["ttl"] == REVIEW_CACHE_TTL
+    assert msgs[0]["content"][0]["cache_control"]["ttl"] == _DEFAULT_GLOBAL_TTL
     user_blocks = msgs[1]["content"]
     assert user_blocks[0]["text"] == "STABLE" and "cache_control" in user_blocks[0]
     assert user_blocks[1]["text"] == "DYNAMIC" and "cache_control" not in user_blocks[1]
@@ -1226,12 +1509,14 @@ def test_extended_ttl_scales_cache_write_estimate(monkeypatch):
     table = {"anthropic/claude-fable-5": _P((10.0, 1.0, 12.5, 50.0))}
     monkeypatch.setattr(pricing_mod, "get_pricing", lambda **k: table)
     base = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1_000_000, 0, cache_write_tokens=1_000_000,
-        prompt_cache_ttl=None, allow_live_fetch=False,
+        "anthropic/claude-fable-5", 1_000_000, 0,
+        cache_usage={"cache_write_tokens": 1_000_000, "prompt_cache_ttl": None},
+        allow_live_fetch=False,
     )
     extended = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1_000_000, 0, cache_write_tokens=1_000_000,
-        prompt_cache_ttl="1h", allow_live_fetch=False,
+        "anthropic/claude-fable-5", 1_000_000, 0,
+        cache_usage={"cache_write_tokens": 1_000_000, "prompt_cache_ttl": "1h"},
+        allow_live_fetch=False,
     )
     assert base == pytest.approx(12.5)
     assert extended == pytest.approx(12.5 * 2.0 / 1.25)

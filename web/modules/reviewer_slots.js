@@ -442,7 +442,7 @@ function renderRows() {
         errorBox.textContent = state.configError
             ? `Saved reviewer-slot configuration is invalid and blocks reviews: ${state.configError}. `
               + 'To repair it, add at least one triad slot and one scope slot below, then Save'
-              + (state.triad.length && state.scope.length ? '.' : ' — an incomplete set is not saved.')
+              + (state.triad.length && state.scope.length ? '.' : ' — Save will report the missing rows.')
             : (state.loadError
                 ? `Could not reach the reviewer-slot settings — ${state.loadError}. Your saved configuration is unchanged; retry when the connection is back.`
                 : '');
@@ -634,13 +634,24 @@ export function initReviewerSlots({ onChange } = {}) {
     // the async arrival of the rows would read as an unsaved edit.
 }
 
+// #126, pure and node-tested: what the settings save sends for reviewer slots.
+// Never author the setting from an UNLOADED view (an unrelated save must not
+// overwrite the owner's configuration with an empty page), and a transport
+// failure is not a verdict on the saved value either. But a LOADED view always
+// sends what it shows — including an empty triad/scope. The old empty-set
+// guard silently dropped the key, so deleting every row Saved "successfully"
+// while saving nothing; now the backend's own 400 («triad needs at least one
+// slot») surfaces through the existing failed-save status. Validation SSOT
+// stays on the backend — no client-side duplicate.
+export function reviewerSlotsSavePayload({ loaded = false, loadError = '', triad = [], scope = [], advisory } = {}) {
+    if (loadError || !loaded) return {};
+    return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting({ triad, scope, advisory }) };
+}
+
 export function collectReviewerSlots() {
-    // Never author the setting from an UNLOADED view: an unrelated save must not
-    // overwrite the owner's configuration with an empty page. A config_error is
-    // NOT that case — the stored value is already invalid and blocking review, the
-    // endpoint returns no rows with it, and refusing here made the documented
-    // repair path swallow the owner's replacement rows and still report success.
-    if (state.loadError || !state.loaded) return {};
-    if (!state.triad.length || !state.scope.length) return {};
-    return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting(state) };
+    // A config_error is NOT the unloaded case — the stored value is already
+    // invalid and blocking review, the endpoint returns no rows with it, and
+    // refusing here made the documented repair path swallow the owner's
+    // replacement rows and still report success.
+    return reviewerSlotsSavePayload(state);
 }

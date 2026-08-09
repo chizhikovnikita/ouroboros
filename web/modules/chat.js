@@ -79,6 +79,7 @@ export function insertTimelineNode(messages, node, typing = null, { stickToBotto
 }
 
 const CHAT_STORAGE_KEY = 'ouro_chat';
+const CHAT_DRAFT_KEY = 'ouro_chat_draft';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const CHAT_SESSION_ID_KEY = 'ouro_chat_session_id';
 const MAX_PENDING_ATTACHMENTS = 10;
@@ -268,6 +269,43 @@ export function projectCollapsedActivity({
 // module scope so cancelRunEligibility shares the same truth as the card layer).
 export const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
 
+/**
+ * /panic gate (v6.90.3, CRITICAL CONTROL): pure decision helper between the
+ * confirm dialog's resolution and sending the panic command. Panic fires on an
+ * EXPLICIT boolean-true confirm and on nothing else — cancel, backdrop,
+ * Escape, and a dialog API drift that starts resolving objects (the input
+ * mode's `{confirmed, value}` shape) all read as "do not fire". Node-tested.
+ */
+export function shouldFirePanic(dialogResult) {
+    return dialogResult === true;
+}
+
+/**
+ * /panic action (v6.90.3, CRITICAL CONTROL): the COMPLETE confirm-and-send
+ * flow behind the header's Panic button, with injectable deps so the node
+ * suite drives the REAL production path — dialog options, the strict
+ * shouldFirePanic gate, and the exact outbound command — not just the boolean
+ * helper. The header action passes the real openConfirmDialog and ws; a
+ * broken await, option drift, or command typo here fails the node test
+ * instead of leaving the live button silently inert.
+ * Fires exactly one {type:'command', cmd:'/panic'} on an explicit confirm;
+ * cancel/backdrop/Escape (false) send NOTHING.
+ */
+export async function confirmAndSendPanic(deps) {
+    const decision = await deps.openConfirmDialog({
+        title: 'Panic — stop all workers',
+        body: 'Kill all workers immediately?',
+        confirmLabel: 'Kill all workers',
+        cancelLabel: 'Keep running',
+        danger: true,
+    });
+    if (shouldFirePanic(decision)) {
+        deps.ws.send({ type: 'command', cmd: '/panic' });
+        return true;
+    }
+    return false;
+}
+
 // v6.82 (P5): terminal card phases. 'cancelled' is a first-class terminal phase
 // so a force-cancelled root resolves its card instead of re-inflating.
 export function isTerminalTaskPhase(phase = '', terminal = false) {
@@ -383,6 +421,7 @@ export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
     asPanel = false, title = 'Chat', titleKey = 'chat.page_title',
+    initialScrollState = null,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
@@ -491,9 +530,17 @@ export function createChatInstance({
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
 
+    // Instance lifecycle (P3): destroy() flips this so rAF loops and late async
+    // continuations become no-ops instead of touching a removed DOM subtree.
+    let destroyed = false;
+    // Every ws.on subscription's disposer, released together in destroy().
+    const wsDisposers = [];
+    const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+
     async function loadUiPreferences() {
         try {
             const prefs = await apiClient.uiPreferences();
+            if (destroyed) return;
             nestedSubagentsExpanded = prefs?.nested_subagents_expanded === true;
         } catch {
             nestedSubagentsExpanded = false;
@@ -675,8 +722,12 @@ export function createChatInstance({
     // Per-instance viewport intent. Content growth does not emit a user scroll,
     // so `_savedStick` survives a large live-card mutation that would make a
     // post-mutation `isNearBottom()` check lose the owner's prior intent.
-    let _savedScrollTop = 0;
-    let _savedStick = true;
+    // A recreated project instance seeds these from the scroll state stashed by
+    // app.js when its predecessor was destroyed (single-live-panel policy);
+    // `_initialScrollPending` defers the actual restore until first paint.
+    let _savedScrollTop = Math.max(0, Number(initialScrollState?.scrollTop) || 0);
+    let _savedStick = initialScrollState ? initialScrollState.stick !== false : true;
+    let _initialScrollPending = Boolean(initialScrollState) && !_savedStick;
     let _restoring = false;
     let _viewportMutationDepth = 0;
     const isInstanceVisible = () =>
@@ -1765,7 +1816,14 @@ export function createChatInstance({
         if (!record) {
             // Card not created yet (the namer raced ahead of the first progress event).
             // Buffer so createLiveCardRecord applies it when the card appears.
+            // FIFO cap: `task_named` is the one broadcast without a thread gate,
+            // so every instance buffers every task's name — bound the buffer so
+            // a long-lived instance cannot grow it without limit (P3).
             pendingSuggestedNames.set(tid, nm);
+            if (pendingSuggestedNames.size > 100) {
+                const oldest = pendingSuggestedNames.keys().next().value;
+                pendingSuggestedNames.delete(oldest);
+            }
             return;
         }
         if (record.isSubagent) return;
@@ -1966,20 +2024,23 @@ export function createChatInstance({
 
     // Re-sync cards after SPA return or browser tab visibility restore, then put
     // the thread back where the user left it (P7) instead of at the very top.
-    window.addEventListener('ouro:page-shown', (event) => {
+    // Named handlers so destroy() can remove them (P3 lifecycle).
+    const handlePageShown = (event) => {
         if (event?.detail?.page !== 'chat') return;
         for (const record of liveCardRecords.values()) {
             if (record?.root?.isConnected) syncLiveCardLayout(record);
         }
         restoreScrollPosition();  // no-op for hidden panel instances
-    });
-    document.addEventListener('visibilitychange', () => {
+    };
+    window.addEventListener('ouro:page-shown', handlePageShown);
+    const handleVisibilityChange = () => {
         if (document.hidden) return;
         if (state.activePage !== 'chat') return;
         for (const record of liveCardRecords.values()) {
             if (record?.root?.isConnected && record._needsLayoutSync) syncLiveCardLayout(record);
         }
-    });
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     function buildTimelineItemHtml(item, record) {
         const expandable = isLiveLineExpandable(item);
@@ -2063,7 +2124,7 @@ export function createChatInstance({
             // best-effort: leave the capped preview on failure
         } finally {
             item._fetchingFull = false;
-            if (record.expandedLineKeys.has(item.lineKey)) {
+            if (!destroyed && record.expandedLineKeys.has(item.lineKey)) {
                 const hadFocus = Boolean(
                     document.activeElement?.closest?.(`[data-live-line-key="${(window.CSS && CSS.escape) ? CSS.escape(item.lineKey) : item.lineKey}"]`),
                 );
@@ -2301,8 +2362,13 @@ export function createChatInstance({
         hideTypingIndicatorOnly();
         const justFinished = record.finished && !wasFinished;
         const drivesComposerStatus = !isBackgroundTaskId(nextGroupId);
-        // P5: a finished card must not keep offering "Cancel run".
-        if (justFinished) syncCancelRunButton(record);
+        // P5: a finished card must not keep offering "Cancel run". A log-channel
+        // task_done terminates the card HERE without passing finishLiveCard, so
+        // the cancelable marker must be dropped on this path too (P3 growth cap).
+        if (justFinished) {
+            cancelableTaskIds.delete(record.groupId);
+            syncCancelRunButton(record);
+        }
         if (record.finished) {
             setLiveCardTypingVisible(record, false);
             markTaskComplete(nextGroupId, summary.phase || 'done');
@@ -2344,6 +2410,9 @@ export function createChatInstance({
         const wasFinished = record.finished;
         record.finished = true;
         record.root.dataset.finished = '1';
+        // A finished task can never be cancelled again; dropping the marker here
+        // keeps the set from accumulating every task id of a long session (P3).
+        cancelableTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
         const activePhase = ['error', 'timeout', 'warn', 'cancelled'].includes(phase) ? phase : 'done';
         record.phaseEl.dataset.phase = activePhase;
@@ -2788,6 +2857,11 @@ export function createChatInstance({
                 clientMessageId,
                 taskId,
             });
+            // Mirror the sessionStorage slice(-200): the in-memory copy exists
+            // only to feed that snapshot, so it obeys the same cap (P3).
+            if (persistedHistory.length > 200) {
+                persistedHistory.splice(0, persistedHistory.length - 200);
+            }
             persistVisibleHistory();
         }
 
@@ -2957,6 +3031,12 @@ export function createChatInstance({
                     return false;
                 }
                 const data = await resp.json();
+                // A late continuation on a destroyed instance must not rebuild a
+                // detached DOM subtree or repopulate the cleared collections.
+                if (destroyed) {
+                    lastHistorySyncSucceeded = false;
+                    return false;
+                }
                 const messages = Array.isArray(data.messages) ? data.messages : [];
                 const scrollBeforeSync = {
                     top: messagesDiv.scrollTop,
@@ -2978,6 +3058,11 @@ export function createChatInstance({
                     liveCardRecords.clear();
                     taskUiStates.clear();
                     ephemeralDecisionTaskIds.clear();
+                    // Rebuild replays the durable truth: stale name buffers and
+                    // cancelable markers from the previous connection are dropped
+                    // and re-learned from history rows (P3 growth caps).
+                    pendingSuggestedNames.clear();
+                    cancelableTaskIds.clear();
                     activeLiveGroupId = '';
                     // Atomically drop the standalone message bubbles and the dedupe
                     // state so the rebuild below cannot produce duplicates even if
@@ -3177,6 +3262,13 @@ export function createChatInstance({
                 const wasFirstLoad = !historyLoaded;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                // A recreated project instance restores its predecessor's stashed
+                // mid-history position on first paint instead of pinning to newest.
+                if (wasFirstLoad && _initialScrollPending) {
+                    _initialScrollPending = false;
+                    updateMessagesPadding({ preserveStickiness: false });
+                    restoreScrollPosition();
+                } else
                 // First load jumps to latest; reconnect preserves older-message reading.
                 if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom())) {
                     updateMessagesPadding({ preserveStickiness: false });
@@ -3224,15 +3316,18 @@ export function createChatInstance({
     async function refreshHistory({ revision = 0 } = {}) {
         const generation = ++historyPaintGeneration;
         await syncHistory({ includeUser: true });
-        if (!lastHistorySyncSucceeded || generation !== historyPaintGeneration || page.hidden) {
+        if (destroyed || !lastHistorySyncSucceeded || generation !== historyPaintGeneration || page.hidden) {
             return { painted: false, revision: Number(revision) || 0 };
         }
         // A successful fetch is not a read acknowledgement until the rebuilt
         // DOM has crossed an actual browser paint while this Project remains
-        // visible. Two frames cover layout followed by paint/composite.
+        // visible. Two frames cover layout followed by paint/composite. A
+        // destroyed page reports hidden===false, so the paint receipt must also
+        // consult the lifecycle flag — a late paint on a torn-down instance
+        // would otherwise acknowledge a revision that was never shown (GPT#15).
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         return {
-            painted: generation === historyPaintGeneration && !page.hidden,
+            painted: !destroyed && generation === historyPaintGeneration && !page.hidden,
             revision: Math.max(0, Number(revision) || 0),
         };
     }
@@ -3379,6 +3474,7 @@ export function createChatInstance({
         }
         rememberInput(text);
         input.value = '';
+        clearInputDraft();
         addMessage(text, 'user', false, null, false, {
             pending: result?.status === 'queued',
             source: 'web',
@@ -3446,13 +3542,15 @@ export function createChatInstance({
                 // Offer a plain, model-scoped confirmation (kept until the model changes).
                 const ack = payload?.needs_ack;
                 if (next === 'max' && ack && ack.model) {
-                    const ok = window.confirm(
-                        `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                        `Confirm that this model supports a 1,000,000-token context window?\n` +
-                        `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
-                        `  base_url: ${ack.base_url || '(default)'}\n\n` +
-                        `This applies only to this exact model/provider and is removed if you change it.`
-                    );
+                    const ok = await openConfirmDialog({
+                        title: 'Confirm 1M-token context window',
+                        body: `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
+                            `Confirm that this model supports a 1,000,000-token context window?\n` +
+                            `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n` +
+                            `base_url: ${ack.base_url || '(default)'}\n\n` +
+                            `This applies only to this exact model/provider and is removed if you change it.`,
+                        confirmLabel: 'Confirm window',
+                    });
                     if (ok) {
                         const ackResp = await apiFetch('/api/owner/capability-ack', {
                             method: 'POST',
@@ -3508,8 +3606,9 @@ export function createChatInstance({
 
     function scrollToBottomAfterLayout() {
         requestAnimationFrame(() => {
+            if (destroyed) return;
             scrollToBottom();
-            requestAnimationFrame(scrollToBottom);
+            requestAnimationFrame(() => { if (!destroyed) scrollToBottom(); });
         });
     }
 
@@ -3556,7 +3655,7 @@ export function createChatInstance({
         const targetTop = _savedScrollTop;
         let frames = 0;
         const apply = () => {
-            if (!isInstanceVisible()) { _restoring = false; return; }
+            if (destroyed || !isInstanceVisible()) { _restoring = false; return; }
             // scrollHeight is re-read each frame so a sticky thread tracks late
             // card-layout growth; a restored mid-history spot re-pins to the exact
             // saved offset (idempotent, so it isn't overridden).
@@ -3588,6 +3687,10 @@ export function createChatInstance({
         updateScrollButton();
     }
 
+    // Kept on the instance so destroy() can disconnect it (the observer was
+    // previously an unreachable closure — the P3 lifecycle leak).
+    let chatResizeObserver = null;
+
     function installChatResizeObservers() {
         if (typeof ResizeObserver !== 'function') return;
         let queued = false;
@@ -3596,23 +3699,48 @@ export function createChatInstance({
             queued = true;
             requestAnimationFrame(() => {
                 queued = false;
+                if (destroyed) return;
                 updateMessagesPadding({ preserveStickiness: true });
             });
         };
-        const observer = new ResizeObserver(schedule);
-        if (pageHeader) observer.observe(pageHeader);
-        if (inputArea) observer.observe(inputArea);
-        if (messagesDiv) observer.observe(messagesDiv);
+        chatResizeObserver = new ResizeObserver(schedule);
+        if (pageHeader) chatResizeObserver.observe(pageHeader);
+        if (inputArea) chatResizeObserver.observe(inputArea);
+        if (messagesDiv) chatResizeObserver.observe(messagesDiv);
     }
 
     installChatResizeObservers();
 
+    // Per-thread input draft (P3): destroy-on-close would otherwise lose typed
+    // but unsent text. Saved on every input (cheap), restored at instance
+    // creation, cleared on send.
+    function saveInputDraft() {
+        try {
+            if (input.value) sessionStorage.setItem(storeKey(CHAT_DRAFT_KEY), input.value);
+            else sessionStorage.removeItem(storeKey(CHAT_DRAFT_KEY));
+        } catch {}
+    }
+
+    function clearInputDraft() {
+        try { sessionStorage.removeItem(storeKey(CHAT_DRAFT_KEY)); } catch {}
+    }
+
+    try {
+        const savedDraft = sessionStorage.getItem(storeKey(CHAT_DRAFT_KEY)) || '';
+        if (savedDraft && !input.value) {
+            input.value = savedDraft;
+            inputDraft = savedDraft;
+            resizeChatInput({ preserveStickiness: false });
+        }
+    } catch {}
+
     input.addEventListener('input', () => {
         if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
         resizeChatInput({ preserveStickiness: false });
+        saveInputDraft();
     });
 
-    headerActions?.addEventListener('click', (event) => {
+    headerActions?.addEventListener('click', async (event) => {
         const button = event.target.closest('[data-chat-command]');
         if (!button) return;
         button.closest('details')?.removeAttribute('open');
@@ -3637,25 +3765,36 @@ export function createChatInstance({
             ws.send({ type: 'command', cmd: '/restart' });
             return;
         }
-        if (command === 'panic' && confirm('Kill all workers immediately?')) {
-            ws.send({ type: 'command', cmd: '/panic' });
+        if (command === 'panic') {
+            // CRITICAL CONTROL: the whole confirm-and-send flow lives in the
+            // node-tested confirmAndSendPanic (dialog options + strict
+            // shouldFirePanic gate + the exact /panic command); this handler
+            // only injects the real deps. Manual check on release: click
+            // Panic → dialog → "Kill all workers" sends /panic;
+            // Cancel/Escape/backdrop send nothing.
+            await confirmAndSendPanic({ openConfirmDialog, ws });
         }
     });
 
     // The More menu is a native <details> (no auto-dismiss): collapse it when a
     // click/tap lands outside it, or on Escape, so it never stays stuck open.
+    // Handler refs are kept so destroy() can remove them (P3 lifecycle).
+    let documentClickHandler = null;
+    let documentKeydownHandler = null;
     if (!asPanel) {
         const collapseHeaderMenus = (predicate) => {
             page.querySelectorAll('details.chat-header-more[open]').forEach((details) => {
                 if (predicate(details)) details.removeAttribute('open');
             });
         };
-        document.addEventListener('click', (event) => {
+        documentClickHandler = (event) => {
             collapseHeaderMenus((details) => !details.contains(event.target));
-        });
-        document.addEventListener('keydown', (event) => {
+        };
+        document.addEventListener('click', documentClickHandler);
+        documentKeydownHandler = (event) => {
             if (event.key === 'Escape') collapseHeaderMenus(() => true);
-        });
+        };
+        document.addEventListener('keydown', documentKeydownHandler);
     }
 
     budgetPill?.addEventListener('click', () => {
@@ -3663,6 +3802,7 @@ export function createChatInstance({
         else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
     });
 
+    let headerControlInterval = null;
     if (asPanel) {
         // The panel has no global controls/budget to poll; seed the status from
         // the live socket so a late-created panel never gets stuck on
@@ -3671,7 +3811,7 @@ export function createChatInstance({
         if (ws.isConnected?.()) setStatus('online', t('chat.status_online', 'Online'));
     } else {
         refreshHeaderControlState(true);
-        setInterval(refreshHeaderControlState, 3000);
+        headerControlInterval = setInterval(refreshHeaderControlState, 3000);
     }
 
     const typingEl = document.createElement('div');
@@ -3722,7 +3862,7 @@ export function createChatInstance({
         updateUnreadBadge();
     }
 
-    ws.on('typing', (msg) => {
+    onWs('typing', (msg) => {
         if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
         showTyping();
     });
@@ -3750,7 +3890,7 @@ export function createChatInstance({
         return cid === chatId;
     };
 
-    ws.on('chat', (msg) => {
+    onWs('chat', (msg) => {
         if (!isMyThread(msg, { mirrorProject: true })) return;
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
@@ -3804,13 +3944,13 @@ export function createChatInstance({
         }
     });
 
-    ws.on('message_annotation', (msg) => {
+    onWs('message_annotation', (msg) => {
         if (!isMyThread(msg)) return;
         if (msg.annotation_type !== 'routing_ack') return;
         updateMessageAnnotation(msg.client_message_id || '', msg);
     });
 
-    ws.on('log', (msg) => {
+    onWs('log', (msg) => {
         if (!msg?.data) return;
         // Log frames now carry the task's chat_id (backend stamps it), so the
         // per-thread fan-out routes the full live card to its own column: a
@@ -3825,15 +3965,15 @@ export function createChatInstance({
     // as the card title up front (turn-into-project then reuses the same name). Not
     // thread-gated on chat_id: the broadcast carries only task_id, and applySuggestedName
     // no-ops unless THIS thread already holds that card.
-    ws.on('task_named', (msg) => {
+    onWs('task_named', (msg) => {
         applySuggestedName(msg?.task_id || '', msg?.suggested_name || '');
     });
 
-    ws.on('outbound_sent', (evt) => {
+    onWs('outbound_sent', (evt) => {
         markPendingDelivered(evt?.clientMessageId || '');
     });
 
-    ws.on('photo', (msg) => {
+    onWs('photo', (msg) => {
         if (!isMyThread(msg)) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
@@ -3870,7 +4010,7 @@ export function createChatInstance({
         incrementUnreadIfNeeded(msg);
     });
 
-    ws.on('video', (msg) => {
+    onWs('video', (msg) => {
         if (!isMyThread(msg)) return;
         hideTyping();
         const role = msg.role === 'user' ? 'user' : 'assistant';
@@ -4013,7 +4153,7 @@ export function createChatInstance({
         return true;
     }
 
-    ws.on('document', (msg) => {
+    onWs('document', (msg) => {
         if (!isMyThread(msg)) return;
         hideTyping();
         if (appendDocumentBubble(msg)) incrementUnreadIfNeeded(msg);
@@ -4021,7 +4161,7 @@ export function createChatInstance({
 
     let wsHasConnectedOnce = false;
 
-    ws.on('open', () => {
+    onWs('open', () => {
         setStatus('online', t('chat.status_online', 'Online'));
         refreshHeaderControlState(true);
         const reconnectBanner =
@@ -4049,7 +4189,7 @@ export function createChatInstance({
             });
     });
 
-    ws.on('close', () => {
+    onWs('close', () => {
         hideTyping();
         setStatus('offline', 'Reconnecting...');
         syncHeaderControlState({ accounting: { available: false } });
@@ -4064,8 +4204,50 @@ export function createChatInstance({
         restoreScrollPosition,
         refreshHistory,
         cancelHistoryPaint,
+        // True once a history snapshot has actually been fetched and painted;
+        // app.js uses it to decide whether a reopen needs a forced repaint.
+        hasPaintedHistory: () => historyLoaded && lastHistorySyncSucceeded,
+        // Unsendable client-side state (staged File objects / an in-flight
+        // upload). app.js must hide, not destroy, an instance holding it.
+        hasPendingWork: () => pendingAttachments.length > 0 || attachmentsUploading,
+        // Viewport intent stash source for the single-live-panel policy.
+        getScrollState: () => ({ scrollTop: _savedScrollTop, stick: _savedStick }),
+        // Full teardown (P3): release every resource this instance acquired —
+        // ws subscriptions, window/document listeners, the ResizeObserver, all
+        // timers — then drop the buffered collections and remove the DOM last.
+        // Idempotent; late rAF/async continuations no-op on `destroyed`.
         destroy() {
+            if (destroyed) return;
+            destroyed = true;
             cancelHistoryPaint();
+            for (const dispose of wsDisposers) {
+                try { dispose(); } catch {}
+            }
+            wsDisposers.length = 0;
+            window.removeEventListener('ouro:page-shown', handlePageShown);
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            if (documentClickHandler) document.removeEventListener('click', documentClickHandler);
+            if (documentKeydownHandler) document.removeEventListener('keydown', documentKeydownHandler);
+            chatResizeObserver?.disconnect();
+            chatResizeObserver = null;
+            if (historySyncTimer) { clearTimeout(historySyncTimer); historySyncTimer = null; }
+            if (_chatFreedTimer) { clearTimeout(_chatFreedTimer); _chatFreedTimer = null; }
+            for (const taskState of taskUiStates.values()) {
+                if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
+            }
+            if (headerControlInterval) { clearInterval(headerControlInterval); headerControlInterval = null; }
+            liveCardRecords.clear();
+            taskUiStates.clear();
+            pendingSuggestedNames.clear();
+            subagentChildParents.clear();
+            subagentTerminalChildren.clear();
+            cancelableTaskIds.clear();
+            ephemeralDecisionTaskIds.clear();
+            retiredTaskIds.clear();
+            pendingUserBubbles.clear();
+            seenMessageKeys.clear();
+            messageKeyOrder.length = 0;
+            persistedHistory.length = 0;
             try { page.remove(); } catch {}
         },
     };

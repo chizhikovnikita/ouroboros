@@ -46,7 +46,10 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
-from ouroboros.triad_review import extract_json_array
+# Reviewer-output JSON extraction lives in ONE place beside the array
+# extractor it falls back to (the fenced-object and verdict parsers were
+# split across two modules for no reason).
+from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
     UsageAccountingError,
     UsageScope,
@@ -452,17 +455,13 @@ _CRITERION_STATUSES = frozenset({"supported", "missing", "partial", "rejected"})
 
 
 def _criteria_have_supported_evidence(criteria: Any) -> bool:
-    return bool(
-        isinstance(criteria, list)
-        and criteria
-        and all(
-            isinstance(item, dict)
-            and bool(str(item.get("criterion") or "").strip())
-            and str(item.get("status") or "").strip().lower() == "supported"
-            and bool(item.get("evidence_refs"))
-            for item in criteria
-        )
-    )
+    return bool(isinstance(criteria, list) and criteria and all(
+        isinstance(item, dict)
+        and bool(str(item.get("criterion") or "").strip())
+        and str(item.get("status") or "").strip().lower() == "supported"
+        and bool(item.get("evidence_refs"))
+        for item in criteria
+    ))
 
 
 def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
@@ -521,27 +520,28 @@ def aggregate_outcome_tier(result: ReviewRunResult) -> str:
 
 
 def task_acceptance_is_clean(result: Any) -> bool:
-    """Whether a task-acceptance verdict satisfies the release-clean contract."""
-    if (
-        str(getattr(result, "aggregate_signal", "") or "").upper() != "PASS"
-        or bool(getattr(result, "degraded", False))
-    ):
+    """Whether a task-acceptance verdict satisfies the release-clean contract.
+
+    The evidence condition is UNCONDITIONAL (D-Q5 deleted the constant-true
+    ``require_criterion_evidence`` knob — the v6.60.0 dead-key precedent), and a
+    'supported' criterion counts only when ≥1 of its ``evidence_refs`` RESOLVED
+    against the packet (host annotation stamped at panel time; absent on
+    historical rows — forward-only). Both demote ONLY this clean bit onto the
+    existing non-clean rails; parse validity/quorum/verdicts untouched (v6.71.1)."""
+    if str(getattr(result, "aggregate_signal", "") or "").upper() != "PASS" or bool(getattr(result, "degraded", False)):
         return False
     contributing = _contributing_actors(result)
     if not contributing:
         return False
-    request = getattr(result, "request", {})
-    policy = request.get("policy") if isinstance(request, dict) else {}
-    require_evidence = bool(
-        isinstance(policy, dict) and policy.get("require_criterion_evidence")
-    )
     for actor in contributing:
         parsed = actor.get("parsed") if isinstance(actor, dict) else None
         if not isinstance(parsed, dict) or str(parsed.get("outcome_tier") or "").lower() != OUTCOME_TIER_SOLVED:
             return False
-        if require_evidence:
-            if not _criteria_have_supported_evidence(parsed.get("criteria_used")):
-                return False
+        if not _criteria_have_supported_evidence(parsed.get("criteria_used")):
+            return False
+        if any(isinstance(r, dict) and not r.get("supported_evidence_resolves")
+               for r in (actor.get("criteria_refs_unresolved") or [])):
+            return False
     return True
 
 
@@ -550,9 +550,7 @@ def task_acceptance_is_clean(result: Any) -> bool:
 DIALOGUE_CONTINUE = "continue_actionable"
 DIALOGUE_UNREACHABLE = "unreachable_here"
 DIALOGUE_STABLE_DISAGREEMENT = "stable_disagreement"
-DIALOGUE_STATUS_VALUES = (
-    DIALOGUE_CONTINUE, DIALOGUE_UNREACHABLE, DIALOGUE_STABLE_DISAGREEMENT,
-)
+DIALOGUE_STATUS_VALUES = (DIALOGUE_CONTINUE, DIALOGUE_UNREACHABLE, DIALOGUE_STABLE_DISAGREEMENT)
 
 
 def _contract_valid_actors(result: Any) -> List[Dict[str, Any]]:
@@ -605,6 +603,34 @@ def aggregate_dialogue_status(result: Any, *, quorum: int) -> Dict[str, Any]:
     return {"status": status, "votes": votes}
 
 
+def _unresolved_evidence_ref_labels(run: Any) -> List[str]:
+    """The D-Q5 refs a contributing actor cited that did NOT resolve, as
+    ``ref (basis)`` labels (or the panel-wide ``host_resolution_unavailable``).
+
+    Pure read of the deciding detail already recorded on the actor rows, so
+    ``panel_reason`` can name the REAL blocker: on a D-Q5 demotion every criterion
+    IS marked supported with refs, and the criteria-support line would describe a
+    condition that is already satisfied."""
+    from ouroboros.review_evidence_refs import NON_RESOLVING_BASIS_KINDS
+
+    labels: List[str] = []
+    for actor in _contributing_actors(run):
+        for row in (actor.get("criteria_refs_unresolved") or []):
+            if not isinstance(row, dict) or row.get("supported_evidence_resolves"):
+                continue
+            if str(row.get("resolution_status") or ""):
+                labels.append(str(row["resolution_status"]))
+                continue
+            for ref in (row.get("refs") or []):
+                if not isinstance(ref, dict):
+                    continue
+                basis = str(ref.get("resolved_as") or "")
+                if basis and basis not in NON_RESOLVING_BASIS_KINDS:
+                    continue  # this one resolved; it is not the blocker
+                labels.append(f"{str(ref.get('ref') or '?')[:80]} ({basis or 'no packet entry'})")
+    return list(dict.fromkeys(labels))
+
+
 def panel_reason(run: Any) -> str:
     """One honest reason line naming the REAL blocker (v6.74.0, A6); shared by
     the capsule header, the compact projection fallback, and progress lines.
@@ -618,6 +644,16 @@ def panel_reason(run: Any) -> str:
     if aggregate == "PASS":
         if task_acceptance_is_clean(run):
             return "clean acceptance"
+        # A D-Q5 demotion leaves every criterion marked supported WITH refs, so the
+        # criteria-support line below would name a condition that is already
+        # satisfied. Name the ref that actually decided instead.
+        unresolved = _unresolved_evidence_ref_labels(run)
+        if unresolved:
+            more = f" (+{len(unresolved) - 3} more)" if len(unresolved) > 3 else ""
+            return (
+                f"tier={tier or 'unclassified'} — cited evidence does not resolve "
+                f"against the packet: {', '.join(unresolved[:3])}{more}"
+            )
         return (
             f"tier={tier or 'unclassified'} — a PASS is not release-clean until "
             "every criterion is supported"
@@ -940,64 +976,6 @@ def scope_reviewer_slots(
     )
 
 
-def _extract_fenced_json(text: str) -> Any:
-    """Best-effort parse of a fenced/embedded JSON object or array from model output.
-
-    Reviewers often wrap their verdict in a ```json ... ``` fence; a fenced JSON
-    OBJECT (e.g. {"verdict":"PASS","findings":[]}) would otherwise fail json.loads
-    and be missed by the array-only extractor, producing a false DEGRADED signal.
-    """
-    if "```" not in text:
-        return None
-    for chunk in text.split("```"):
-        candidate = chunk.strip()
-        if candidate.startswith("json"):
-            candidate = candidate[4:].strip()
-        if not candidate:
-            continue
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            continue
-        if isinstance(obj, (dict, list)):
-            return obj
-    return None
-
-
-def _parse_findings(raw_text: str) -> tuple[Any, List[Dict[str, Any]], str]:
-    text = str(raw_text or "").strip()
-    parsed: Any = None
-    findings: List[Dict[str, Any]] = []
-    signal = "UNKNOWN"
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        parsed = _extract_fenced_json(text)
-        if parsed is None:
-            extracted = extract_json_array(text)
-            if extracted is None:
-                # Keep non-JSON output untruncated; reviewer raw_text is still useful.
-                return None, [], "DEGRADED"
-            parsed = extracted
-    if isinstance(parsed, dict):
-        signal = str(parsed.get("verdict") or parsed.get("status") or "UNKNOWN").upper()
-        raw_findings = parsed.get("findings") or []
-        if isinstance(raw_findings, list):
-            findings = [item for item in raw_findings if isinstance(item, dict)]
-    elif isinstance(parsed, list):
-        findings = [item for item in parsed if isinstance(item, dict)]
-        verdicts = {str(item.get("verdict") or item.get("status") or "").upper() for item in findings}
-        if "FAIL" in verdicts:
-            signal = "FAIL"
-        elif "PASS" in verdicts:
-            signal = "PASS"
-        elif "DEGRADED" in verdicts:
-            signal = "DEGRADED"
-        else:
-            signal = "UNKNOWN"
-    return parsed, findings, signal
-
-
 class ReviewCoordinator:
     def __init__(
         self,
@@ -1156,10 +1134,6 @@ class ReviewCoordinator:
             request.surface == "task_acceptance"
             and (request.policy or {}).get("classify_outcome_tier")
         )
-        require_criterion_evidence = bool(
-            request.surface == "task_acceptance"
-            and (request.policy or {}).get("require_criterion_evidence")
-        )
         _valid_tiers = {"solved", "best_effort", "blocked_with_evidence"}
         # A SOLVED task-acceptance PASS need not carry a tier-up coach. Commit/scope
         # use distinct surfaces and retain their own hard-gate semantics.
@@ -1172,7 +1146,7 @@ class ReviewCoordinator:
                 actor_errors.append(f"{actor.slot_id}:{actor.error}")
             elif actor.status != "ok":
                 actor_errors.append(f"{actor.slot_id}:{actor.status}")
-            parsed, findings, signal = _parse_findings(actor.raw_text)
+            parsed, findings, signal = parse_review_findings(actor.raw_text)
             actor.parsed = parsed
             actor.signal = signal
             slot = slots_by_id.get(actor.slot_id)
@@ -1201,7 +1175,8 @@ class ReviewCoordinator:
                     # empty coach must NOT demote it to DEGRADED.
                     or (is_advisory and _tier == "solved")
                 )
-                and (not require_criterion_evidence or _criteria_ok)
+                # Criteria shape rides the tier contract (its knob was constant-true, deleted).
+                and _criteria_ok
             )
             if signal == "FAIL":
                 # A task-acceptance FAIL is authoritative only when it obeys the
@@ -1486,7 +1461,7 @@ class ReviewCoordinator:
                         if (
                             acceptance_actor
                             and actor_attempt + 1 < actor_attempts
-                            and _parse_findings(raw_text)[0] is None
+                            and parse_review_findings(raw_text)[0] is None
                         ):
                             _prior_msg, _prior_usage, _prior_text = msg, usage, raw_text
                             try:
@@ -1597,4 +1572,14 @@ def run_review_request(
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
-    return coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
+    result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
+    if request.surface == "task_acceptance":
+        # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never parse
+        # validity/quorum/verdicts. Called UNGUARDED on purpose — the annotator is
+        # total and fail-CLOSED (a resolver failure stamps the non-clean row), and
+        # `review_evidence` already built this packet, so swallowing an error here
+        # could only turn "the host never checked the refs" into a clean PASS.
+        from ouroboros.review_evidence import annotate_criteria_evidence_resolution
+
+        annotate_criteria_evidence_resolution(result.actors, request.evidence)
+    return result

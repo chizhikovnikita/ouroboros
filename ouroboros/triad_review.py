@@ -183,6 +183,65 @@ def _normalize_items(items: List[Any]) -> List[Any]:
         return items
 
 
+def extract_fenced_json(text: str) -> Any:
+    """Best-effort parse of a fenced/embedded JSON object or array from model output.
+
+    Reviewers often wrap their verdict in a ```json ... ``` fence; a fenced JSON
+    OBJECT (e.g. {"verdict":"PASS","findings":[]}) would otherwise fail json.loads
+    and be missed by the array-only extractor, producing a false DEGRADED signal.
+    """
+    if "```" not in text:
+        return None
+    for chunk in text.split("```"):
+        candidate = chunk.strip()
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, (dict, list)):
+            return obj
+    return None
+
+
+def parse_review_findings(raw_text: str) -> tuple[Any, List[Dict[str, Any]], str]:
+    """Reviewer response -> (parsed, findings, signal), by the object/array ladder."""
+    text = str(raw_text or "").strip()
+    parsed: Any = None
+    findings: List[Dict[str, Any]] = []
+    signal = "UNKNOWN"
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = extract_fenced_json(text)
+        if parsed is None:
+            extracted = extract_json_array(text)
+            if extracted is None:
+                # Keep non-JSON output untruncated; reviewer raw_text is still useful.
+                return None, [], "DEGRADED"
+            parsed = extracted
+    if isinstance(parsed, dict):
+        signal = str(parsed.get("verdict") or parsed.get("status") or "UNKNOWN").upper()
+        raw_findings = parsed.get("findings") or []
+        if isinstance(raw_findings, list):
+            findings = [item for item in raw_findings if isinstance(item, dict)]
+    elif isinstance(parsed, list):
+        findings = [item for item in parsed if isinstance(item, dict)]
+        verdicts = {str(item.get("verdict") or item.get("status") or "").upper() for item in findings}
+        if "FAIL" in verdicts:
+            signal = "FAIL"
+        elif "PASS" in verdicts:
+            signal = "PASS"
+        elif "DEGRADED" in verdicts:
+            signal = "DEGRADED"
+        else:
+            signal = "UNKNOWN"
+    return parsed, findings, signal
+
+
 # The review output contract lives beside the parser that enforces it: the
 # advisory path once shipped a prompt asking for NO_FINDINGS while its own
 # parser had no branch for it, so a clean review was recorded as unparseable.

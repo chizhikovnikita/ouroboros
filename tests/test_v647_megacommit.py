@@ -1012,3 +1012,38 @@ def test_fr2_deep_inheritance_resolves_shared_tree(monkeypatch, tmp_path):
     assert reject == "", reject
     assert resolved_ws == shared and ws_mode == "external_workspace"
     assert constraint["write_root"] == shared
+
+
+def test_finalize_schedule_emission_surfaces_coop_tree_path():
+    """The host-minted shared coop tree is a SCHEDULE-TIME fact: the parent's
+    tool result names the tree path + the root=subagent_projects read recipe,
+    so continuation waves stop rediscovering their own tree by trial and error
+    (submarine waves). The request-only doctrine (v6.87.28) is untouched: no
+    lane/executor resolution rides along."""
+    from ouroboros.tools.control import _finalize_schedule_emission
+
+    ctx = types.SimpleNamespace(task_id="p1", drive_root=Path(tempfile.mkdtemp()))
+    out = _finalize_schedule_emission(ctx, {
+        "task_ids": ["c1"],
+        "requested_model_lane": "light",
+        "objective": "build",
+        "role": "builder",
+        "depth": 1,
+        "parent_task_id": "p1",
+        "root_task_id": "p1",
+        "emitted_modes": ["live"],
+        "write_surface": "external_workspace",
+        "coop_shared_tree": "/tmp/projects/coop_abc123",
+    })
+    # Windows renders the tree path with os separators — pin label + tree name.
+    assert "shared coop tree: " in out and "coop_abc123" in out
+    assert "root=subagent_projects" in out
+    assert "coop_abc123" in out
+    assert "effective_lane=" not in out  # request-only doctrine intact
+    # Without a minted tree the result is unchanged.
+    out2 = _finalize_schedule_emission(ctx, {
+        "task_ids": ["c2"], "requested_model_lane": "light", "objective": "probe",
+        "role": "scout", "depth": 1, "parent_task_id": "p1", "root_task_id": "p1",
+        "emitted_modes": ["live"],
+    })
+    assert "shared coop tree" not in out2

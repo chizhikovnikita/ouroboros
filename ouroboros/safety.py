@@ -689,8 +689,10 @@ def _run_llm_check(
                 resolved_model,
                 int(usage_payload.get("prompt_tokens") or 0),
                 int(usage_payload.get("completion_tokens") or 0),
-                int(usage_payload.get("cached_tokens") or 0),
-                int(usage_payload.get("cache_write_tokens") or 0),
+                cache_usage={
+                    "cached_tokens": int(usage_payload.get("cached_tokens") or 0),
+                    "cache_write_tokens": int(usage_payload.get("cache_write_tokens") or 0),
+                },
                 provider=provider,
             )
             usage_payload["cost"] = cost

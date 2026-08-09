@@ -42,6 +42,9 @@ const state = {
 
 // Connect only after modules register listeners.
 const ws = createWS();
+// Loopback-only debug hook: the Playwright leak test counts live ws listeners
+// through this handle (the module-scoped `ws` is unreachable from page.evaluate).
+window.__ouroWs = ws;
 const beforePageLeaveHandlers = [];
 let settingsControls = null;
 let dashboardControls = null;
@@ -221,8 +224,36 @@ initFiles(ctx);
 // Navigation is one state machine now: page, project, and mobile drawer are
 // synchronized together so Utilities and Projects can't remain active at once.
 // ---------------------------------------------------------------------------
+// Single-live-panel policy (P3, owner 7A): at most ONE project chat instance is
+// alive; closing or switching destroys the previous one. The exception is an
+// instance holding unsendable client state (staged File attachments / an
+// in-flight upload): it is hidden and marked instead, so switching to Settings
+// mid-upload never drops attachments. Scroll intent survives destruction in a
+// small stash keyed by project id and is re-applied after the recreated
+// instance's first paint.
+const projectScrollStash = new Map();
+
+function destroyProjectInstance(pid) {
+    const inst = projectInstances.get(pid);
+    if (!inst) return;
+    if (inst.hasPendingWork?.()) {
+        inst.page.hidden = true;
+        inst.page.dataset.pendingWork = '1';
+        inst.cancelHistoryPaint?.();
+        return;
+    }
+    const scroll = inst.getScrollState?.();
+    if (scroll) projectScrollStash.set(pid, scroll);
+    inst.destroy?.();
+    projectInstances.delete(pid);
+    projectPaintRequests.delete(pid);
+}
+
 function closeProjectPanel({ sync = true } = {}) {
+    const activeId = navState.activeProjectId;
     navState.activeProjectId = null;
+    if (activeId) destroyProjectInstance(activeId);
+    // Anything left is a hidden pending-work survivor; keep it hidden.
     for (const inst of projectInstances.values()) {
         inst.page.hidden = true;
         inst.cancelHistoryPaint?.();
@@ -240,6 +271,11 @@ async function openProjectPanel(project, { closeDrawer = true } = {}) {
     if (movedToChat === false) return;
     navState.activeProjectId = project.id;
     projectPanelTitle.textContent = project.name || project.id;
+    // One live panel: every OTHER project instance is destroyed (or hidden and
+    // marked when it holds pending work) before the target is created/shown.
+    for (const pid of [...projectInstances.keys()]) {
+        if (pid !== project.id) destroyProjectInstance(pid);
+    }
     let inst = projectInstances.get(project.id);
     if (!inst) {
         inst = createChatInstance({
@@ -253,9 +289,13 @@ async function openProjectPanel(project, { closeDrawer = true } = {}) {
             // so it can never be looked up in a translation catalog.
             title: project.name || project.id,
             titleKey: '',
+            initialScrollState: projectScrollStash.get(project.id) || null,
         });
+        projectScrollStash.delete(project.id);
         projectInstances.set(project.id, inst);
     }
+    // A reopened pending-work survivor is live again.
+    delete inst.page.dataset.pendingWork;
     for (const [pid, other] of projectInstances) {
         other.page.hidden = pid !== project.id;
         if (pid !== project.id) other.cancelHistoryPaint?.();
@@ -266,8 +306,9 @@ async function openProjectPanel(project, { closeDrawer = true } = {}) {
     // after the panel is shown so the column has real geometry to scroll.
     inst.restoreScrollPosition?.();
     // ACK only the exact revision whose history was fetched and painted. chat.js
-    // owns the paint receipt; until that hook exists or succeeds, unread remains.
-    await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true });
+    // owns the paint receipt; an already-painted instance skips the forced
+    // refetch — the server clamps the ACK, so no repaint is needed.
+    await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
 }
 
 // A Project can receive a new visible revision while its panel remains open.
@@ -292,6 +333,9 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
             && Number(paint.revision) === revision
             && navState.activeProjectId === project.id
             && !inst.page.hidden
+            // A destroyed instance's page reports hidden===false but is detached;
+            // a late paint must never ACK a revision nobody saw (GPT#15).
+            && inst.page.isConnected
         ) {
             await markProjectViewed(project.id, revision);
         }

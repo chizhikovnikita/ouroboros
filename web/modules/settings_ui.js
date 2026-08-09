@@ -470,6 +470,28 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3 data-i18n="settings.prompt_cache_ttl">Prompt Cache TTL</h3>
+                        <div class="settings-section-copy">
+                            How long provider prompt caches keep this agent's stable context warm (Anthropic-family routes; other providers manage caching implicitly).
+                            <code>1h</code> keeps the large stable prefix cached across long waits and review cycles &mdash; cache writes bill at 2&times; base input instead of 1.25&times;, but one wait longer than 5 minutes already pays that back on big contexts.
+                            <code>5m</code> is the provider default tier as an explicit value; <code>Default</code> sends bare markers (provider default, callers may still declare their own TTL).
+                            One honest global: it applies to every lane, including review and safety prompts.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Prompt Cache TTL</label>
+                            <input id="s-prompt-cache-ttl" type="hidden" value="1h">
+                            ${renderSegmentedField({
+                                target: 's-prompt-cache-ttl',
+                                options: [
+                                    { value: 'default', label: 'Default' },
+                                    { value: '5m', label: '5m' },
+                                    { value: '1h', label: '1h' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3 data-i18n="settings.safety_supervisor">Safety Supervisor</h3>
                         <div class="settings-section-copy">
                             Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).
@@ -578,7 +600,7 @@ export function renderSettingsPage() {
                             <div class="form-field">
                                 <label data-i18n="settings.per_cycle_budget_reserve_usd">Per-Cycle Budget Reserve (USD)</label>
                                 <input id="s-evo-budget" placeholder="0">
-                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task soft cap and the supervisor's reserved-budget floor.</div>
+                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
                             </div>
                         </div>
                         <div class="form-field">
@@ -761,7 +783,7 @@ export function renderSettingsPage() {
                                 <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
                             </div>
                             <div class="form-field">
-                                <label data-i18n="settings.per_task_soft_threshold_usd">Per-Task Soft Threshold (USD)</label>
+                                <label data-i18n="settings.per_task_cost_cap_usd">Per-Task Cost Cap (USD)</label>
                                 <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
                             </div>
                         </div>

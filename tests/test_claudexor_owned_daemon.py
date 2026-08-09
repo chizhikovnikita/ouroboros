@@ -1270,3 +1270,68 @@ def test_spawn_env_prepends_onto_the_hosts_own_path_key(monkeypatch, tmp_path):
     assert "PATH" not in env, "a second differently-cased PATH key was added"
     assert env["Path"].startswith(node_bin + os_mod.pathsep)
     assert env["Path"].endswith("C:/hostedtoolcache/git/bin")
+
+
+def test_spawn_env_never_leaves_an_empty_path_component(monkeypatch, tmp_path):
+    """EMPTY PATH COMPONENT == CWD. The env builder composes the child's PATH as
+    f"{command_bin}{os.pathsep}{inherited}", so a host whose environment carries
+    no PATH at all (a scrubbed service manager, a bare container unit) yields a
+    TRAILING EMPTY component -- and an empty component means the current working
+    directory on POSIX. That would make CWD an executable search root for a
+    long-lived daemon that shells out to tools of its own.
+
+    Measured, not argued: with a trailing-empty PATH a bare-name binary in the
+    working directory EXECUTED (rc 0); the same exec with the empty component
+    removed raised FileNotFoundError."""
+    import os as os_mod
+    import sys
+
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", sys.executable)
+    monkeypatch.setattr(owned, "_SPAWN_WAIT_SEC", 0.05)
+    monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.01)
+
+    # A host environment with no PATH key in any casing.
+    fake_environ = {k: v for k, v in os_mod.environ.items() if k.upper() != "PATH"}
+    monkeypatch.setattr(os_mod, "environ", fake_environ)
+
+    captured = {}
+
+    class _NeverReadyChild:
+        pid = 424245
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    def _capture_spawn(command, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _NeverReadyChild()
+
+    import ouroboros.platform_layer as platform_layer
+
+    monkeypatch.setattr(platform_layer, "process_group_id", lambda _pid: 0)
+    import ouroboros.process_custody as custody_mod
+
+    monkeypatch.setattr(custody_mod, "spawn_supervised", _capture_spawn)
+
+    manager = owned.OwnedClaudexorDaemon()
+    with pytest.raises(ClaudexorUnavailable):
+        manager.ensure_running()
+
+    env = captured["env"]
+    path_key = next((k for k in env if k.upper() == "PATH"), "")
+    assert path_key, "the child received no PATH at all"
+    components = env[path_key].split(os_mod.pathsep)
+    assert "" not in components, (
+        "an empty PATH component reached the daemon's child environment "
+        f"({env[path_key]!r}); on POSIX that is the current working directory"
+    )
+    assert components[0] == str(pathlib.Path(sys.executable).parent)

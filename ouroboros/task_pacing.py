@@ -326,27 +326,190 @@ _COST_WRAPUP_SPENT_FRACTION = 0.80
 # The historical in-task hard stop: half the budget remaining at task start.
 _DEFAULT_COST_HARD_STOP_PCT = 50
 
+# Typed cost-ceiling states (v6.91): ``None`` is deliberately NOT overloaded to
+# mean both "unlimited" and "exhausted" — a $0.50 bench root cap under a $3
+# planning margin must soft-land, never run uncapped.
+COST_CEILING_DISABLED = "disabled"
+COST_CEILING_ACTIVE = "active"
+COST_CEILING_EXHAUSTED_SOFT_LAND = "exhausted_soft_land"
+COST_CEILING_UNKNOWN = "unknown"
 
-def resolve_cost_ceiling_usd(
+# Planning margin subtracted from the root cap before the graceful in-task stop:
+# an ABSOLUTE emit-window's worth of money (~2 forced-wrap-up call reservation
+# bounds), NEVER a percentage of the cap (a pct reserve amputated ~54 min from a
+# 6h task — v6.54.4 adversarial r1, see effective_finalization_reserve_sec) and
+# NOT ledger-held — the ledger fence still binds at the full cap; the margin
+# only pulls the graceful stop earlier so the wrap-up call fits under the fence.
+_WRAPUP_CALL_RESERVATION_BOUND_USD = 1.50
+COST_PLANNING_MARGIN_USD = max(1.0, 2.0 * _WRAPUP_CALL_RESERVATION_BOUND_USD)
+
+
+# Deciding-spend basis vocabulary (v6.91). The tree-accounted number is the
+# authority whenever a root cap exists (the ledger fence counts the TREE); when
+# it is momentarily unavailable the own-cost number still decides — but the
+# substitution is DISCLOSED, never silent (BIBLE P1: represent the gap). Without
+# a root cap there is no tree fence at all, so own cost is complete, not a
+# fallback — the three states are kept distinct for exactly that reason.
+SPEND_BASIS_TREE = "tree_accounted"
+SPEND_BASIS_OWN_TREE_UNKNOWN = "own_fallback_tree_unknown"
+SPEND_BASIS_OWN_NO_TREE_CAP = "own_only_no_tree_cap"
+
+
+def resolve_deciding_spend(
+    *,
+    tree_cost_usd: Optional[float],
+    task_cost_usd: Optional[float],
+    root_cap_usd: Optional[float],
+) -> Tuple[Optional[float], str]:
+    """The spend that decides a cost surface, plus its DISCLOSED basis (SSOT).
+
+    Shared by the loop's ceiling check and the milestone note so the stop and
+    the nudge can never disagree about which number they are reading. Unknown
+    spend stays None end-to-end — it is never coerced to $0."""
+    if tree_cost_usd is not None:
+        return float(tree_cost_usd), SPEND_BASIS_TREE
+    deciding = None if task_cost_usd is None else float(task_cost_usd)
+    if root_cap_usd is not None:
+        return deciding, SPEND_BASIS_OWN_TREE_UNKNOWN
+    return deciding, SPEND_BASIS_OWN_NO_TREE_CAP
+
+
+@dataclass(frozen=True)
+class CostCeiling:
+    """Typed in-task cost-stop state, resolved ONCE at loop start.
+
+    ``state``:
+    - ``disabled``: no in-task stop — explicit ``cost_hard_stop_pct=0`` (bench
+      contract, e.g. SWE-Pro) or no finite budget on either axis (e.g. GAIA);
+      the whole cost axis stays silent.
+    - ``active``: ``ceiling_usd`` is a strictly-positive graceful-stop point =
+      min(pct-of-global-remaining, root_cap − planning margin).
+    - ``exhausted_soft_land``: the root cap leaves no room above the planning
+      margin — the loop must enter its graceful best-effort wrap-up
+      immediately; it must NEVER run uncapped.
+    - ``unknown``: resolution inputs errored; the axis stays silent but the
+      gap is represented, never filled in (BIBLE P1)."""
+
+    state: str
+    ceiling_usd: Optional[float] = None
+    root_cap_usd: Optional[float] = None
+    planning_margin_usd: Optional[float] = None
+    basis: str = ""
+
+
+def resolve_cost_ceiling(
     budget_remaining_start_usd: Optional[float],
     profile: Dict[str, Any],
-) -> Optional[float]:
-    """The in-task cost hard-stop ceiling in USD, computed ONCE at loop start.
+    *,
+    root_cap_usd: Optional[float] = None,
+) -> CostCeiling:
+    """The in-task cost stop, computed ONCE at loop start (typed; v6.91).
 
-    None start (no finite budget — e.g. GAIA runs) -> None: the whole cost axis
-    stays silent. ``cost_hard_stop_pct`` None -> the historical 50%-of-remaining
-    stop; 0 -> None (explicitly uncapped in-task: deadline/rounds/global gate
-    remain the bounds) — NEVER a computed $0 ceiling, which would stop the task
-    on its first micro-spend."""
-    if budget_remaining_start_usd is None or budget_remaining_start_usd <= 0:
-        return None
-    pct = profile.get("cost_hard_stop_pct")
-    if pct is None:
-        pct = _DEFAULT_COST_HARD_STOP_PCT
-    pct = max(0, min(100, int(pct)))
-    if pct == 0:
-        return None
-    return budget_remaining_start_usd * (pct / 100.0)
+    The GLOBAL component keeps the historical semantics: ``cost_hard_stop_pct``
+    None -> 50% of the global remaining at task start; 0 -> the whole in-task
+    stop is disabled (bench contract). The ROOT component is the per-task tree
+    cap (``OUROBOROS_PER_TASK_COST_USD`` -> ``UsageScope.root_limit_usd``, the
+    SAME value the ledger fence enforces) minus the ABSOLUTE planning margin —
+    deliberately NOT pct-scaled (pct applies to the global axis only; scaling
+    the owner's chosen cap would silently halve it). The ceiling is
+    min(available components); NEVER a computed $0 — a root cap at or below the
+    margin resolves to ``exhausted_soft_land`` instead.
+
+    Stated plainly rather than implied: the ``room <= 0`` bail is the owner's
+    "$0 ceiling" rule EXACTLY, no wider. A cap just ABOVE the margin therefore
+    yields a real but tiny ceiling — ``root_cap_usd = COST_PLANNING_MARGIN_USD
+    + 0.01`` gives ``ceiling_usd == 0.01``, which the first round's spend
+    crosses — so a positive ``ceiling_usd`` is not by itself a promise of
+    working room. Both numbers are disclosed on the carrier (``ceiling_usd``,
+    ``root_cap_usd``, ``planning_margin_usd``) and printed in the stop text, so
+    a reader sees the tiny ceiling instead of inferring a healthy one. Widening
+    the bail into a minimum-room FLOOR would move caps the owner deliberately
+    allows into immediate soft-land; that is an owner call, not a code one."""
+    try:
+        pct = profile.get("cost_hard_stop_pct")
+        if pct is None:
+            pct = _DEFAULT_COST_HARD_STOP_PCT
+        pct = max(0, min(100, int(pct)))
+        if pct == 0:
+            return CostCeiling(
+                state=COST_CEILING_DISABLED,
+                root_cap_usd=(
+                    float(root_cap_usd)
+                    if root_cap_usd is not None and float(root_cap_usd) > 0
+                    else None
+                ),
+                basis="cost_hard_stop_pct_zero",
+            )
+        components: list[float] = []
+        basis_parts: list[str] = []
+        if budget_remaining_start_usd is not None and float(budget_remaining_start_usd) > 0:
+            components.append(float(budget_remaining_start_usd) * (pct / 100.0))
+            basis_parts.append("global_pct")
+        margin: Optional[float] = None
+        cap: Optional[float] = None
+        if root_cap_usd is not None and float(root_cap_usd) > 0:
+            cap = float(root_cap_usd)
+            margin = COST_PLANNING_MARGIN_USD
+            room = cap - margin
+            if room <= 0:
+                return CostCeiling(
+                    state=COST_CEILING_EXHAUSTED_SOFT_LAND,
+                    root_cap_usd=cap,
+                    planning_margin_usd=margin,
+                    basis="root_cap_at_or_below_planning_margin",
+                )
+            components.append(room)
+            basis_parts.append("root_cap_minus_margin")
+        if not components:
+            return CostCeiling(state=COST_CEILING_DISABLED, basis="no_finite_budget")
+        return CostCeiling(
+            state=COST_CEILING_ACTIVE,
+            # Min of strictly-positive components, so never a computed $0 — but a
+            # cap just above the margin makes this legitimately TINY (cap $3.01 ->
+            # $0.01), which is a stop-after-the-first-spend ceiling, not headroom.
+            # Documented in the docstring and pinned in test_budget_limits.
+            ceiling_usd=min(components),
+            root_cap_usd=cap,
+            planning_margin_usd=margin,
+            basis="min(" + ", ".join(basis_parts) + ")",
+        )
+    except Exception:
+        log.warning("Cost ceiling resolution failed; axis stays silent", exc_info=True)
+        return CostCeiling(state=COST_CEILING_UNKNOWN, basis="resolve_error")
+
+
+def _cost_checkpoint(
+    kind: str,
+    *,
+    deciding: float,
+    task_cost: Optional[float],
+    base: float,
+    hard_stop: bool,
+    spend_basis: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """The cost checkpoint payload, with ONE meaning per key name.
+
+    ``task_cost_usd`` has meant THIS task's own accumulated cost since v6.56.0
+    and still does — ``loop.py``'s ``_acceptance_loop_rails`` publishes the same
+    name with the same meaning, and the rails line renders it as "$X spent this
+    task". v6.91 briefly published the tree-accounted DECIDING number under that
+    name, so the same key silently changed axis across a version boundary and
+    every historical log reader would have been quietly re-pointed. The deciding
+    number now rides its own honest name instead, and both are always present so
+    no reader has to infer which axis a value came from (``spend_basis`` says
+    which one the crossing used)."""
+    return {
+        "checkpoint_kind": kind,
+        **extra,
+        "deciding_spend_usd": round(float(deciding), 4),
+        "task_cost_usd": round(float(task_cost), 4) if task_cost is not None else None,
+        "base_usd": round(float(base), 4),
+        "hard_stop": hard_stop,
+        # Always present: a reader must be able to tell a tree number from an
+        # own-cost stand-in without inferring it from a missing key.
+        "spend_basis": spend_basis,
+    }
 
 
 def build_cost_budget_note(
@@ -355,6 +518,8 @@ def build_cost_budget_note(
     start_remaining_usd: Optional[float],
     cost_ceiling_usd: Optional[float],
     task_cost: Optional[float],
+    tree_cost_usd: Optional[float] = None,
+    root_cap_usd: Optional[float] = None,
 ) -> Optional[PacingNote]:
     """Cost milestone note at 50/25/10% of the in-task cost budget remaining,
     plus a one-shot wrap-up note at ~80% spent. Fires only on crossings (never
@@ -364,11 +529,24 @@ def build_cost_budget_note(
     budget remaining at task start (the informational base for
     ``cost_hard_stop_pct=0`` runs). ``start_remaining_usd`` None (no finite
     budget) keeps the axis silent. ADVISORY only — the hard stop itself lives
-    in the loop's budget gate, not here (P5)."""
+    in the loop's budget gate, not here (P5).
+
+    ``tree_cost_usd`` (v6.91) is the root subtree's ledger-accounted spend
+    (settled + reserved + unresolved holds, subagents included) — when known it
+    is the DECIDING spend, because the ledger fence counts the tree, not this
+    task's own calls (waves died at tree $84-94 while own showed $41-49).
+    ``task_cost`` (own accumulated cost) stays the diagnostic line. Unknown tree
+    spend falls back to own cost — never coerced to $0, and never SILENTLY
+    substituted: under a ``root_cap_usd`` the fallback is a lower bound and the
+    note says so (basis vocabulary in ``resolve_deciding_spend``)."""
     base = cost_ceiling_usd if cost_ceiling_usd is not None else start_remaining_usd
-    if base is None or base <= 0 or task_cost is None:
+    deciding, spend_basis = resolve_deciding_spend(
+        tree_cost_usd=tree_cost_usd, task_cost_usd=task_cost, root_cap_usd=root_cap_usd,
+    )
+    if base is None or base <= 0 or deciding is None:
         return None
-    spent_fraction = max(0.0, float(task_cost)) / base
+    tree_basis = spend_basis == SPEND_BASIS_TREE
+    spent_fraction = max(0.0, float(deciding)) / base
     fraction_remaining = max(0.0, 1.0 - spent_fraction)
     seen = getattr(ctx, "_cost_budget_milestones_seen", None)
     if not isinstance(seen, set):
@@ -378,6 +556,20 @@ def build_cost_budget_note(
     unseen_crossed = [(value, label) for value, label in crossed if label not in seen]
     hard_stop = cost_ceiling_usd is not None
     base_kind = "in-task cost ceiling" if hard_stop else "start-of-task budget snapshot (no in-task cost stop)"
+    if tree_basis:
+        own_text = f"; own calls ~${task_cost:.2f}" if task_cost is not None else ""
+        spent_line = (
+            f"Spent this task tree: ~${deciding:.2f} "
+            f"(ledger-accounted incl. in-flight holds, subagents included{own_text})"
+        )
+    elif spend_basis == SPEND_BASIS_OWN_TREE_UNKNOWN:
+        spent_line = (
+            f"Spent this task: ~${deciding:.2f} (OWN calls only — the tree-accounted "
+            "total is unavailable right now, so subagent spend is NOT included; treat "
+            "this as a lower bound against the tree cap)"
+        )
+    else:
+        spent_line = f"Spent this task: ~${deciding:.2f}"
     if unseen_crossed:
         selected_label = unseen_crossed[-1][1]  # thresholds are coarse→fine
         for _value, label in crossed:
@@ -396,19 +588,18 @@ def build_cost_budget_note(
         )
         text = (
             f"[COST BUDGET — {selected_label} remaining crossed]\n"
-            f"Spent this task: ~${task_cost:.2f} | Remaining: ~${max(0.0, base - task_cost):.2f} "
+            f"{spent_line} | Remaining: ~${max(0.0, base - deciding):.2f} "
             f"of ~${base:.2f} ({base_kind})\n"
             "Use this as planning context, not as a command to stop. Prefer the shortest path "
             "to a verifiable result; if a passing artifact or service already exists, prefer "
             "preserving and verifying it over speculative improvements." + _tree_tail
         )
-        return PacingNote(text=text, checkpoint={
-            "checkpoint_kind": "cost_budget_milestone",
-            "milestone": selected_label,
-            "task_cost_usd": round(float(task_cost), 4),
-            "base_usd": round(float(base), 4),
-            "hard_stop": hard_stop,
-        })
+        checkpoint = _cost_checkpoint(
+            "cost_budget_milestone", deciding=deciding, task_cost=task_cost,
+            base=base, hard_stop=hard_stop, spend_basis=spend_basis,
+            milestone=selected_label,
+        )
+        return PacingNote(text=text, checkpoint=checkpoint)
     if spent_fraction >= _COST_WRAPUP_SPENT_FRACTION and not getattr(ctx, "_cost_wrapup_seen", False):
         ctx._cost_wrapup_seen = True
         # v6.60.0: the marker PHRASE is protocol-gated (the milestone itself is not).
@@ -418,19 +609,27 @@ def build_cost_budget_note(
             if _protocol_marker_phrases(ctx) else ""
         )
         _tree_tail = _TREE_FLUSH_SENTENCE if _workspace_delivery(ctx) else ""
+        if tree_basis:
+            _tree_amount = f"tree-accounted ~${deciding:.2f} of ~${base:.2f}"
+        elif spend_basis == SPEND_BASIS_OWN_TREE_UNKNOWN:
+            _tree_amount = (
+                f"~${deciding:.2f} of ~${base:.2f}, counting OWN calls only — the "
+                "tree-accounted total is unavailable right now, so this is a lower bound"
+            )
+        else:
+            _tree_amount = f"~${deciding:.2f} of ~${base:.2f}"
         text = (
             f"[COST BUDGET — wrap-up]\n"
             f"~{spent_fraction * 100:.0f}% of the {base_kind} is spent "
-            f"(~${task_cost:.2f} of ~${base:.2f}).\n"
+            f"({_tree_amount}).\n"
             "Start converging: prefer completing and verifying the current best path over "
             "opening new ones." + _tree_tail + _marker_tail
         )
-        return PacingNote(text=text, checkpoint={
-            "checkpoint_kind": "cost_budget_wrapup",
-            "task_cost_usd": round(float(task_cost), 4),
-            "base_usd": round(float(base), 4),
-            "hard_stop": hard_stop,
-        })
+        checkpoint = _cost_checkpoint(
+            "cost_budget_wrapup", deciding=deciding, task_cost=task_cost,
+            base=base, hard_stop=hard_stop, spend_basis=spend_basis,
+        )
+        return PacingNote(text=text, checkpoint=checkpoint)
     return None
 
 
@@ -462,6 +661,7 @@ def build_time_budget_note(
     *,
     round_idx: int = 0,
     accumulated_usage: Optional[Dict[str, Any]] = None,
+    tree_cost_provider: Optional[Any] = None,
 ) -> Optional[PacingNote]:
     """Deadline-aware milestone note at 50/25/10% remaining, never per-round.
 
@@ -483,6 +683,7 @@ def build_time_budget_note(
     if deadline is None:
         return build_intrinsic_pacing_note(
             ctx, created=created, now=now, round_idx=round_idx, accumulated_usage=accumulated_usage,
+            tree_cost_provider=tree_cost_provider,
         )
     total = max(1.0, (deadline - created).total_seconds())
     remaining = (deadline - now).total_seconds()
@@ -546,11 +747,19 @@ def build_intrinsic_pacing_note(
     now,
     round_idx: int,
     accumulated_usage: Optional[Dict[str, Any]],
+    tree_cost_provider: Optional[Any] = None,
 ) -> Optional[PacingNote]:
     """No deadline: surface the agent's OWN elapsed / rounds / cost periodically.
 
     ADVISORY only — awareness so the one mind can choose to wrap up; deliberately
-    no deterministic time/round/cost stop (finalization stays P5 judgment)."""
+    no deterministic time/round/cost stop (finalization stays P5 judgment).
+
+    ``tree_cost_provider`` (v6.91): a zero-arg callable returning the root
+    subtree's accounting snapshot (``{"accounted_usd", "root_limit_usd"}`` or
+    None). Called ONLY when the note actually fires (a rare, already
+    cache-breaking surface — never per round), so a fresh ledger read at most
+    once per pacing interval keeps the number honest after long child waits.
+    Unknown stays "unknown", never $0."""
     interval = get_pacing_interval_sec()
     if interval <= 0:
         return None
@@ -565,6 +774,23 @@ def build_intrinsic_pacing_note(
     raw_cost = (accumulated_usage or {}).get("cost")
     cost = float(raw_cost) if raw_cost is not None else None
     cost_text = f"~${cost:.2f}" if cost is not None else "unknown"
+    tree_line = ""
+    tree_accounted: Optional[float] = None
+    tree_cap: Optional[float] = None
+    if callable(tree_cost_provider):
+        try:
+            tree_info = tree_cost_provider()
+        except Exception:
+            tree_info = None
+        if isinstance(tree_info, dict) and tree_info.get("accounted_usd") is not None:
+            tree_accounted = float(tree_info["accounted_usd"])
+            raw_cap = tree_info.get("root_limit_usd")
+            tree_cap = float(raw_cap) if raw_cap is not None else None
+            cap_text = f" of ${tree_cap:.2f} tree cap" if tree_cap is not None else ""
+            tree_line = (
+                f" | Task tree spend: ~${tree_accounted:.2f}{cap_text} "
+                "(ledger-accounted incl. in-flight holds, subagents included)"
+            )
     _marker_tail = (
         " If you have a current best short answer, record it with a `FINAL ANSWER:` line "
         "before continuing so it remains salvageable if later work stalls."
@@ -572,14 +798,19 @@ def build_intrinsic_pacing_note(
     )
     text = (
         f"[PACING — ~{elapsed/60:.0f} min elapsed]\n"
-        f"Rounds so far: {round_idx} | Elapsed: ~{elapsed/60:.1f} min | Cost so far: {cost_text}\n"
+        f"Rounds so far: {round_idx} | Elapsed: ~{elapsed/60:.1f} min | Cost so far: {cost_text}"
+        f"{tree_line}\n"
         "Planning context, not a command to stop. Periodically confirm you are still on the "
         "shortest path to a verifiable result; if a passing artifact or service already exists, "
         "prefer preserving and verifying it over speculative improvements." + _marker_tail
     )
-    return PacingNote(text=text, checkpoint={
+    checkpoint = {
         "checkpoint_kind": "intrinsic_pacing",
         "elapsed_sec": round(elapsed, 3),
         "rounds": int(round_idx),
         "cost": round(cost, 4) if cost is not None else None,
-    })
+    }
+    if tree_accounted is not None:
+        checkpoint["tree_accounted_usd"] = round(tree_accounted, 4)
+        checkpoint["tree_cap_usd"] = round(tree_cap, 4) if tree_cap is not None else None
+    return PacingNote(text=text, checkpoint=checkpoint)

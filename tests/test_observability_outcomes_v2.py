@@ -277,7 +277,7 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "tool": "run_command",
             "is_error": True,
             "status": "artifact_output_error",
-            "result": "⚠️ ARTIFACT_OUTPUT_ERROR: undeclared output",
+            "result": "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.",
         }]},
     )
     assert tool_failure["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED

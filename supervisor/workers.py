@@ -628,69 +628,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                 "reason": "project_registration_failed",
                 "task_id": tid,
             }
-    # v6.58.0 (slice 1) — the promote path admits a workspace through the SAME SSOT
-    # as /api/tasks. A task born in a project ROOM defaults to the room's registered
-    # working_dir (workspace="none" on the event opts out); a SET-but-broken
-    # working_dir fails LOUDLY here — never a silent workspace-less task that would
-    # resolve to the self_modification profile over the system repo.
-    from ouroboros.workspace_admission import bounded_workspace_preflight, compose_workspace_block, resolve_room_workspace
-
-    resolved_ws, ws_error = resolve_room_workspace(
-        drive_root=DRIVE_ROOT,
-        system_repo_dir=REPO_DIR,
-        project_id=pid,
-        explicit_workspace=str(evt.get("workspace_root") or "").strip(),
-        workspace_sentinel=str(evt.get("workspace") or ""),
-    )
-    if ws_error:
-        _fail_promoted_task_loudly(ctx, task, ws_error)
-        return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
-    if resolved_ws:
-        task["workspace_root"] = resolved_ws
-        task["workspace_mode"] = "external"
-        task["memory_mode"] = "forked"
-        # The lease lane keys off task["project_id"]: for a project room it is already
-        # set; for a bare workspace promote, resolve it (registry-first → derived hash)
-        # so one folder is one serialized lane on EVERY entry path (slice 0 invariant).
-        if not str(task.get("project_id") or "").strip():
-            try:
-                from ouroboros.project_facts import resolve_project_id as _resolve_pid
-
-                derived_pid = _resolve_pid({"workspace_root": resolved_ws})
-                if derived_pid:
-                    task["project_id"] = derived_pid
-            except Exception:
-                log.debug("promote: project_id derivation failed for %s", tid, exc_info=True)
-        # Memory-fork parity with /api/tasks: the room task runs on an ISOLATED child
-        # drive (forked seed), with the canonical root kept for budget/status.
-        try:
-            from ouroboros.headless import prepare_task_drive
-
-            child_drive = prepare_task_drive(
-                DRIVE_ROOT, tid, "forked", project_id=str(task.get("project_id") or "")
-            )
-            if child_drive is not None:
-                task["drive_root"] = str(child_drive)
-                task["budget_drive_root"] = str(DRIVE_ROOT)
-        except Exception:
-            log.warning("promote: child drive fork failed for %s", tid, exc_info=True)
-        # Preflight parity, HARD-CAPPED: this runs on the supervisor event-drain
-        # thread, so the git/toolchain snapshot gets a bounded window and degrades
-        # to a disclosed skip note instead of stalling event delivery.
-        preflight_summary = bounded_workspace_preflight(resolved_ws)
-        metadata = task.setdefault("metadata", {})
-        metadata["workspace_root"] = resolved_ws
-        metadata["workspace_preflight"] = preflight_summary
-        task["text"] = (
-            f"{task['text']}\n\n[HEADLESS_WORKSPACE]\n"
-            + compose_workspace_block(
-                workspace_root=resolved_ws,
-                workspace_mode="external",
-                memory_mode="forked",
-                workspace_preflight=preflight_summary,
-            )
-            + "[END_HEADLESS_WORKSPACE]"
-        )
+    # Workspace admission (v6.58.0 SSOT + the Q10=A auto-provision) lives in one
+    # helper so this entry point stays readable and under the method gate.
+    workspace_outcome = _admit_promoted_workspace(evt, ctx, task, pid=pid, tid=tid)
+    if workspace_outcome is not None:
+        return workspace_outcome
     attachment_uploads = (
         evt.get("attachment_uploads") if isinstance(evt.get("attachment_uploads"), list) else []
     )
@@ -757,6 +699,139 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     if source_note:
         outcome["source_note"] = source_note
     return outcome
+
+
+def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid: str) -> Optional[dict]:
+    """Bind the promoted task's active workspace, or return a failure outcome.
+
+    Extracted verbatim from ``promote_chat_to_task`` (v6.90.x submarine unwind) to
+    keep that function under the hard method gate; the admission SEQUENCE is
+    unchanged. Returns ``None`` when the task was bound (or legitimately has no
+    workspace) and mutates ``task`` in place; returns a ``needs_manual_target``
+    outcome dict when admission must fail LOUDLY.
+    """
+    # v6.58.0 (slice 1) — the promote path admits a workspace through the SAME SSOT
+    # as /api/tasks. A task born in a project ROOM defaults to the room's registered
+    # working_dir (workspace="none" on the event opts out); a SET-but-broken
+    # working_dir fails LOUDLY here — never a silent workspace-less task that would
+    # resolve to the self_modification profile over the system repo.
+    from ouroboros.workspace_admission import (
+        WORKSPACE_NONE,
+        bounded_workspace_preflight,
+        compose_workspace_block,
+        resolve_room_workspace,
+    )
+
+    # Q10=A (owner, 2026-08-08): a project promoted with NO working folder gets one
+    # AUTO-PROVISIONED via the existing ensure_project_workspace seam (an idempotent
+    # standalone git repo under the durable subagent_projects root — passes the same
+    # validate_workspace_root SSOT below). This binds the task's real tree as its
+    # active workspace, fixing path/cwd confinement, the external tool profile and
+    # the one-writer lease for the file-less project class (the submarine shape).
+    # STRICTLY empty-only: a NON-EMPTY working_dir — valid or broken — is never
+    # blind-ensured over (a broken one must LOUD-FAIL through resolve_room_workspace,
+    # the v6.58.0 invariant, not be papered over with a fresh empty repo). The
+    # workspace="none" sentinel still opts out entirely. Docs are NOT part of this
+    # decision: since D-ARCH (2026-08-08) the doc matrix keys on project membership
+    # and the owner mode, so binding a workspace here never drags ARCHITECTURE.md
+    # out of a max context.
+    if (
+        pid
+        and not str(evt.get("workspace_root") or "").strip()
+        and str(evt.get("workspace") or "").strip().lower() != WORKSPACE_NONE
+    ):
+        provisioned_now = ""
+        try:
+            from ouroboros.projects_registry import get_project as _get_project_entry
+
+            _existing_wd = str((_get_project_entry(DRIVE_ROOT, pid) or {}).get("working_dir") or "").strip()
+        except Exception:
+            # Registry read failure: do NOT provision (a blind ensure here could
+            # mint a fresh empty repo over a project whose working_dir merely
+            # failed to load). resolve_room_workspace re-reads and decides.
+            _existing_wd = "unreadable"
+            log.warning("promote: project working_dir lookup failed for %s", pid, exc_info=True)
+        if not _existing_wd:
+            try:
+                from ouroboros.projects_registry import ensure_project_workspace
+
+                provisioned_now = str(ensure_project_workspace(DRIVE_ROOT, pid, REPO_DIR) or "")
+            except Exception:
+                provisioned_now = ""
+                log.warning("promote: workspace auto-provisioning raised for %s", pid, exc_info=True)
+            if not provisioned_now:
+                # Bind-or-fail (v6.58.0): falling through to a workspace-less
+                # self_modification-profile task over the system repo is exactly
+                # the silent degradation the admission SSOT exists to kill.
+                _fail_promoted_task_loudly(
+                    ctx, task,
+                    f"project {pid!r} has no working folder and auto-provisioning one failed; "
+                    "see the supervisor log (ensure_project_workspace)",
+                )
+                return {
+                    "status": "needs_manual_target",
+                    "reason": "workspace_provisioning_failed",
+                    "task_id": tid,
+                }
+            task.setdefault("metadata", {})["workspace_autoprovisioned"] = True
+
+    resolved_ws, ws_error = resolve_room_workspace(
+        drive_root=DRIVE_ROOT,
+        system_repo_dir=REPO_DIR,
+        project_id=pid,
+        explicit_workspace=str(evt.get("workspace_root") or "").strip(),
+        workspace_sentinel=str(evt.get("workspace") or ""),
+    )
+    if ws_error:
+        _fail_promoted_task_loudly(ctx, task, ws_error)
+        return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
+    if resolved_ws:
+        task["workspace_root"] = resolved_ws
+        task["workspace_mode"] = "external"
+        task["memory_mode"] = "forked"
+        # The lease lane keys off task["project_id"]: for a project room it is already
+        # set; for a bare workspace promote, resolve it (registry-first → derived hash)
+        # so one folder is one serialized lane on EVERY entry path (slice 0 invariant).
+        if not str(task.get("project_id") or "").strip():
+            try:
+                from ouroboros.project_facts import resolve_project_id as _resolve_pid
+
+                derived_pid = _resolve_pid({"workspace_root": resolved_ws})
+                if derived_pid:
+                    task["project_id"] = derived_pid
+            except Exception:
+                log.debug("promote: project_id derivation failed for %s", tid, exc_info=True)
+        # Memory-fork parity with /api/tasks: the room task runs on an ISOLATED child
+        # drive (forked seed), with the canonical root kept for budget/status.
+        try:
+            from ouroboros.headless import prepare_task_drive
+
+            child_drive = prepare_task_drive(
+                DRIVE_ROOT, tid, "forked", project_id=str(task.get("project_id") or "")
+            )
+            if child_drive is not None:
+                task["drive_root"] = str(child_drive)
+                task["budget_drive_root"] = str(DRIVE_ROOT)
+        except Exception:
+            log.warning("promote: child drive fork failed for %s", tid, exc_info=True)
+        # Preflight parity, HARD-CAPPED: this runs on the supervisor event-drain
+        # thread, so the git/toolchain snapshot gets a bounded window and degrades
+        # to a disclosed skip note instead of stalling event delivery.
+        preflight_summary = bounded_workspace_preflight(resolved_ws)
+        metadata = task.setdefault("metadata", {})
+        metadata["workspace_root"] = resolved_ws
+        metadata["workspace_preflight"] = preflight_summary
+        task["text"] = (
+            f"{task['text']}\n\n[HEADLESS_WORKSPACE]\n"
+            + compose_workspace_block(
+                workspace_root=resolved_ws,
+                workspace_mode="external",
+                memory_mode="forked",
+                workspace_preflight=preflight_summary,
+            )
+            + "[END_HEADLESS_WORKSPACE]"
+        )
+    return None
 
 
 def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
@@ -1191,6 +1266,32 @@ def _current_custody_session_id() -> str:
         return ""
 
 
+def _bind_worker_repo_root(repo_dir: str, drive_root: str = "") -> None:
+    """Point git_ops' roots at the repo and data dir this worker was told to serve.
+
+    ``git_ops.REPO_DIR`` is a module global with no env fallback, and ``git_ops.init()`` is never
+    called at boot, so a worker inherits the hardcoded ``~/Ouroboros/repo`` default. Under the
+    spawn start method (macOS/Windows) the child re-imports the module and gets that default even
+    when it serves a checkout somewhere else — and ``update_merge._update_tx_marker_path()``
+    resolves through it, so the worker's managed-update tool gate would read ANOTHER repo's
+    transaction. Bind it from the ``repo_dir`` this worker already receives.
+
+    ``DRIVE_ROOT`` moves with it: the same re-import leaves it on the default data dir, so a
+    worker serving a custom install would write git_ops' rescue snapshots and logs under an
+    unrelated home directory. Both values are handed to this process; the branch names and
+    REMOTE_URL are NOT, which is also why this is a direct assignment rather than
+    ``git_ops.init()`` — init() would overwrite them with its own defaults, silently retargeting
+    an install whose branches differ. They keep whatever the child imported.
+    """
+    import pathlib as _pl
+
+    from supervisor import git_ops as _git_ops
+
+    _git_ops.REPO_DIR = _pl.Path(repo_dir)
+    if drive_root:
+        _git_ops.DRIVE_ROOT = _pl.Path(drive_root)
+
+
 def _prepare_worker_task_runtime() -> None:
     """Load the managed-update authorization path before a live merge can conflict."""
     import supervisor.update_merge  # noqa: F401
@@ -1205,6 +1306,9 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    # Before ANY import that resolves the update-tx marker through git_ops (see
+    # _bind_worker_repo_root): a spawned child would otherwise gate on the hardcoded default repo.
+    _bind_worker_repo_root(repo_dir, drive_root)
     # Adopt the server's custody session id. Under the 'spawn' start method this
     # process re-imported process_custody and minted a fresh _SESSION_ID; without
     # adopting the server's id, every service/process this worker records looks

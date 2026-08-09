@@ -16,6 +16,45 @@ from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 from ouroboros import _outcome_receipts
+# Tool-call trace vocabulary + execution-axis classifier (leaf module). Re-exported
+# here so `from ouroboros.outcomes import _classify_tool_errors/_POLICY_DENIAL_STATUSES/...`
+# keeps resolving for every historical import site.
+from ouroboros._outcome_tool_errors import (
+    _BLOCKING_TOOL_STATUSES as _BLOCKING_TOOL_STATUSES,
+)
+from ouroboros._outcome_tool_errors import (
+    _classify_tool_errors as _classify_tool_errors,
+)
+from ouroboros._outcome_tool_errors import (
+    _COSMETIC_TOOL_NAMES as _COSMETIC_TOOL_NAMES,
+)
+from ouroboros._outcome_tool_errors import (
+    _is_ignored_readonly_block as _is_ignored_readonly_block,
+)
+from ouroboros._outcome_tool_errors import (
+    _NON_BLOCKING_READONLY_BLOCK_STATUSES as _NON_BLOCKING_READONLY_BLOCK_STATUSES,
+)
+from ouroboros._outcome_tool_errors import (
+    _NON_BLOCKING_RECOVERABLE_STATUSES as _NON_BLOCKING_RECOVERABLE_STATUSES,
+)
+from ouroboros._outcome_tool_errors import (
+    _OK_TOOL_STATUSES as _OK_TOOL_STATUSES,
+)
+from ouroboros._outcome_tool_errors import (
+    _POLICY_DENIAL_STATUSES as _POLICY_DENIAL_STATUSES,
+)
+from ouroboros._outcome_tool_errors import (
+    _RECOVERY_TOOL_NAMES as _RECOVERY_TOOL_NAMES,
+)
+from ouroboros._outcome_tool_errors import (
+    _ROOT_WRITE_TOOLS as _ROOT_WRITE_TOOLS,
+)
+from ouroboros._outcome_tool_errors import (
+    _unresolved_tool_errors as _unresolved_tool_errors,
+)
+from ouroboros._outcome_tool_errors import (
+    _user_file_basenames as _user_file_basenames,
+)
 from ouroboros.headless import (
     ARTIFACT_STATUS_FAILED,
     ARTIFACT_STATUS_FINALIZING,
@@ -89,6 +128,22 @@ REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
 
+# CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
+# acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
+# when the panel was OWED (eligible) but a rail ended the task first. Both deadline
+# rails collapse to ONE reason; an unmapped rail stamps nothing — the enum stays finite
+# and no call site may mint a reason by concatenation (ledger vocabulary only, never
+# agent-visible text — the v6.61.4 token-parroting class).
+ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
+    "budget_exhausted": "acceptance_bypassed_budget_exhausted",
+    "round_limit": "acceptance_bypassed_round_limit",
+    "finalization_grace": "acceptance_bypassed_deadline",
+    "deadline_local": "acceptance_bypassed_deadline",
+    "provider_unavailable": "acceptance_bypassed_provider_unavailable",
+    "children_unabsorbed": "acceptance_bypassed_children_unabsorbed",
+}
+ACCEPTANCE_BYPASS_REASONS = frozenset(ACCEPTANCE_BYPASS_REASON_BY_RAIL.values())
+
 # v6.78.0 (owner Q23=B): the HOST acceptance decision has exactly three owner-facing
 # states, each carrying a typed `reason` drawn from facts the host already computed
 # (dialogue_status, pass_reason, panel/degraded reasons, the pacing launch reason).
@@ -101,104 +156,6 @@ ACCEPTANCE_DECISION_STATUSES = (
     ACCEPTANCE_ACCEPTED, ACCEPTANCE_REVISION_REQUESTED, ACCEPTANCE_FINALIZED_UNACCEPTED,
 )
 
-_BLOCKING_TOOL_STATUSES = frozenset({
-    "artifact_output_error",
-    "blocked",
-    "claude_code_error",
-    "cwd_blocked",
-    "data_blocked",
-    "edit_ops_blocked",
-    "edit_text_blocked",
-    "elevation_blocked",
-    "error",
-    "git_via_shell_blocked",
-    "heal_mode_blocked",
-    "install_error",
-    "integration_blocked",
-    "light_mode_blocked",
-    "non_zero_exit",
-    "protected_blocked",
-    "resource_constraint_blocked",
-    "resource_policy_blocked",
-    "run_script_blocked",
-    "safety_violation",
-    "shell_error",
-    "skill_payload_blocked",
-    "skill_payload_control_blocked",
-    "skill_state_blocked",
-    "timeout",
-    "unavailable",
-    "violation",
-    "workspace_blocked",
-    "write_file_blocked",
-    "root_required_user_files",
-    "root_required_active_workspace",
-})
-_RECOVERY_TOOL_NAMES = frozenset({
-    "edit_text", "apply_patch", "edit_batch",
-    "run_command",
-    "run_script",
-    "start_service",
-    "stop_service",
-    "write_file",
-})
-# v6.57.0 — POLICY-denial statuses: the runtime/policy said "no" to an action
-# (a `*_blocked` refusal, on ANY tool incl. writes/shell). This is telemetry, NOT
-# an execution-health failure: the agent either found another way (its work is
-# judged on the objective/review axis) or was honestly blocked. Distinct from the
-# read-only `_NON_BLOCKING_READONLY_BLOCK_STATUSES` (which already demotes resource
-# blocks on read-only tools) — this covers the WRITE/shell/integration blocks that
-# previously forced execution=degraded + a false `tool_failure` headline even when
-# the deliverable succeeded (the site-presentation incident: integration_blocked +
-# LIST_FILES policy → degraded/tool_failure over a shipped site). A structural
-# status partition (Bible P5 — never content matching). Genuine tool/exec failures
-# (`error`, `*_error`, `non_zero_exit`, `shell_error`, `timeout`, `unavailable`) and
-# security-boundary hits (`safety_violation`, `violation`) are intentionally EXCLUDED
-# and stay real failures.
-_POLICY_DENIAL_STATUSES = frozenset({
-    "blocked",
-    "cwd_blocked",
-    "data_blocked",
-    "edit_ops_blocked",
-    "edit_text_blocked",
-    "elevation_blocked",
-    "git_via_shell_blocked",
-    "heal_mode_blocked",
-    "integration_blocked",
-    "light_mode_blocked",
-    "protected_blocked",
-    "resource_constraint_blocked",
-    "resource_policy_blocked",
-    "run_script_blocked",
-    "skill_payload_blocked",
-    "skill_payload_control_blocked",
-    "skill_state_blocked",
-    "workspace_blocked",
-    "write_file_blocked",
-})
-# T4 (v6.35.0): an unrecovered run_command/run_script non-zero exit / shell
-# error — e.g. an X11-teardown `exit=1` after "138 passed", or an abandoned
-# `find` probe on a nonexistent path — is cosmetic, not a degraded execution.
-# NOTE: `non_zero_exit`/`shell_error` ARE in _BLOCKING_TOOL_STATUSES; this branch
-# DELIBERATELY demotes them to a non-degrading "cosmetic" bucket (still recorded
-# on the execution axis for monitoring) because the owner accepted that an
-# ignored shell failure belongs on the LLM-review/objective axis, not the
-# execution axis. `timeout` is intentionally EXCLUDED — a stuck/aborted command
-# is a real failure. Structural status/tool-name partition, never content
-# matching (Bible P5).
-_NON_BLOCKING_RECOVERABLE_STATUSES = frozenset({"non_zero_exit", "shell_error"})
-_COSMETIC_TOOL_NAMES = frozenset({"run_command", "run_script"})
-# A2: an UNRECOVERED access-policy block (resource_policy_blocked /
-# resource_constraint_blocked) on a READ-ONLY exploratory tool — e.g. a
-# read_file/search_code/query_code refused by the resource policy — is honest
-# telemetry, not a degraded execution: the agent simply could not look there.
-# DISTINCT from _NON_BLOCKING_RECOVERABLE_STATUSES / _COSMETIC_TOOL_NAMES so this
-# never demotes a run_command resource block. Routed to a FULLY-IGNORED bucket (not
-# cosmetic) so it raises no WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW — the goal is
-# honest telemetry, not a new visible warning. The read-only tool whitelist reuses
-# the capability SSOT (READ_ONLY_PARALLEL_TOOLS). Write/edit/data/protected/
-# light_mode/integration blocks are intentionally NOT demoted here.
-_NON_BLOCKING_READONLY_BLOCK_STATUSES = frozenset({"resource_policy_blocked", "resource_constraint_blocked"})
 # When cosmetic residual errors exist but no acceptance review ran, the
 # execution axis is OK yet "did it actually work?" was never judged: surface a
 # structural warning so a default-`auto` overclaim isn't displayed as clean.
@@ -239,18 +196,6 @@ _LEDGER_NON_FAILURE_STATUSES = (
     # diagnostic reporting what it was called to find). A finding, not a failure.
     | frozenset({"tool_reported_failure"})
 )
-
-
-def _is_ignored_readonly_block(tool: str, status: str) -> bool:
-    """A2 (v6.50.2) SSOT predicate: an access-policy block (resource_policy_blocked /
-    resource_constraint_blocked) on a READ-ONLY exploratory tool is honest telemetry, not a
-    degraded execution NOR a verification-ledger failure — the agent simply could not look
-    there. Shared by ``_classify_tool_errors`` (execution axis) and ``build_verification_ledger``
-    (has_failures) so both axes classify it identically. Non-read-only/effect tools (e.g. a
-    run_command resource block) are NOT matched and stay real failures."""
-    from ouroboros.tool_capabilities import READ_ONLY_PARALLEL_TOOLS
-
-    return status in _NON_BLOCKING_READONLY_BLOCK_STATUSES and tool in READ_ONLY_PARALLEL_TOOLS
 
 
 def _merge_objective_warning(objective: Dict[str, Any], code: str) -> None:
@@ -354,10 +299,7 @@ def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Option
     — never a single latest-pointer, which a newer red would let erase an older still-red
     one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
     reconciliation rule lives in one place."""
-    return _outcome_receipts.latest_unreconciled_failed(
-        receipts,
-        _RECEIPT_RED_RECONCILING_STATUSES,
-    )
+    return _outcome_receipts.latest_unreconciled_failed(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
 def latest_unreconciled_failed_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
@@ -380,10 +322,7 @@ def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[
     so a cleanly reconciled newer masked check no longer takes an older one with it.
     FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
     the acceptance verification_summary."""
-    return _outcome_receipts.latest_unreconciled_masked(
-        receipts,
-        _RECEIPT_RED_RECONCILING_STATUSES,
-    )
+    return _outcome_receipts.latest_unreconciled_masked(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
 def latest_unreconciled_masked_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
@@ -469,14 +408,12 @@ def infra_failed_axes(reason_code: str, *, lifecycle: str = "failed", review_tri
 # applies directly. (The retired SDK edit gateway was the one cwd-based coding
 # tool; delegated coding now rides the subagent lane, whose integration lands
 # through integrate_subagent_patch below — D10.)
-_ROOT_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})  # patch/batch refuse scratch roots: any success is a reviewable effect
 _EFFECT_COMMIT_TOOLS = frozenset({"commit_reviewed", "vcs_commit_reviewed"})
 # Exclusion model: only pure scratch is exempt. Every other root is a real surface
 # (deliverable, workspace, repo, skill payload, or a light-mode skill write via
 # runtime_data). Excluding by scratch — not enumerating "deliverable" roots —
 # keeps the immune gate complete as roots evolve and errs toward reviewing work.
 _SCRATCH_ROOTS = frozenset({"task_drive"})
-_OK_TOOL_STATUSES = frozenset({"", "ok", "ok_autocorrected"})
 # Process/service tools that produce a registered deliverable when given outputs=[...].
 _EFFECT_PROCESS_TOOLS = frozenset({"run_command", "run_script", "start_service"})
 # Substantial cwd-based coding tools: none since D10 retired the SDK edit
@@ -533,171 +470,7 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
 
 def turn_has_reviewable_effects(llm_trace: Dict[str, Any]) -> bool:
     """True when the shared structured projection contains a real effect."""
-
     return bool(reviewable_effect_projection(llm_trace))
-
-
-def _user_file_basenames(args: Dict[str, Any]) -> set[str]:
-    """Lowercased file basenames declared in a write call's ``path`` and ``files[]``."""
-    candidates = [args.get("path")]
-    candidates.extend(
-        (entry or {}).get("path") for entry in (args.get("files") or []) if isinstance(entry, dict)
-    )
-    return {
-        pathlib.PurePath(str(candidate or "")).name.lower()
-        for candidate in candidates
-        if str(candidate or "").strip()
-    }
-
-
-def _tool_error_record(item: Dict[str, Any], *, recovered_by: int | None = None) -> Dict[str, Any]:
-    record = {
-        "tool": str(item.get("tool") or "unknown"),
-        "status": str(item.get("status") or "error"),
-        "exit_code": item.get("exit_code"),
-        "signal": item.get("signal"),
-        "result": str(item.get("result") or "")[:500],
-    }
-    if recovered_by is not None:
-        record["recovered_by_call_index"] = recovered_by
-    return record
-
-
-def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    calls = [item for item in (llm_trace.get("tool_calls") or []) if isinstance(item, dict)]
-    unresolved: List[Dict[str, Any]] = []
-    recovered_items: List[Dict[str, Any]] = []
-    cosmetic_items: List[Dict[str, Any]] = []
-    ignored_items: List[Dict[str, Any]] = []
-    policy_denials: List[Dict[str, Any]] = []
-    for idx, item in enumerate(calls):
-        if not item.get("is_error"):
-            continue
-        tool = str(item.get("tool") or "unknown")
-        status = str(item.get("status") or "error")
-        # COGNITIVE_TOOL_REQUIRED is an advisory redirect, not a task failure: the
-        # agent is told to use update_identity/update_scratchpad/knowledge_write, but
-        # a self-initiated cognitive write through the wrong tool must never fail the
-        # task (that was the original "Привет fails" regression). Skip it entirely.
-        if status == "cognitive_tool_required":
-            continue
-        # A2: an access-policy block on a READ-ONLY exploratory tool is honest
-        # telemetry, not a degraded execution — fully ignored (recorded for
-        # forensics) so it neither sets tool_failure nor raises a residual warning.
-        if _is_ignored_readonly_block(tool, status):
-            ignored_items.append(_tool_error_record(item))
-            continue
-        if status not in _BLOCKING_TOOL_STATUSES and tool not in _RECOVERY_TOOL_NAMES:
-            continue
-        # ROOT_REQUIRED_* redirects name a real misrouted deliverable. Each is
-        # recovered ONLY when every blocked file name (path or files[]) is later
-        # written via the root the redirect demanded (user_files ↔ active_workspace).
-        # These branches are terminal: they never fall through to the generic
-        # same-target/artifact_registered recovery, which could otherwise clear
-        # them through a write to the wrong root (e.g. a run_command output).
-        if status in ("root_required_user_files", "root_required_active_workspace"):
-            required_root = (
-                "user_files" if status == "root_required_user_files" else "active_workspace"
-            )
-            blocked_args = item.get("args") if isinstance(item.get("args"), dict) else {}
-            blocked_names = _user_file_basenames(blocked_args)
-            recovered_names: set[str] = set()
-            for later in calls[idx + 1:]:
-                if not (isinstance(later, dict) and not later.get("is_error")):
-                    continue
-                later_args = later.get("args") if isinstance(later.get("args"), dict) else {}
-                later_root = str(later_args.get("root") or "")
-                # active_workspace is these tools' DEFAULT root: a retry that simply
-                # omits root already writes to the demanded place, so it earns the
-                # recovery credit too (scope r2 — the explicit-arg-only match left a
-                # real recovery marked unresolved → false execution-axis degradation).
-                # user_files is never a default and still requires the explicit arg.
-                root_matches = later_root == required_root or (
-                    required_root == "active_workspace" and not later_root
-                )
-                if (
-                    str(later.get("tool") or "") in _ROOT_WRITE_TOOLS
-                    and root_matches
-                    and str(later.get("status") or "ok") in _OK_TOOL_STATUSES
-                ):
-                    recovered_names |= _user_file_basenames(later_args)
-            if not (blocked_names and blocked_names <= recovered_names):
-                unresolved.append(_tool_error_record(item))
-            else:
-                recovered_items.append(_tool_error_record(item))
-            continue
-        args = item.get("args") if isinstance(item.get("args"), dict) else {}
-        target_parts = []
-        target_paths = set()
-        for key in ("root", "path", "cwd", "cmd", "script", "name", "outputs"):
-            if key not in args:
-                continue
-            value = args.get(key)
-            target_parts.append((key, value))
-            if key in {"path", "cwd"} and value:
-                target_paths.add(str(value))
-            if key == "outputs" and isinstance(value, list):
-                target_paths.update(str(part) for part in value if str(part or "").strip())
-        target_key = json.dumps(target_parts, sort_keys=True, default=str)
-        recovered_by: int | None = None
-        for later_idx, later in enumerate(calls[idx + 1:], start=idx + 2):
-            if later.get("is_error"):
-                continue
-            later_tool = str(later.get("tool") or "")
-            later_status = str(later.get("status") or "ok")
-            if later_status not in {"", "ok", "ok_autocorrected"}:
-                continue
-            later_args = later.get("args") if isinstance(later.get("args"), dict) else {}
-            later_parts = []
-            later_paths = set()
-            for key in ("root", "path", "cwd", "cmd", "script", "name", "outputs"):
-                if key not in later_args:
-                    continue
-                value = later_args.get(key)
-                later_parts.append((key, value))
-                if key in {"path", "cwd"} and value:
-                    later_paths.add(str(value))
-                if key == "outputs" and isinstance(value, list):
-                    later_paths.update(str(part) for part in value if str(part or "").strip())
-            same_target = later_tool == tool and target_key == json.dumps(later_parts, sort_keys=True, default=str)
-            same_path = bool(target_paths and later_paths and target_paths.intersection(later_paths))
-            # Read the TYPED artifact-registration flag captured from the full result at
-            # execution time (loop_tool_execution), not a substring of the (truncatable)
-            # trace preview — the same typed signal turn_has_reviewable_effects uses, so
-            # the marker is never re-derived from prose on this layer (C9.5).
-            artifact_registered = bool(later.get("artifact_registered"))
-            if status == "artifact_output_error":
-                recovered = artifact_registered and (same_path or not target_paths)
-            else:
-                recovered = same_target or (artifact_registered and same_path)
-            if recovered:
-                recovered_by = later_idx
-                break
-        if recovered_by is not None:
-            recovered_items.append(_tool_error_record(item, recovered_by=recovered_by))
-            continue
-        if status in _NON_BLOCKING_RECOVERABLE_STATUSES and tool in _COSMETIC_TOOL_NAMES:
-            # Unrecovered run_command/run_script non-zero exit: cosmetic, not degrading.
-            cosmetic_items.append(_tool_error_record(item))
-            continue
-        if status in _POLICY_DENIAL_STATUSES:
-            # v6.57.0 — an unrecovered POLICY refusal (the runtime said "no" to this
-            # action) is telemetry, not an execution-health failure. Recorded for
-            # forensics; does NOT set execution=degraded nor a `tool_failure` headline.
-            policy_denials.append(_tool_error_record(item))
-            continue
-        unresolved.append(_tool_error_record(item))
-    return {
-        "unresolved": unresolved,
-        "recovered": recovered_items,
-        "cosmetic": cosmetic_items,
-        "ignored": ignored_items,
-        "policy_denials": policy_denials,
-    }
-
-
-def _unresolved_tool_errors(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return _classify_tool_errors(llm_trace).get("unresolved") or []
 
 
 def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
@@ -733,13 +506,10 @@ def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
 
 def _aggregate_outcome_tier(tiers: List[str]) -> str:
     """Worst-tier-wins aggregation: blocked > best_effort > solved."""
-    if not tiers:
-        return ""
-    if OUTCOME_TIER_BLOCKED in tiers:
-        return OUTCOME_TIER_BLOCKED
-    if OUTCOME_TIER_BEST_EFFORT in tiers:
-        return OUTCOME_TIER_BEST_EFFORT
-    return OUTCOME_TIER_SOLVED
+    for tier in (OUTCOME_TIER_BLOCKED, OUTCOME_TIER_BEST_EFFORT):
+        if tier in tiers:
+            return tier
+    return OUTCOME_TIER_SOLVED if tiers else ""
 
 
 def _acceptance_decision_projection(acceptance_decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -1016,6 +786,17 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
     return public
 
 
+# INFRA-failure host-fallback text prefixes: (prefix, failure kind, default reason_code).
+_INFRA_TEXT_PREFIXES = (
+    ("⚠️ Failed to get a response", "provider", REASON_PROVIDER_FAILURE),
+    ("⚠️ All models are down", "provider", REASON_PROVIDER_FAILURE),
+    ("⚠️ Error during processing:", "runtime", REASON_TASK_EXCEPTION),
+    ("❌ Deep self-review unavailable:", "runtime", REASON_DEEP_SELF_REVIEW_UNAVAILABLE),
+    ("⚠️ Deep self-review error:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
+    ("❌ Deep self-review failed:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
+)
+
+
 def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Return a typed LoopOutcome-compatible dict."""
 
@@ -1042,11 +823,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     mutation_attribution = _trace_mapping(llm_trace, "mutation_attribution")
     # v6.78.0: keyed on the CANONICAL status plus the typed reason (before the
     # three-state collapse the reason literal WAS the status). Missing this pairing
-    # would silently stop degrading an eligible-but-skipped panel — a false green.
-    acceptance_review_skipped_deadline_reserve = (
+    # would silently stop degrading an eligible-but-skipped panel — a false green;
+    # keying on the status alone would degrade honest capsule_spent finalizations.
+    # The forced-rail bypass reasons (ACCEPTANCE_BYPASS_REASONS) ride the same key.
+    _acceptance_reason = str(acceptance_decision.get("reason") or "")
+    acceptance_review_skipped_eligible = (
         str(acceptance_decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
-        and str(acceptance_decision.get("reason") or "")
-        == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        and (
+            _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+            or _acceptance_reason in ACCEPTANCE_BYPASS_REASONS
+        )
         and str(review_decision.get("eligibility") or "") == "eligible"
     )
     disposition_projection = _trace_mapping(llm_trace, "child_result_dispositions")
@@ -1105,22 +891,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Failed to get a response") or text.lstrip().startswith("⚠️ All models are down"):
+    elif (_infra := next(
+        (row for row in _INFRA_TEXT_PREFIXES if text.lstrip().startswith(row[0])), None,
+    )) is not None:
         execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_PROVIDER_FAILURE
-        failure = {"kind": "provider", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Error during processing:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_TASK_EXCEPTION
-        failure = {"kind": "runtime", "reason_code": reason_code}
-    elif text.lstrip().startswith("❌ Deep self-review unavailable:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_DEEP_SELF_REVIEW_UNAVAILABLE
-        failure = {"kind": "runtime", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Deep self-review error:") or text.lstrip().startswith("❌ Deep self-review failed:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_DEEP_SELF_REVIEW_ERROR
-        failure = {"kind": "runtime", "reason_code": reason_code}
+        reason_code = usage_reason or _infra[2]
+        failure = {"kind": _infra[1], "reason_code": reason_code}
     elif delivery_candidate.get("degraded") and not deferred_child_suffix:
         execution_status = EXECUTION_DEGRADED
         reason_code = usage_reason or REASON_DELIVERY_CONTROL_DEGRADED
@@ -1150,11 +926,21 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "tool_errors": tool_errors[:20],
         }
 
-    # A deadline-skipped eligible panel is not a verdict, but cannot remain clean;
+    # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
-    if acceptance_review_skipped_deadline_reserve and execution_status == EXECUTION_OK:
+    # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
+    # cannot arrive here on an OK execution — a bypass is stamped only when the rail
+    # already wrote `usage.reason_code`, and every writer of that key also writes
+    # `execution_status='failed'`, so those runs land on the STRONGER failed /
+    # best_effort branches above and the owner-visible bypass rides the review axis
+    # (see test_forced_rail_axes_are_the_production_shape). What this branch actually
+    # decides is the pacing skip (REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE).
+    # The bypass keys stay in the condition as a BACKSTOP, not as a live behaviour
+    # claim: a future rail that bypasses an owed panel without failing the usage must
+    # not be able to come back as a clean green.
+    if acceptance_review_skipped_eligible and execution_status == EXECUTION_OK:
         execution_status = EXECUTION_DEGRADED
-        reason_code = REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        reason_code = _acceptance_reason
         failure = {
             "kind": "task_acceptance",
             "reason_code": reason_code,
@@ -1182,12 +968,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "source": "delivery_finalization_control",
         })
     if (
-        acceptance_review_skipped_deadline_reserve
+        acceptance_review_skipped_eligible
         and objective.get("status") == OBJECTIVE_NOT_EVALUATED
     ):
         objective.update({
             "status": OBJECTIVE_DEGRADED,
-            "source": "task_acceptance_deadline_reserve",
+            "source": (
+                "task_acceptance_deadline_reserve"
+                if _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+                else "task_acceptance_forced_bypass"
+            ),
         })
     # Mutation attribution is evidence for the reviewing panels (attached to the
     # failure-evidence projection below), deliberately never a structural veto.
@@ -1283,33 +1073,23 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
         refs["execution_id"] = execution_id
-    llm_refs = []
-    for item in usage.get("llm_call_refs") or []:
-        if not isinstance(item, dict):
-            continue
-        llm_refs.append({
-            "llm_call_id": item.get("llm_call_id"),
-            "execution_id": item.get("execution_id"),
-            "round_id": item.get("round_id"),
-            "round": item.get("round"),
-            "request_ref": item.get("request_ref"),
-            "response_ref": item.get("response_ref"),
-            "model": item.get("model"),
-            "resolved_model": item.get("resolved_model"),
-            "provider": item.get("provider"),
-        })
+    llm_refs = [
+        {key: item.get(key) for key in (
+            "llm_call_id", "execution_id", "round_id", "round", "request_ref",
+            "response_ref", "model", "resolved_model", "provider",
+        )}
+        for item in usage.get("llm_call_refs") or []
+        if isinstance(item, dict)
+    ]
     if llm_refs:
         refs["llm_call_refs"] = llm_refs
     tool_refs = []
     for item in llm_trace.get("tool_calls") or []:
         if isinstance(item, dict) and item.get("trace_ref"):
             trace = item.get("trace_ref") if isinstance(item.get("trace_ref"), dict) else {}
-            tool_refs.append({
-                "call_id": trace.get("call_id"),
-                "manifest_ref": trace.get("manifest_ref"),
-                "redacted_projection_ref": trace.get("redacted_projection_ref"),
-                "redaction": trace.get("redaction"),
-            })
+            tool_refs.append({key: trace.get(key) for key in (
+                "call_id", "manifest_ref", "redacted_projection_ref", "redaction",
+            )})
     if tool_refs:
         refs["tool_call_refs"] = tool_refs
     return refs

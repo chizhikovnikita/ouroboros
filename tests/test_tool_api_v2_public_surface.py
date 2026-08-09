@@ -261,7 +261,9 @@ def test_user_files_root_blocks_workspace_parent_and_home_secrets(tmp_path, monk
 
     assert "WRITE_FILE_ERROR" in parent_result
     assert "user_files path blocked" in parent_result
-    assert "READ_FILE_ERROR" in secret_result
+    # Read-tool confinement refusals carry the TYPED policy-denial prefix
+    # (v6.57.0 partition) instead of a generic READ_FILE_ERROR wrap.
+    assert "USER_FILES_PATH_BLOCKED" in secret_result
     assert "credential-like" in secret_result
     assert not (home / "Ouroboros" / "AGENTS.md").exists()
 
@@ -286,7 +288,8 @@ def test_list_files_user_files_blocks_ouroboros_control_plane(tmp_path, monkeypa
 
     result = registry.execute("list_files", {"root": "user_files", "path": "Ouroboros/repo"})
 
-    assert "LIST_FILES_ERROR" in result
+    # Typed policy-denial prefix (v6.57.0 partition) — no generic LIST_FILES_ERROR wrap.
+    assert "USER_FILES_PATH_BLOCKED" in result
     assert "user_files path blocked" in result
     assert "README.md" not in result
 
@@ -892,6 +895,7 @@ def test_run_command_outputs_registers_artifact(tmp_path, monkeypatch):
 
     assert "exit_code=0" in result
     assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "ARTIFACT_OUTPUT_UNDECLARED" not in result
     assert "registered output" in result
     assert (data / "task_results" / "artifacts" / "task1" / "deliverable.txt").read_text(encoding="utf-8") == "ok"
     records = collect_task_artifact_records(data, "task1")
@@ -994,7 +998,7 @@ def test_run_command_without_outputs_blocks_absolute_user_file_writes(tmp_path, 
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1027,7 +1031,7 @@ def test_run_command_artifact_error_still_invalidates_repo_advisory(tmp_path, mo
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert calls
     assert calls[-1][1]["source_tool"] == "run_command"
     assert "changed.txt" in calls[-1][1]["changed_paths"]
@@ -1053,6 +1057,7 @@ def test_run_command_without_outputs_allows_absolute_user_file_reads(tmp_path, m
     )
 
     assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "ARTIFACT_OUTPUT_UNDECLARED" not in result
     assert "exit_code=0" in result
 
 
@@ -1074,7 +1079,7 @@ def test_run_command_without_outputs_blocks_absolute_user_file_open_writes(tmp_p
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1098,7 +1103,7 @@ def test_run_script_without_outputs_flags_absolute_user_file_writes(tmp_path, mo
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "run_script wrote user_files without declaring outputs" in result
     assert str(target) in result
     # The write happened (post-exec) but the file is NOT registered as an artifact.
@@ -1117,7 +1122,7 @@ def test_run_command_without_outputs_detects_shell_redirection_to_user_files(tmp
         {"cmd": ["sh", "-c", f"echo ok > {shlex.quote(target.as_posix())}"], "cwd": str(desktop)},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8").strip() == "ok"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1366,3 +1371,111 @@ def test_get_runtime_mode_prefers_boot_baseline(monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
 
     assert cfg.get_runtime_mode() == "light"
+
+
+# --- submarine unwind (2026-08-08): legible confinement + typed policy denials --
+
+def test_user_files_block_names_subagent_projects_root(tmp_path, monkeypatch):
+    """A refused coop-tree path names the ONE root that can actually reach it
+    (root=subagent_projects + the exact relative path) instead of four roots
+    that cannot (waves 2-3 rediscovery loop). Message-only: the root stays
+    read-only and the shell/write boundary is unchanged."""
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    projects = home / "Ouroboros" / "projects"
+    (projects / "coop_abc123" / "render").mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects))
+
+    result = registry.execute(
+        "list_files",
+        {"root": "user_files", "path": str(projects / "coop_abc123" / "render")},
+    )
+    assert "USER_FILES_PATH_BLOCKED" in result
+    assert "root=subagent_projects" in result
+    assert "coop_abc123" in result
+    # The suggested call actually works (read-only root, same profile).
+    listing = registry.execute(
+        "list_files", {"root": "subagent_projects", "path": "coop_abc123/render"}
+    )
+    assert "⚠️" not in listing
+
+
+def test_user_files_read_block_status_is_policy_denial(tmp_path, monkeypatch):
+    """The typed USER_FILES_PATH_BLOCKED status is partitioned as a policy denial
+    (v6.57.0): an unrecovered read-side confinement refusal lands in
+    execution.policy_denials, never unresolved/tool_failure."""
+    from ouroboros.loop_tool_execution import _extract_result_metadata
+    from ouroboros.outcomes import _POLICY_DENIAL_STATUSES, _classify_tool_errors
+
+    meta = _extract_result_metadata(
+        "list_files",
+        "⚠️ USER_FILES_PATH_BLOCKED: user_files path blocked: path overlaps ...",
+        True,
+    )
+    assert meta["status"] == "user_files_path_blocked"
+    assert meta["status"] in _POLICY_DENIAL_STATUSES
+    buckets = _classify_tool_errors({
+        "tool_calls": [
+            {"tool": "list_files", "is_error": True, "status": "user_files_path_blocked", "args": {}},
+        ]
+    })
+    assert buckets["unresolved"] == []
+    assert len(buckets["policy_denials"]) == 1
+
+
+def test_artifact_output_nudge_split_from_registration_failure():
+    """The exit_code=0 undeclared-outputs NUDGE is typed apart from the real
+    'declared output registration failed' case: the nudge is a policy denial,
+    the registration failure stays a genuine blocking error."""
+    from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
+    from ouroboros.outcomes import _BLOCKING_TOOL_STATUSES, _POLICY_DENIAL_STATUSES
+
+    nudge = (
+        "⚠️ ARTIFACT_OUTPUT_UNDECLARED: command appears to write user_files outputs "
+        "without declaring outputs=[...]. Paths: /x/y.txt.\n\nexit_code=0\n"
+    )
+    assert _is_tool_execution_failure(True, nudge) is True  # honest ⚠️ in the trace
+    nudge_meta = _extract_result_metadata("run_command", nudge, True)
+    assert nudge_meta["status"] == "artifact_output_undeclared"
+    assert nudge_meta["status"] in _POLICY_DENIAL_STATUSES
+
+    real = "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.\nexit_code=0\n"
+    real_meta = _extract_result_metadata("run_command", real, True)
+    assert real_meta["status"] == "artifact_output_error"
+    assert real_meta["status"] in _BLOCKING_TOOL_STATUSES
+    assert real_meta["status"] not in _POLICY_DENIAL_STATUSES
+
+
+def test_python_cwd_failure_emits_canonical_cwd_message(tmp_path, monkeypatch):
+    """A python/python3 launch with a confined cwd gets the SAME self-healing
+    SHELL_CWD_BLOCKED root list a non-python command gets — not an opaque
+    interpreter-provenance message (submarine waves 1/3, python3 -m http.server)."""
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    blocked_cwd = home / "Ouroboros" / "projects" / "coop_x"
+    blocked_cwd.mkdir(parents=True)
+
+    result = registry.execute(
+        "run_command",
+        {"cmd": ["python3", "-m", "http.server"], "cwd": str(blocked_cwd)},
+    )
+    assert "SHELL_CWD_BLOCKED" in result
+    assert "PYTHON_INTERPRETER_UNAVAILABLE" not in result
+    assert "task_drive=" in result  # label=path root list (v6.54.3)
+
+
+def test_service_cwd_failure_emits_canonical_cwd_message(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    blocked_cwd = home / "Ouroboros" / "projects" / "coop_y"
+    blocked_cwd.mkdir(parents=True)
+
+    result = registry.execute(
+        "start_service",
+        {"cmd": ["node", "server.js"], "name": "svc-cwd", "cwd": str(blocked_cwd)},
+    )
+    assert "SHELL_CWD_BLOCKED" in result
+    assert "SERVICE_CWD_ERROR" not in result
+    assert "task_drive=" in result

@@ -532,6 +532,19 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         for root in ("active_workspace", "system_repo"):
             if root in policy:
                 light_gated_roots.append(root)
+    # label=resolved-path pairs for every root the profile can see (the v6.54.3
+    # shell_cwd_block_message lesson applied to the context digest: a bare label
+    # left the model guessing absolute paths and re-tripping the same block).
+    # skill_payload is omitted (its path needs bucket/skill args); per-root
+    # resolution is fail-soft so one unresolvable root never hides the rest.
+    root_paths: dict[str, str] = {}
+    for _root_label in sorted(policy):
+        if _root_label == "skill_payload":
+            continue
+        try:
+            root_paths[_root_label] = str(resource_root_path(ctx, _root_label))
+        except Exception:
+            continue
     result = {
         "profile": profile,
         "writable_roots": writable_roots,
@@ -540,6 +553,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         # not a behavioral gate — subagents used to infer invisibility only by
         # absence and then burned rounds re-probing blocked roots.
         "invisible_roots": sorted(_ALL_ROOTS - set(policy)),
+        "root_paths": root_paths,
         "default_shell_cwd": shell_roots[0][0] if shell_roots else "",
         "allowed_shell_cwd_roots": [label for label, _root in shell_roots],
         "default_service_cwd": service_roots[0][0] if service_roots else "",
@@ -554,6 +568,35 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         result["project_room_dir"] = str(_room)
         result["default_shell_cwd"] = f"project room ({_room})"
     return result
+
+
+def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
+    """Resolved ``(label, path)`` pairs for every resource root the ACTIVE
+    profile can already READ via ``read_file`` (the ``_POLICY`` 'read' verb).
+
+    The consistency SSOT for read-side tools that need "where may I look"
+    (view_image, verify_and_record artifact observation): deriving from the ONE
+    matrix instead of hand-maintaining private per-tool root lists is what kills
+    the copy-shuffle class (three tools, three disagreeing lists — wave3 r8/r24).
+    Widens nothing: every returned root is one the profile already reads through
+    read_file. It CAN, however, narrow a consumer that previously trusted a root
+    unconditionally — verify's orchestrator roots did; the disclosed delta lives
+    at ``tools/verify.py::_within_readonly_orchestrator_root``. ``skill_payload``
+    is omitted (its path needs bucket/skill args); per-root resolution is
+    fail-soft."""
+    out: list[tuple[str, pathlib.Path]] = []
+    try:
+        policy = _POLICY.get(active_tool_profile(ctx), {})
+    except Exception:
+        return out
+    for root, ops in sorted(policy.items()):
+        if "read" not in ops or root == "skill_payload":
+            continue
+        try:
+            out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
+        except Exception:
+            continue
+    return out
 
 
 def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "shell", error: Exception | None = None) -> str:
@@ -762,6 +805,48 @@ def workspace_mode_block_reason(ctx: Any) -> str:
     return ""
 
 
+def _subagent_projects_read_hint(
+    ctx: Any,
+    resolved: pathlib.Path,
+    hard_protected_roots: list[pathlib.Path],
+) -> str:
+    """A targeted refusal for a user_files path that actually lives inside the
+    subagent-projects area: name root=subagent_projects with the exact relative
+    path instead of steering the model at roots that cannot reach the target.
+    Empty when the target is not there, the active profile cannot read that root,
+    or the projects root is misconfigured to overlap a HARD drive (never steer a
+    read at the control plane)."""
+    try:
+        profile_policy = _POLICY.get(active_tool_profile(ctx), {})
+        if "read" not in profile_policy.get("subagent_projects", set()):
+            return ""
+        projects_root = resource_root_path(ctx, "subagent_projects")
+        if any(
+            path_is_relative_to(projects_root, hard) or _path_is_relative_to_casefold(projects_root, hard)
+            for hard in hard_protected_roots
+        ):
+            return ""
+        if not (
+            path_is_relative_to(resolved, projects_root)
+            or _path_is_relative_to_casefold(resolved, projects_root)
+        ):
+            return ""
+        try:
+            rel = str(resolved.relative_to(projects_root))
+        except ValueError:
+            rel = os.path.relpath(str(resolved), str(projects_root))
+        rel = rel if rel not in ("", ".") else "."
+        return (
+            "this path is inside root=subagent_projects (the durable child-project "
+            f"area); read it via root=subagent_projects, path={rel!r} "
+            "(read/list/search only — no write/shell there by design: children "
+            "write via write_surface=external_workspace, and the host "
+            "checkpoint-commits dirty coop trees at root finalization)"
+        )
+    except Exception:
+        return ""
+
+
 def user_files_path_block_reason(
     ctx: Any,
     candidate: pathlib.Path,
@@ -833,6 +918,17 @@ def user_files_path_block_reason(
             if overlaps_protected or (
                 not allow_protected_descendants and contains_protected
             ):
+                # Name the root that ACTUALLY contains the target (the v6.54.3
+                # shell_cwd_block_message lesson applied to this surface): the
+                # subagent-projects area lives under the SOFT ~/Ouroboros parent,
+                # so every coop-tree read used to get a message naming four roots
+                # that cannot reach it while omitting the one that can. MESSAGE
+                # ONLY — subagent_projects stays a read-only root (no user_files
+                # write carve-out), and a target inside a HARD drive never takes
+                # this branch.
+                projects_hint = _subagent_projects_read_hint(ctx, resolved, hard_protected_roots)
+                if projects_hint:
+                    return projects_hint
                 return (
                     "path overlaps the Ouroboros repo/runtime workspace; use "
                     "root=active_workspace, root=task_drive, root=artifact_store, "
@@ -866,6 +962,17 @@ def user_files_path_block_reason(
         return "path name is credential-like"
 
     return ""
+
+
+class UserFilesPathBlockedError(ValueError):
+    """Typed user_files confinement refusal (a POLICY denial, not an I/O failure).
+
+    Subclasses ``ValueError`` so every existing generic handler keeps working;
+    the read-surface wrappers (read_file/list_files/search_code) render it with
+    the typed ``⚠️ USER_FILES_PATH_BLOCKED`` prefix so the outcome axis can
+    partition it into ``execution.policy_denials`` (v6.57.0) instead of the
+    generic ``error`` status that falsely degraded a shipped task to
+    ``tool_failure`` (the submarine wave-3 incident)."""
 
 
 def resolve_user_file_path(
@@ -924,7 +1031,7 @@ def resolve_user_file_path(
                 except (OSError, ValueError):
                     inside_deliverables = False
             if not inside_home and not inside_deliverables:
-                raise ValueError(
+                raise UserFilesPathBlockedError(
                     "user_files path blocked: absolute path "
                     f"{raw_text!r} is outside the user_files home ({home_resolved}). "
                     "Use root='active_workspace' for workspace paths, or a "
@@ -965,7 +1072,7 @@ def resolve_user_file_path(
         allow_protected_descendants=allow_protected_descendants,
     )
     if reason:
-        raise ValueError(f"user_files path blocked: {reason}")
+        raise UserFilesPathBlockedError(f"user_files path blocked: {reason}")
     return candidate
 
 

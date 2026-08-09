@@ -560,6 +560,17 @@ def _register_process_outputs(
     return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed
 
 
+# v6.90.x (submarine unwind) — the DECLARATION-NUDGE marker, deliberately typed
+# APART from the real ``ARTIFACT_OUTPUT_ERROR`` registration failure above. The
+# command SUCCEEDED (exit_code=0) and this only asks for ``outputs=[...]`` to be
+# declared, so its status lands in the v6.57.0 POLICY-DENIAL partition
+# (``_outcome_tool_errors._POLICY_DENIAL_STATUSES``) instead of degrading execution
+# to ``tool_failure``. The submarine wave-3 incident was exactly this: a moot nudge
+# on an already-registered artifact fed the failure record. SSOT for both
+# ``run_command`` and ``run_script`` so the two nudges cannot drift apart.
+_UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
+
+
 def _executor_can_run_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> bool:
     executor_ref = executor_ref_from_ctx(ctx)
     if executor_ref is None:
@@ -1206,9 +1217,10 @@ def _run_shell(
             )
         undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs, scratch_abs=scratch_abs, command_start_ts=_command_start_ts)
         if undeclared_user_outputs:
+            # Declaration NUDGE, not a failure — see _UNDECLARED_OUTPUTS_MARKER.
             return (
                 autocorrect_note
-                + "⚠️ ARTIFACT_OUTPUT_ERROR: command appears to write user_files outputs "
+                + f"{_UNDECLARED_OUTPUTS_MARKER}: command appears to write user_files outputs "
                 "without declaring outputs=[...]. Declare generated user-visible files so "
                 "they are copied into the task artifact store before claiming completion. "
                 f"Paths: {', '.join(undeclared_user_outputs[:5])}.\n\n"
@@ -1444,8 +1456,9 @@ def _run_script(
     )
     audit_note = ""
     if undeclared_user_outputs:
+        # Same declaration NUDGE class as run_command's — see _UNDECLARED_OUTPUTS_MARKER.
         audit_note = (
-            "⚠️ ARTIFACT_OUTPUT_ERROR: run_script wrote user_files without declaring outputs: "
+            f"{_UNDECLARED_OUTPUTS_MARKER}: run_script wrote user_files without declaring outputs: "
             + ", ".join(undeclared_user_outputs)
             + ". Re-run with outputs=[...] or write the canonical deliverable via root=artifact_store."
         )

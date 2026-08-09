@@ -27,11 +27,14 @@ event-drain thread responsive).
 """
 from __future__ import annotations
 
+import logging
 import pathlib
 import subprocess
 from typing import Any, Optional
 
 from ouroboros.platform_layer import bootstrap_process_path
+
+log = logging.getLogger(__name__)
 
 
 class WorkspaceRootError(ValueError):
@@ -117,10 +120,11 @@ def resolve_room_workspace(
     - else the project's registered ``working_dir`` (if any) → validated and used.
     - else no workspace (a file-less project), returns ("","").
 
-    Returns ``(workspace_root, error)``. ``error`` is non-empty ONLY when a workspace
-    was REQUESTED (explicit path or a set project working_dir) but is unusable — the
-    caller MUST fail the task loudly rather than fall back to a workspace-less
-    self_modification profile (the loud-fail invariant)."""
+    Returns ``(workspace_root, error)``. ``error`` is non-empty when a workspace was
+    REQUESTED (explicit path or a set project working_dir) but is unusable, AND when
+    the project's registry entry cannot be READ at all — the caller MUST fail the task
+    loudly rather than fall back to a workspace-less self_modification profile (the
+    loud-fail invariant)."""
     if str(workspace_sentinel or "").strip().lower() == WORKSPACE_NONE:
         return "", ""
 
@@ -131,10 +135,23 @@ def resolve_room_workspace(
             from ouroboros.projects_registry import get_project
 
             project = get_project(drive_root, project_id) or {}
-            requested = str(project.get("working_dir") or "").strip()
-            source = f"project {project_id!r} working_dir"
-        except Exception:
-            requested = ""
+        except Exception as exc:
+            # BIND-OR-LOUD-FAIL. "The registry could not be read" is NOT the same
+            # fact as "this project has no working_dir", and collapsing the two was a
+            # silent re-entry of the very regression this SSOT exists to kill: the
+            # swallowed exception returned ("", "") — indistinguishable from a
+            # file-less project — so admission continued and the task ran
+            # workspace-less on the self_modification profile over the SYSTEM repo.
+            # An unreadable registry is an error; the caller fails the task loudly.
+            log.warning(
+                "resolve_room_workspace: project registry read failed for %r", project_id, exc_info=True
+            )
+            return "", (
+                f"project {project_id!r} registry entry is unreadable "
+                f"({type(exc).__name__}: {exc}) — cannot determine the task's workspace"
+            )
+        requested = str(project.get("working_dir") or "").strip()
+        source = f"project {project_id!r} working_dir"
     if not requested:
         return "", ""  # file-less project (or no working_dir): a non-workspace task
 

@@ -263,7 +263,7 @@ def resolve_cooperative_write_root(
     ):
         from ouroboros.config import get_allow_mutative_subagents
 
-        if get_allow_mutative_subagents():
+        if get_allow_mutative_subagents("external_workspace"):
             key = str((metadata or {}).get("root_task_id") or getattr(ctx, "task_id", "") or "").strip()
             shared = ensure_cooperative_shared_root(ctx, key)
             if isinstance(shared, str) and shared.startswith("⚠️"):

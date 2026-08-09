@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import pathlib
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -33,6 +35,92 @@ async def api_health(_request: Request) -> JSONResponse:
     })
 
 
+def _state_snapshot(request: Request) -> Dict[str, Any]:
+    """Collect every heavy synchronous input for the ``/api/state`` payload.
+
+    Runs inside ``asyncio.to_thread`` (pattern shared with gateway/history.py)
+    so state.json reads, the usage-ledger projection, the evolution snapshot,
+    and the projects/bindings reads cannot block the event loop for every
+    concurrent request.
+    """
+    from ouroboros.tools.github import github_token_from_env_or_settings
+    from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
+    from supervisor.queue import get_evolution_status_snapshot
+    from supervisor.state import TOTAL_BUDGET_LIMIT, load_state
+    from supervisor.workers import PENDING, RUNNING, WORKERS
+
+    st = load_state()
+    alive = 0
+    total_w = 0
+    try:
+        alive = sum(1 for w in WORKERS.values() if w.proc.is_alive())
+        total_w = len(WORKERS)
+    except Exception:
+        pass
+    # ``0`` is the documented unbounded budget, not a request to invent the
+    # historical $10 default.  Server startup initializes the supervisor
+    # value from settings; keeping zero here makes that state explicit.
+    limit = max(0.0, float(TOTAL_BUDGET_LIMIT or 0.0))
+    drive_root = request_drive_root(request)
+    accounting_available = True
+    try:
+        ensure_legacy_imported(drive_root)
+        breakdown = usage_breakdown(drive_root)
+        accounting = (
+            usage_projection(drive_root, global_limit_usd=limit)
+            if limit > 0
+            else dict(breakdown)
+        )
+    except Exception:
+        log.exception("Physical-attempt accounting unavailable for /api/state")
+        accounting_available = False
+        breakdown, accounting = {}, {}
+    # Compatibility header/bar uses the conservative dispatch authority:
+    # settled + live reservations + unresolved upper bounds.  Actual paid
+    # cost remains separately visible as accounting.settled_usd/confirmed.
+    spent = float(accounting.get("accounted_usd") or 0.0) if accounting_available else None
+    # De-triplication: hand the evolution snapshot the projection this request
+    # already computed, so budget_remaining does not replay the ledger again —
+    # but ONLY when this request's drive root IS the supervisor's root and the
+    # computation SUCCEEDED. A failed computation passes nothing, so the
+    # snapshot computes (and fails) itself and the "accounting unavailable =>
+    # evolution paused" disclosure keeps coming from its own strict attempt.
+    budget_projection = None
+    if accounting_available and limit > 0:
+        try:
+            from supervisor import state as supervisor_state
+
+            if (
+                pathlib.Path(supervisor_state.DRIVE_ROOT).resolve(strict=False)
+                == pathlib.Path(drive_root).resolve(strict=False)
+            ):
+                budget_projection = accounting
+        except Exception:
+            budget_projection = None
+    evolution_state = (
+        get_evolution_status_snapshot(budget_projection=budget_projection)
+        if budget_projection is not None
+        else get_evolution_status_snapshot()
+    )
+    return {
+        "st": st,
+        "workers_alive": alive,
+        "workers_total": total_w,
+        "pending_count": len(PENDING),
+        "running_count": len(RUNNING),
+        "limit": limit,
+        "accounting_available": accounting_available,
+        "accounting": accounting,
+        "breakdown": breakdown,
+        "spent": spent,
+        "evolution_state": evolution_state,
+        "github_token_configured": bool(github_token_from_env_or_settings()),
+        "projects": _projects_summary_safe(request),
+        "project_chat_ids": _project_chat_ids_safe(request),
+        "task_bindings": _task_bindings_safe(request),
+    }
+
+
 async def api_state(request: Request) -> JSONResponse:
     try:
         from ouroboros.config import (
@@ -42,43 +130,15 @@ async def api_state(request: Request) -> JSONResponse:
             get_safety_mode,
             get_skills_repo_path,
         )
-        from ouroboros.tools.github import github_token_from_env_or_settings
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
-        from supervisor.queue import get_evolution_status_snapshot
-        from supervisor.state import TOTAL_BUDGET_LIMIT, load_state
-        from supervisor.workers import PENDING, RUNNING, WORKERS
 
-        st = load_state()
-        alive = 0
-        total_w = 0
-        try:
-            alive = sum(1 for w in WORKERS.values() if w.proc.is_alive())
-            total_w = len(WORKERS)
-        except Exception:
-            pass
-        # ``0`` is the documented unbounded budget, not a request to invent the
-        # historical $10 default.  Server startup initializes the supervisor
-        # value from settings; keeping zero here makes that state explicit.
-        limit = max(0.0, float(TOTAL_BUDGET_LIMIT or 0.0))
-        drive_root = request_drive_root(request)
-        accounting_available = True
-        try:
-            ensure_legacy_imported(drive_root)
-            breakdown = usage_breakdown(drive_root)
-            accounting = (
-                usage_projection(drive_root, global_limit_usd=limit)
-                if limit > 0
-                else dict(breakdown)
-            )
-        except Exception:
-            log.exception("Physical-attempt accounting unavailable for /api/state")
-            accounting_available = False
-            breakdown, accounting = {}, {}
-        # Compatibility header/bar uses the conservative dispatch authority:
-        # settled + live reservations + unresolved upper bounds.  Actual paid
-        # cost remains separately visible as accounting.settled_usd/confirmed.
-        spent = float(accounting.get("accounted_usd") or 0.0) if accounting_available else None
-        evolution_state = get_evolution_status_snapshot()
+        snap = await asyncio.to_thread(_state_snapshot, request)
+        st = snap["st"]
+        limit = snap["limit"]
+        accounting = snap["accounting"]
+        breakdown = snap["breakdown"]
+        accounting_available = snap["accounting_available"]
+        spent = snap["spent"]
+        evolution_state = snap["evolution_state"]
         bg_requested = bool(st.get("bg_consciousness_enabled"))
         describe_bg_state: Callable[[bool], dict[str, Any]] | None = _state_attr(
             request,
@@ -90,10 +150,10 @@ async def api_state(request: Request) -> JSONResponse:
         app_start = float(_state_attr(request, "app_start", time.time()) or time.time())
         return JSONResponse({
             "uptime": int(time.time() - app_start),
-            "workers_alive": alive,
-            "workers_total": total_w,
-            "pending_count": len(PENDING),
-            "running_count": len(RUNNING),
+            "workers_alive": snap["workers_alive"],
+            "workers_total": snap["workers_total"],
+            "pending_count": snap["pending_count"],
+            "running_count": snap["running_count"],
             "spent_usd": round(spent, 4) if spent is not None else None,
             "budget_limit": limit,
             "budget_pct": (
@@ -121,7 +181,7 @@ async def api_state(request: Request) -> JSONResponse:
             "context_mode_auto_low": get_owner_context_mode() != get_context_mode(),
             "safety_mode": get_safety_mode(),
             "skills_repo_configured": bool(get_skills_repo_path()),
-            "github_token_configured": bool(github_token_from_env_or_settings()),
+            "github_token_configured": snap["github_token_configured"],
             "accounting": {
                 "available": accounting_available,
                 "authority": "physical_attempt_ledger",
@@ -160,9 +220,9 @@ async def api_state(request: Request) -> JSONResponse:
                 ),
                 **({"error_code": "ledger_unavailable"} if not accounting_available else {}),
             },
-            "projects": _projects_summary_safe(request),
-            "project_chat_ids": _project_chat_ids_safe(request),
-            "task_bindings": _task_bindings_safe(request),
+            "projects": snap["projects"],
+            "project_chat_ids": snap["project_chat_ids"],
+            "task_bindings": snap["task_bindings"],
         })
     except Exception as exc:
         return json_exception(exc)

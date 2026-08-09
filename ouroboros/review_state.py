@@ -1406,10 +1406,28 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
         "(Historical — run `review_status` for gate-accurate live freshness)",
     ]
 
-    # Include all runs/attempts/findings; review history must not silently truncate.
+    # Cap the historical ledger with EXPLICIT omission notes (the continuation
+    # pattern): the full history stays on disk behind `review_status`, but this
+    # section rides into EVERY task's context for the repo_key's lifetime, so
+    # unbounded rendering grew monotonically with commit activity (~24K chars
+    # live at the submarine forensics). P1: disclosed omission — the note names
+    # the count and the recovery path; nothing is silently dropped.
+    _LEDGER_RUN_CAP = 5
+    _LEDGER_ATTEMPT_CAP = 5
+    _COMMIT_MSG_CAP = 300
+    if len(advisory_runs) > _LEDGER_RUN_CAP:
+        lines.append(
+            f"\n⚠️ OMISSION NOTE: {len(advisory_runs) - _LEDGER_RUN_CAP} older advisory "
+            f"run(s) omitted (showing {_LEDGER_RUN_CAP} most recent; run `review_status` "
+            "for the full ledger)."
+        )
+        advisory_runs = advisory_runs[-_LEDGER_RUN_CAP:]
     for run in advisory_runs:
         lines.append(f"\n{_RUN_STATUS_ICONS.get(run.status, '❓')} **{run.status.upper()}** | hash={run.snapshot_hash[:12]} | {run.ts}")
-        lines.append(f"   Commit: {run.commit_message}")
+        lines.append(
+            "   Commit: "
+            + _truncate_review_artifact(str(run.commit_message or ""), limit=_COMMIT_MSG_CAP).replace("\n", " ")
+        )
         if run.bypass_reason:
             lines.append(f"   Bypassed: {run.bypass_reason}")
         if run.snapshot_summary:
@@ -1444,6 +1462,13 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
 
     if attempts:
         lines.append("\n### Recent reviewed attempts")
+        if len(attempts) > _LEDGER_ATTEMPT_CAP:
+            lines.append(
+                f"⚠️ OMISSION NOTE: {len(attempts) - _LEDGER_ATTEMPT_CAP} older attempt(s) "
+                f"omitted (showing {_LEDGER_ATTEMPT_CAP} most recent; run `review_status` "
+                "for the full ledger)."
+            )
+            attempts = attempts[-_LEDGER_ATTEMPT_CAP:]
         for item in attempts:
             tool = item.tool_name or _DEFAULT_TOOL_NAME
             num = int(item.attempt or 0)
@@ -1451,7 +1476,10 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
             phase = item.phase or "review"
             facts = [f"status={item.status}", f"phase={phase}", f"blocked={'yes' if item.blocked else 'no'}"]
             if item.commit_message:
-                facts.append(f"commit={item.commit_message}")
+                facts.append(
+                    "commit="
+                    + _truncate_review_artifact(str(item.commit_message or ""), limit=_COMMIT_MSG_CAP).replace("\n", " ")
+                )
             if item.late_result_pending:
                 facts.append("late_result_pending=yes")
             if item.readiness_warnings:
@@ -1471,7 +1499,10 @@ def format_status_section(state: AdvisoryReviewState, repo_dir: Optional[pathlib
     if ca and ca.status in ("blocked", "failed"):
         icon = "🚫" if ca.status == "blocked" else "❌"
         lines.append(f"\n{icon} **Last commit {ca.status.upper()}** | {ca.ts}")
-        lines.append(f"   Commit: {ca.commit_message}")
+        lines.append(
+            "   Commit: "
+            + _truncate_review_artifact(str(ca.commit_message or ""), limit=_COMMIT_MSG_CAP).replace("\n", " ")
+        )
         lines.append(f"   Tool: {ca.tool_name or _DEFAULT_TOOL_NAME}")
         if ca.attempt:
             lines.append(f"   Attempt: {ca.attempt}")

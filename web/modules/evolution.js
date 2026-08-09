@@ -1,5 +1,26 @@
 import { escapeHtmlText, formatUsd2 } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
+
+/**
+ * Ask for the evolution-campaign objective (pure decision helper, node-tested
+ * with an injected dialog). window.prompt is dead on the macOS desktop shell
+ * (pywebview/WKWebView answers null silently), which made Start campaign a
+ * one-click PAID launch with a hidden-empty objective and no way to cancel.
+ * Semantics (owner-approved Б1-8): cancel/Escape/backdrop = do NOT start;
+ * confirmed-empty = start with the default autonomous objective downstream
+ * (evolution_lifecycle.py); confirmed-text = start with that objective.
+ */
+export async function promptCampaignObjective({ dialogImpl = openConfirmDialog } = {}) {
+    const answer = await dialogImpl({
+        title: 'Start evolution campaign',
+        body: 'Evolution campaign objective (optional). Leave empty to let Ouroboros pick its own autonomous objective.',
+        input: true,
+        confirmLabel: 'Start campaign',
+    });
+    if (!answer?.confirmed) return { confirmed: false, objective: '' };
+    return { confirmed: true, objective: String(answer.value || '').trim() };
+}
 
 export function initEvolution({ ws, state, mount }) {
     const page = document.createElement('div');
@@ -343,11 +364,14 @@ export function initEvolution({ ws, state, mount }) {
         loadEvolution(true);
     });
     startBtn?.addEventListener('click', async () => {
-        const objective = window.prompt('Evolution campaign objective (optional):', '') || '';
+        const asked = await promptCampaignObjective();
+        // Cancel = no campaign start (semantic fix, owner-approved Б1-8: the
+        // old `prompt() || ''` started a paid campaign even on Cancel/null).
+        if (!asked.confirmed) return;
         await apiFetch('/api/command', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: `/evolve on${objective.trim() ? ` ${objective.trim()}` : ''}` }),
+            body: JSON.stringify({ cmd: `/evolve on${asked.objective ? ` ${asked.objective}` : ''}` }),
         });
         loadEvolution(true);
     });

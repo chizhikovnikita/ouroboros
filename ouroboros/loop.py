@@ -16,13 +16,18 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content, estimate_context_prompt_tokens
-from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
-from ouroboros.context_compaction import _tool_round_spans, compact_tool_history_llm
+from ouroboros.context_budget import (
+    COMPACTION_HYSTERESIS_REGION_GROWTH,
+    COMPACTION_HYSTERESIS_ROUNDS,
+    EMERGENCY_COMPACTION_CHARS,
+    LOW_EMERGENCY_COMPACTION_CHARS,
+)
+from ouroboros.context_compaction import _round_has_protected_content, _tool_round_spans, compact_tool_history_llm
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
 from ouroboros.usage_accounting import BudgetExceeded
@@ -68,6 +73,10 @@ class _CompactionRoundContext:
     checkpoint_injected: bool
     emit_progress: Callable[[str], None]
     active_model: str = ""
+    # The round's LIVE tool-schema list (the same object enable_tools appends to).
+    # Sent on the wire beside `messages`, so the necessity measure must count it;
+    # optional so existing constructions stay valid (schemas absent => 0 tokens).
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
 
 
 def _estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
@@ -344,23 +353,27 @@ def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
 def _check_budget_limits(
     ctx: "_RoundLimitContext",
     budget_remaining_usd: Optional[float],
-    cost_ceiling_usd: Optional[float] = None,
+    cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Return a final-response tuple when budget limits require stopping.
 
-    ``cost_ceiling_usd`` is the in-task hard-stop resolved ONCE at loop start
-    from ``task_contract.budget_profile.cost_hard_stop_pct``
-    (``task_pacing.resolve_cost_ceiling_usd``); None means no in-task cost stop
-    — the global budget-exhaustion gate below still applies."""
-    if budget_remaining_usd is None:
-        return None
+    ``cost_ceiling`` is the typed in-task stop resolved ONCE at loop start
+    (``task_pacing.resolve_cost_ceiling``). Only an ``active`` ceiling stops
+    here; ``exhausted_soft_land`` fires at the top of the round in the loop.
+    The deciding spend is the root subtree's ledger-accounted number when a
+    root cap exists (the fence counts the TREE, not own calls); own cost is
+    the DISCLOSED fallback and the diagnostic. Unknown spend never becomes $0.
 
+    The two axes are INDEPENDENT (v6.91 fix): ``budget_remaining_usd`` None
+    means only that no finite GLOBAL budget exists (TOTAL_BUDGET unset — the
+    GAIA-shaped run), which must not silence a live per-task ROOT CAP. A task
+    with neither a global budget nor a root cap resolves to a ``disabled``
+    ceiling and the whole cost axis stays silent, as before."""
     accumulated_usage = ctx.accumulated_usage
-    messages = ctx.messages
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None
 
-    if budget_remaining_usd <= 0:
+    if budget_remaining_usd is not None and budget_remaining_usd <= 0:
         finish_reason = "🚫 Task rejected. Total budget exhausted. Please increase TOTAL_BUDGET in settings."
         accumulated_usage["execution_status"] = "failed"
         accumulated_usage["reason_code"] = "budget_exhausted"
@@ -376,6 +389,19 @@ def _check_budget_limits(
                 )
                 if tool_ctx is not None else ""
             )
+            # This early rejection is a forced sink like every other: nothing was
+            # produced, but a queued/headless root still OWED a panel, and returning
+            # here without the record left `eligibility=not_eligible / run_count=0`
+            # — indistinguishable from "no panel was warranted", the exact shape the
+            # typed bypass exists to close. Pure ledger write: no panel, no model
+            # round, no fence (the common recorder is the one seam).
+            _record_forced_finalization(
+                ctx,
+                trace,
+                reason_code="budget_exhausted",
+                source="host_budget_rejection_before_work",
+                candidate=None,
+            )
             return _compose_delivery_suffix(finish_reason, suffix), accumulated_usage, trace
         return _forced_final_answer(
             ctx,
@@ -387,21 +413,52 @@ def _check_budget_limits(
             fallback_text=finish_reason,
             reason_code="budget_exhausted",
         )
+    # The pre-v6.91 per-task soft "[COST NOTE]" is gone: since v6.64.0 the same
+    # settings key hard-fences the whole TREE at the ledger, so an own-cost note
+    # keyed to it could never fire before the fence (proven live: silent through
+    # two tree deaths). The v6.56.0 latched milestones are the designed nudge.
 
-    from ouroboros.config import SETTINGS_DEFAULTS as _DEFAULTS
-    _per_task_default = str(_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"])
-    per_task_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", _per_task_default) or _per_task_default)
-    if task_cost is not None and task_cost >= per_task_limit and ctx.round_idx % 10 == 0:
-        _append_or_merge_user_message(
-            messages,
-            f"[COST NOTE] Task spent ${task_cost:.3f}, which is at or above the per-task soft threshold of ${per_task_limit:.2f}. Continue only if the expected value still justifies the cost.",
+    if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
+        return None
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
+    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
+    deciding, spend_basis = task_pacing.resolve_deciding_spend(
+        tree_cost_usd=tree_cost,
+        task_cost_usd=task_cost,
+        root_cap_usd=cost_ceiling.root_cap_usd,
+    )
+    ceiling_usd = cost_ceiling.ceiling_usd
+    if deciding is not None and ceiling_usd is not None and deciding > ceiling_usd:
+        if spend_basis == task_pacing.SPEND_BASIS_TREE:
+            spent_text = (
+                f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds, "
+                f"subagents included; own calls ${task_cost:.3f})"
+                if task_cost is not None
+                else f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds)"
+            )
+        elif spend_basis == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN:
+            # Stopping on a disclosed lower bound beats not stopping at all, but
+            # the substitution is stated, never silent (BIBLE P1).
+            spent_text = (
+                f"Task spent ${deciding:.3f} on its OWN calls (the tree-accounted total "
+                "is unavailable right now, so subagent spend is not included — this is a "
+                "lower bound)"
+            )
+        else:
+            spent_text = f"Task spent ${deciding:.3f}"
+        cap_text = (
+            f"; the hard tree cap is ${cost_ceiling.root_cap_usd:.2f}"
+            if cost_ceiling.root_cap_usd is not None else ""
         )
-
-    if cost_ceiling_usd is not None and task_cost is not None and task_cost > cost_ceiling_usd:
         finish_reason = (
-            f"Task spent ${task_cost:.3f} (over the in-task cost ceiling ${cost_ceiling_usd:.2f} "
-            f"of remaining ${budget_remaining_usd:.2f}). Budget exhausted."
+            f"{spent_text}, over the in-task cost ceiling ${ceiling_usd:.2f}{cap_text}. "
+            "Budget exhausted."
         )
+        # The basis rides the usage record too, so a later reader can tell a
+        # tree-decided stop from an own-cost stand-in without parsing prose.
+        accumulated_usage["cost_stop_spend_basis"] = spend_basis
         return _forced_final_answer(
             ctx,
             prompt=(
@@ -418,12 +475,110 @@ def _check_budget_limits(
     return None
 
 
-def _resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -> Optional[float]:
-    """The in-task cost hard-stop, resolved ONCE at loop start from the start-of-
-    task budget snapshot + task_contract.budget_profile (cost_hard_stop_pct
-    None -> the historical 50%-of-remaining stop, 0 -> no in-task stop)."""
-    return task_pacing.resolve_cost_ceiling_usd(
-        budget_remaining_usd, task_pacing.resolve_budget_profile(ctx),
+def _resolve_task_cost_ceiling(
+    ctx: Any, budget_remaining_usd: Optional[float],
+) -> "task_pacing.CostCeiling":
+    """The typed in-task cost stop, resolved ONCE at loop start.
+
+    The root cap comes from the bound usage scope — the SAME
+    ``OUROBOROS_PER_TASK_COST_USD``-derived value the ledger fence enforces
+    (agent.py wires it as ``UsageScope.root_limit_usd``), so the graceful stop
+    and the fence can never disagree about the cap."""
+    root_cap = None
+    try:
+        from ouroboros.usage_accounting import current_usage_scope
+
+        scope = current_usage_scope()
+        root_cap = getattr(scope, "root_limit_usd", None) if scope is not None else None
+    except Exception:
+        log.debug("Usage scope unavailable for cost ceiling resolution", exc_info=True)
+    return task_pacing.resolve_cost_ceiling(
+        budget_remaining_usd,
+        task_pacing.resolve_budget_profile(ctx),
+        root_cap_usd=root_cap,
+    )
+
+
+# Bounded staleness for the two DECIDING cost surfaces (the ceiling check and
+# the milestone note). The free stash is refreshed by every dispatch under this
+# root, so in a fast loop it is at most one round old and this costs zero reads.
+# But ONE round can block for 900s inside wait_tasks while children spend — the
+# exact shape both dead waves had — and the pacing refresh only covers deadline-
+# less tasks, so a round that outlives this bound pays for exactly one real
+# projection read. Still never a per-round read (see the usage_accounting
+# telemetry note and the e4a87344 contention class).
+_TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
+
+
+def _loop_tree_accounting(
+    *, refresh: bool, max_age_sec: float = 30.0,
+) -> Optional[Dict[str, Any]]:
+    """The root subtree's accounted spend for the CURRENT task's tree (nullable).
+
+    Reads the reserve-time scope telemetry for free; ``refresh=True`` may
+    perform one real ledger projection read when the stash is older than
+    ``max_age_sec``. Callers: loop start / the 600s pacing note / the 15-round
+    checkpoint (already cache-breaking surfaces, small max_age), and the two
+    DECIDING surfaces (ceiling check + milestone note) with the wider
+    ``_TREE_ACCOUNTING_MAX_STALE_SEC`` bound — which costs nothing while rounds
+    are shorter than the bound, since every dispatch refreshes the stash. Never
+    an unconditional per-round read (usage_accounting telemetry notes,
+    e4a87344). Only meaningful under a root cap; returns None otherwise
+    (unknown is represented, never $0)."""
+    try:
+        from ouroboros.usage_accounting import (
+            current_usage_scope,
+            last_root_accounting,
+            refresh_root_accounting,
+        )
+
+        scope = current_usage_scope()
+        if scope is None or not scope.root_task_id or scope.root_limit_usd is None:
+            return None
+        if refresh:
+            return refresh_root_accounting(
+                scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec,
+            )
+        return last_root_accounting(scope.root_task_id)
+    except Exception:
+        log.debug("Tree accounting telemetry unavailable", exc_info=True)
+        return None
+
+
+def _soft_land_exhausted_ceiling(
+    limit_ctx: "_RoundLimitContext",
+    cost_ceiling: "task_pacing.CostCeiling",
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Typed soft landing (v6.91): a root cap at or below the planning margin
+    leaves no working room — enter the existing graceful best-effort wrap-up
+    BEFORE spending a work round; never run uncapped (the pre-typed shape
+    resolved this to the same None as "unlimited"). The ledger fence stays the
+    untouched backstop. Returns the forced-final tuple, or None when the
+    ceiling is not in the ``exhausted_soft_land`` state."""
+    if cost_ceiling.state != task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
+        return None
+    cap_text = (
+        f"${cost_ceiling.root_cap_usd:.2f}"
+        if cost_ceiling.root_cap_usd is not None else "the per-task tree cap"
+    )
+    margin_text = (
+        f"${cost_ceiling.planning_margin_usd:.2f}"
+        if cost_ceiling.planning_margin_usd is not None else "the wrap-up planning margin"
+    )
+    soft_land_reason = (
+        f"Per-task tree cap {cap_text} leaves no working room above the "
+        f"wrap-up planning margin ({margin_text}). Budget exhausted."
+    )
+    return _forced_final_answer(
+        limit_ctx,
+        prompt=(
+            f"[BUDGET LIMIT] {soft_land_reason} Produce your best final answer "
+            "NOW from the verified work so far; clearly mark anything unverified "
+            "or incomplete. An honest best-effort result is the expected outcome "
+            "here, not a failure."
+        ),
+        fallback_text=soft_land_reason,
+        reason_code="budget_exhausted",
     )
 
 
@@ -1224,6 +1379,9 @@ ACCEPTANCE_DECISION_REASONS = (
     "fence_reopen_failed",
     "infra_failure",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
+    # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by
+    # `_record_forced_acceptance_bypass` when the panel was owed but a rail fired.
+    *sorted(ACCEPTANCE_BYPASS_REASONS),
     ACCEPTANCE_REASON_UNSPECIFIED,
 )
 
@@ -1621,7 +1779,6 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             "min_successful_slots": adaptive_quorum(len(slots)),
             "fail_closed_on_errors": True,
             "classify_outcome_tier": True,
-            "require_criterion_evidence": True,
             "max_physical_attempts_per_actor": 2,
         },
         task_id=ctx.task_id,
@@ -2759,12 +2916,31 @@ def _maybe_inject_self_check(
     cost_text = f"${task_cost:.2f}" if task_cost is not None else "unknown"
     checkpoint_num = round_idx // REMINDER_INTERVAL
 
+    # Tree spend under a root cap (v6.91): the checkpoint is an already
+    # cache-breaking user turn, so it is one of the RARE surfaces allowed to
+    # carry a live ledger number (DEVELOPMENT cache_friendliness item 22). The
+    # fence counts the whole tree, so own cost alone hid two tree deaths.
+    tree_line = ""
+    tree_accounted: Optional[float] = None
+    tree_cap: Optional[float] = None
+    tree_info = _loop_tree_accounting(refresh=True, max_age_sec=30.0)
+    if isinstance(tree_info, dict) and tree_info.get("accounted_usd") is not None:
+        tree_accounted = float(tree_info["accounted_usd"])
+        raw_cap = tree_info.get("root_limit_usd")
+        tree_cap = float(raw_cap) if raw_cap is not None else None
+        cap_text = f" of ${tree_cap:.2f} hard tree cap" if tree_cap is not None else ""
+        tree_line = (
+            f"Task tree spend: ~${tree_accounted:.2f}{cap_text} "
+            "(ledger-accounted incl. in-flight holds, subagents included)\n"
+        )
+
     tool_trace = _build_recent_tool_trace(messages)
 
     reminder = (
         f"[CHECKPOINT {checkpoint_num} — round {round_idx}/{max_rounds}]\n"
         f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text} | "
         f"Rounds remaining: {max_rounds - round_idx}\n"
+        f"{tree_line}"
     )
     if tool_trace:
         reminder += f"\n{tool_trace}\n"
@@ -2788,13 +2964,17 @@ def _maybe_inject_self_check(
         f"~{ctx_tokens} tokens, {cost_text} spent"
     )
 
-    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+    checkpoint_payload: Dict[str, Any] = {
         "checkpoint_number": checkpoint_num,
         "round": round_idx,
         "max_rounds": max_rounds,
         "context_tokens": ctx_tokens,
         "task_cost": task_cost,
-    })
+    }
+    if tree_accounted is not None:
+        checkpoint_payload["tree_accounted_usd"] = round(tree_accounted, 4)
+        checkpoint_payload["tree_cap_usd"] = round(tree_cap, 4) if tree_cap is not None else None
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, checkpoint_payload)
 
     return True
 
@@ -2814,6 +2994,9 @@ def _maybe_inject_time_budget_milestone(
     appends the note and emits the checkpoint event."""
     note = task_pacing.build_time_budget_note(
         tools._ctx, round_idx=round_idx, accumulated_usage=accumulated_usage,
+        # A real ledger read happens ONLY when the pacing note actually fires
+        # (per 600s bucket) — the note is a cache-breaking user turn already.
+        tree_cost_provider=lambda: _loop_tree_accounting(refresh=True, max_age_sec=30.0),
     )
     if note is None:
         return False
@@ -2827,19 +3010,35 @@ def _maybe_inject_cost_budget_milestone(
     tools: ToolRegistry,
     *,
     budget_remaining_usd: Optional[float],
-    cost_ceiling_usd: Optional[float],
+    cost_ceiling: Optional["task_pacing.CostCeiling"],
     accumulated_usage: Optional[Dict[str, Any]],
     event_queue: Optional[queue.Queue] = None,
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
 ) -> bool:
     """Thin transport over the task_pacing cost axis (v6.56.0): content,
-    thresholds, and latch state live in ouroboros/task_pacing.py."""
+    thresholds, and latch state live in ouroboros/task_pacing.py. The deciding
+    spend under a root cap is the tree-accounted stash (free read; refreshed by
+    every dispatch) with a bounded staleness cap — never a per-round ledger
+    read, see ``_TREE_ACCOUNTING_MAX_STALE_SEC``."""
+    ceiling_usd = (
+        cost_ceiling.ceiling_usd
+        if cost_ceiling is not None and cost_ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        else None
+    )
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
+    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     note = task_pacing.build_cost_budget_note(
         tools._ctx,
         start_remaining_usd=budget_remaining_usd,
-        cost_ceiling_usd=cost_ceiling_usd,
+        cost_ceiling_usd=ceiling_usd,
         task_cost=(accumulated_usage or {}).get("cost"),
+        tree_cost_usd=tree_cost,
+        # Whether a tree cap exists at all decides if own cost is the complete
+        # picture or a disclosed lower bound (task_pacing.resolve_deciding_spend).
+        root_cap_usd=(cost_ceiling.root_cap_usd if cost_ceiling is not None else None),
     )
     if note is None:
         return False
@@ -2860,7 +3059,7 @@ def _inject_round_checkpoints(
     task_id: str,
     drive_logs: Optional[pathlib.Path],
     budget_remaining_usd: Optional[float] = None,
-    cost_ceiling_usd: Optional[float] = None,
+    cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> bool:
     """Inject the per-round self-check and the time-budget / intrinsic-pacing
     milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
@@ -2876,7 +3075,7 @@ def _inject_round_checkpoints(
     )
     cost_budget = _maybe_inject_cost_budget_milestone(
         messages, tools,
-        budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd,
+        budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling,
         accumulated_usage=accumulated_usage,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
@@ -3107,6 +3306,119 @@ def _drain_incoming_messages(
     return controls
 
 
+def _emergency_keep_recent(span_count: int) -> int:
+    """Tool rounds an emergency pass keeps (SSOT for the pass and its forecast).
+
+    Halve the history (floor 6), but ALWAYS clamp BELOW the span count or the
+    compactor no-ops (``len(spans) <= keep_recent`` returns the transcript
+    as-is) — a transcript over the emergency byte threshold with only ~50 huge
+    rounds used to never compact at all. With a single round there is nothing
+    older to summarize. One definition, because ``_compaction_floor_chars``
+    forecasts what this same rule will keep; two copies would let the forecast
+    drift from the pass it predicts.
+    """
+    return min(50, max(6, span_count // 2), max(1, span_count - 1))
+
+
+def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[int, int]]) -> int:
+    """Smallest transcript an emergency pass could leave behind.
+
+    The pass can only replace the spans OLDER than ``_emergency_keep_recent``
+    that carry no protected content; the frozen frame (everything before the
+    first tool round), the kept spans AND the protected older spans (the
+    compactor's ``_round_has_protected_content`` skips them raw — same predicate
+    here, one SSOT) survive untouched, and the summaries it writes only ADD to
+    that. So this is a true lower bound: when the floor is already over the
+    trigger, NO pass can get under it and no amount of transcript growth changes
+    that — only a smaller FRAME (a mode change or a context rebuild) can. That
+    is what makes the hysteresis rearm criterion honest: measuring "can a pass
+    help?" on the compactable region alone rearmed on growth the pass itself
+    created (the pass collapses the region to the kept spans, so the very next
+    tool round cleared the growth bar and the pass refired every round — the
+    submarine thrash). Omitting the protected spans was the same lie one layer
+    down: a transcript dominated by an old protected round forecast a reachable
+    trigger the pass could never reach, so every 1.2x region growth bought
+    another futile summarizer pass + cache-destroying rewrite.
+    """
+    if not spans:
+        return _estimate_messages_chars(messages)
+    keep = _emergency_keep_recent(len(spans))
+    frame = messages[: spans[0][0]]
+    kept = messages[spans[-keep][0]:]
+    protected = sum(
+        _estimate_messages_chars(messages[start:end + 1])
+        for start, end in spans[:-keep]
+        if _round_has_protected_content(messages, start, end)
+    )
+    return _estimate_messages_chars(frame) + protected + _estimate_messages_chars(kept)
+
+
+@dataclass
+class _HysteresisMeasurement:
+    """The arming round's measured pressure facts, folded into one object (the
+    <8-parameter contract). ``region_chars`` is the region the arming round
+    JUDGED (for a futile pass: the region it actually handled, not the collapsed
+    remainder), so the growth bar means "the transcript climbed back past a size
+    already proven insufficient" rather than "the pass shrank the region, so
+    anything is growth"."""
+    pressure_real_tokens: float
+    threshold_real_tokens: float
+    region_chars: int
+    schema_tokens: int
+    density: float
+    floor_real_tokens: Optional[float] = None
+
+
+def _arm_compaction_hysteresis(
+    ctx: _CompactionRoundContext,
+    usage_state: Dict[str, Any],
+    measurement: _HysteresisMeasurement,
+    *,
+    reason: str = "nothing_compactable",
+) -> None:
+    """Suppress emergency compaction until a pass can plausibly help again.
+
+    Two ways a pass fails to earn its cost, both armed here so the disclosure is
+    identical: it ran and could not bring total pressure under the trigger
+    (``emergency_pass_futile``), or the transcript holds under two tool rounds so
+    the compactor would structurally no-op (``nothing_compactable``). One loud
+    line plus a typed checkpoint event, then silence until a pass could help or
+    the round window passes — never a silent stop (BIBLE P1).
+    """
+    pressure_real_tokens = measurement.pressure_real_tokens
+    threshold_real_tokens = measurement.threshold_real_tokens
+    region_chars = measurement.region_chars
+    floor_real_tokens = measurement.floor_real_tokens
+    usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
+    frame_bound = floor_real_tokens is not None and floor_real_tokens > threshold_real_tokens
+    rearm_clause = (
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass (the frame alone is over the "
+        "trigger, so transcript growth cannot make a pass able to help)"
+        if frame_bound else
+        f"the compactable transcript grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass"
+    )
+    ctx.emit_progress(
+        "⚠️ Emergency compaction cannot help: calibrated context "
+        f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
+        f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
+        "blocks + tool schemas) plus the protected/kept rounds carry it and cannot "
+        f"be compacted. Further passes suppressed until {rearm_clause}."
+    )
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "compaction_hysteresis_armed",
+        "round": ctx.round_idx,
+        "reason": reason,
+        "calibrated_real_tokens": int(pressure_real_tokens),
+        "threshold_real_tokens": int(threshold_real_tokens),
+        "compactable_region_chars": int(region_chars),
+        "tool_schema_tokens": int(measurement.schema_tokens),
+        "token_density": round(float(measurement.density), 3),
+        "floor_real_tokens": None if floor_real_tokens is None else int(floor_real_tokens),
+        "frame_bound": bool(frame_bound),
+    })
+
+
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
@@ -3144,27 +3456,116 @@ def _run_round_compaction(
     # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
     # window table; the reactive provider-overflow detector (context.py) drops the
     # agent to low mode if a route's real window turns out smaller than assumed.
+    #
+    # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
+    # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
+    # blocks, TOOL SCHEMAS, protected/kept rounds) counts toward the provider
+    # window even though no pass can shrink it. "Total" is literal: the schemas
+    # travel beside `messages` on the wire (~148K chars on the submarine traces),
+    # so a transcript-only measure would let the trigger fire a whole tool
+    # envelope late — they are added through the context_fit token seam
+    # (tool_schema_tokens), never re-estimated here. The char budget is compared
+    # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
+    # measured supersedes — never the review-pack cold-conservative value, which
+    # would demote fresh installs; the v6.80→v6.81 oscillation).
+    # UTILITY — can a pass help, and when should it refire? — is judged on the
+    # FLOOR a pass could reach (frozen frame + the spans it must keep,
+    # `_compaction_floor_chars`), not on the compactable region alone: a pass
+    # that could NOT get below the trigger arms a hysteresis, and one loud
+    # disclosure replaces the per-round light-model call + cache-destroying
+    # rewrite (wave3: 35/35 rounds fired because the LOW trigger sits below the
+    # irreducible low-mode frame). Early rearm (region grew ~20% past the size
+    # already proven insufficient) is admitted ONLY while the floor is under the
+    # trigger — measuring rearm on the region alone let the pass's OWN collapse
+    # of that region clear the growth bar on the very next tool round, so the
+    # thrash survived the first fix (34/35 rounds measured). Above the floor,
+    # only the N-round window refires, which keeps the transcript bounded while
+    # the frame is what carries the pressure. The reactive provider-overflow
+    # low-retry net (one-shot, loop exit path) is deliberately untouched.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    if _estimate_messages_chars(messages) > emergency_chars:
-        # keep_recent must stay BELOW the current span count or the compactor
-        # no-ops (len(spans) <= keep_recent returns as-is): a transcript over
-        # the emergency byte threshold with only ~50 huge rounds previously
-        # never compacted at all. Halve the history (floor 6), but ALWAYS
-        # clamp below the span count so even 2-6 huge rounds compact; with a
-        # single round there is nothing older to summarize.
-        span_count = len(_tool_round_spans(messages))
-        emergency_keep_recent = min(50, max(6, span_count // 2), max(1, span_count - 1))
+    from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
+
+    density = main_loop_token_density(ctx.drive_root, ctx.active_model)
+    threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
+    schema_tokens = tool_schema_tokens(ctx.tool_schemas)
+
+    def _pressure(chars: float) -> float:
+        return (chars / 4.0 + schema_tokens) * density
+
+    def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
+        return _pressure(_estimate_messages_chars(msgs))
+
+    pressure_real_tokens = _total_pressure(messages)
+    if pressure_real_tokens > threshold_real_tokens:
+        usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
+        usage_state = usage_state if isinstance(usage_state, dict) else {}
+        spans = _tool_round_spans(messages)
+        region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
+        # Can a pass reach the trigger AT BEST? The floor is frame + kept spans;
+        # summaries only add to it. This is the rearm authority the compactable
+        # region cannot be: the region is exactly what a pass collapses, so
+        # region growth was satisfied by the pass's own output every round.
+        floor_real_tokens = _pressure(_compaction_floor_chars(messages, spans))
+        pass_can_reach_trigger = floor_real_tokens <= threshold_real_tokens
+        hysteresis = usage_state.get("_compaction_hysteresis")
+        if isinstance(hysteresis, dict):
+            armed_region = int(hysteresis.get("region_chars") or 0)
+            armed_round = int(hysteresis.get("round") or 0)
+            # `armed_region + 1` is the floor that makes an EMPTY armed region
+            # behave: a 20%-growth test on zero is `0 < 0`, which never
+            # suppresses, so an over-threshold frame with nothing compactable
+            # re-fired every single round — the exact thrash this arm exists to
+            # stop, just with an empty transcript instead of a full one.
+            grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
+            early_rearm = region_chars >= grow_to and pass_can_reach_trigger
+            if not early_rearm and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS:
+                return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
+            usage_state.pop("_compaction_hysteresis", None)
+        span_count = len(spans)
+        if span_count < 2:
+            # Necessity is real, but the transcript holds at most ONE tool round:
+            # the compactor's `len(spans) <= keep_recent` gate makes the pass a
+            # structural no-op (keep_recent floors at 1). Running it anyway bought
+            # nothing and wrote a forensic checkpoint every round while the frozen
+            # frame alone sat over the trigger — a low-mode task can enter its
+            # first rounds already there. Arm the hysteresis instead: same
+            # disclosure, no per-round work.
+            _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
+                pressure_real_tokens=pressure_real_tokens,
+                threshold_real_tokens=threshold_real_tokens,
+                region_chars=region_chars,
+                schema_tokens=schema_tokens,
+                density=density,
+                floor_real_tokens=floor_real_tokens,
+            ))
+            return messages, None
+        emergency_keep_recent = _emergency_keep_recent(span_count)
         if _persist_compaction_checkpoint(
             messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
             reason="emergency_context_size", keep_recent=emergency_keep_recent,
             round_idx=ctx.round_idx, event_queue=ctx.event_queue,
         ):
-            return compact_tool_history_llm(
+            messages, usage = compact_tool_history_llm(
                 messages,
                 keep_recent=emergency_keep_recent,
                 drive_root=ctx.drive_root,
                 task_id=ctx.task_id,
             )
+            after_real_tokens = _total_pressure(messages)
+            if after_real_tokens > threshold_real_tokens:
+                # Arm on the region the pass ALREADY HANDLED (pre-pass), not on
+                # the remainder it just collapsed: the collapsed remainder made
+                # the next tool round clear the 1.2x bar on its own.
+                _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
+                    pressure_real_tokens=after_real_tokens,
+                    threshold_real_tokens=threshold_real_tokens,
+                    region_chars=region_chars,
+                    schema_tokens=schema_tokens,
+                    density=density,
+                    floor_real_tokens=_pressure(
+                        _compaction_floor_chars(messages, _tool_round_spans(messages))),
+                ), reason="emergency_pass_futile")
+            return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
 
@@ -3217,6 +3618,35 @@ class _RoundLimitContext:
     incoming_messages: Optional[queue.Queue] = None
     owner_msg_seen: Optional[set] = None
     forced_service_evidence_fingerprint: str = ""
+
+
+def _account_compaction_usage(
+    accumulated_usage: Dict[str, Any],
+    compaction_usage: Dict[str, Any],
+    event_queue: Optional[queue.Queue],
+    task_id: str,
+) -> None:
+    """Fold a compaction pass's usage into the loop totals and emit its llm_usage
+    event (light-model lane). Extracted verbatim from ``run_llm_loop`` for the
+    300-line function gate; behavior unchanged."""
+    add_usage(accumulated_usage, compaction_usage)
+    _cm = get_light_model()
+    _cc = (
+        float(compaction_usage["cost"])
+        if compaction_usage.get("cost") is not None
+        else estimate_cost_optional(
+            _cm,
+            int(compaction_usage.get("prompt_tokens") or 0),
+            int(compaction_usage.get("completion_tokens") or 0),
+            cache_usage={
+                "cached_tokens": int(compaction_usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(compaction_usage.get("cache_write_tokens") or 0),
+                "prompt_cache_ttl": compaction_usage.get("prompt_cache_ttl"),
+            },
+            provider=str(compaction_usage.get("provider") or "openrouter"),
+        )
+    )
+    emit_llm_usage_event(event_queue, task_id, _cm, compaction_usage, _cc, "compaction")
 
 
 def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -3750,6 +4180,95 @@ def _degrade_retained_delivery_candidate(
     return candidate
 
 
+def _record_forced_acceptance_bypass(
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+    reason_code: str,
+) -> None:
+    """Typed acceptance-bypass record on a forced rail — a LEDGER write, never a gate.
+
+    The acceptance panel's only launch site is the voluntary no-tool finalization, so
+    every forced exit used to leave the review axis at {skipped, not_eligible,
+    run_count:0} — indistinguishable from "no panel warranted". This stamps the
+    terminal truth instead: the eligibility predicate is evaluated PURE against the
+    live trace (no fence begin, no subtree-quiescence wait, no panel, no model round,
+    no prompt text — forced exits are the v6.29 honesty/salvage shelf and stay
+    byte-identical in behavior), and an OWED-but-bypassed panel lands as
+    ``finalized_unaccepted`` with a closed-enum reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`,
+    the v6.54.4 deadline-reserve precedent generalized; v6.74.4 filed follow-up).
+    Reason tokens stay ledger-only (v6.61.4 token-parroting class). Never raises —
+    the salvage lane has priority over this record.
+    """
+    rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
+    if rail_reason is None:
+        return
+    # A rail that deliberately cleared the failure state (a confirmed swarm routing
+    # handoff) terminalized nothing reviewable here — the admitted managed task gets
+    # its own acceptance lifecycle.
+    if not str(ctx.accumulated_usage.get("reason_code") or ""):
+        return
+    tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    if tools_ctx is None:
+        return
+    # A host decision already recorded (panel ran, pacing skip, supersede) wins;
+    # the bypass record exists only for the no-host-verdict shape. "Host decision"
+    # means a canonical status (`_set_acceptance_decision` fails closed to one) —
+    # NOT the status-less agent-stance dict `process_tool_results` merges when a
+    # root task's task_acceptance_review is deferred to the host (`source` +
+    # `agent_disposition`/`agent_rationale` only): treating that as a decision
+    # left the forced bypass unrecorded exactly when the panel was still owed.
+    # The stamp below flows through `_set_acceptance_decision`, which carries the
+    # agent stance forward rather than overwriting it.
+    decision = llm_trace.get("acceptance_decision")
+    if isinstance(decision, dict) and str(decision.get("status") or "") in ACCEPTANCE_DECISION_STATUSES:
+        return
+    if getattr(tools_ctx, "_task_acceptance_reviewed", False):
+        return
+    trigger = f"bypassed_{reason_code}"
+    try:
+        from ouroboros.task_results import resolve_task_lineage
+
+        meta = getattr(tools_ctx, "task_metadata", {})
+        meta = meta if isinstance(meta, dict) else {}
+        lineage = resolve_task_lineage(
+            str(ctx.task_id or getattr(tools_ctx, "task_id", "") or ""),
+            metadata=meta,
+            root_task_id=getattr(tools_ctx, "root_task_id", None),
+            parent_task_id=getattr(tools_ctx, "parent_task_id", None),
+            delegation_role=getattr(tools_ctx, "delegation_role", None),
+            original_task_id=getattr(tools_ctx, "original_task_id", None),
+            timeout_retry_from=getattr(tools_ctx, "timeout_retry_from", None),
+        )
+        eligible, probe_trigger = _task_acceptance_eligible(
+            get_task_review_mode(),
+            llm_trace,
+            bool(getattr(tools_ctx, "is_direct_chat", False)),
+            is_root_task=bool(lineage["is_root_task"]),
+            is_ephemeral_turn=bool(getattr(tools_ctx, "is_ephemeral_turn", False)),
+            task_contract=(
+                tools_ctx.task_contract
+                if isinstance(getattr(tools_ctx, "task_contract", None), dict)
+                else {}
+            ),
+        )
+    except Exception:
+        # A mid-round dying trace may not support the probe; record the honest
+        # unknown instead of crashing the salvage path.
+        log.debug("Forced acceptance-bypass eligibility probe failed", exc_info=True)
+        llm_trace["review_decision"] = {"eligibility": "unknown", "trigger": trigger}
+        return
+    if not eligible:
+        # Explicitly "no panel warranted" — now distinguishable from "not evaluated".
+        llm_trace["review_decision"] = {"eligibility": "not_eligible", "trigger": probe_trigger}
+        return
+    llm_trace["review_decision"] = {"eligibility": "eligible", "trigger": trigger}
+    _set_acceptance_decision(llm_trace, {
+        "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+        "reason": rail_reason,
+        "source": "forced_finalization",
+    })
+
+
 def _record_forced_finalization(
     ctx: _RoundLimitContext,
     llm_trace: Dict[str, Any],
@@ -3763,6 +4282,10 @@ def _record_forced_finalization(
     # have been refreshed, so every forced return exposes the same terminal
     # child-result truth to the outcome reducer.
     _project_child_result_dispositions(ctx, llm_trace)
+    # Common terminal recorder = the ONE seam covering both the LLM-seam forced
+    # answer (`_forced_final_answer`) and the no-spend host-fallback fence path
+    # (`_handle_budget_exceeded` -> `_forced_fallback_result`).
+    _record_forced_acceptance_bypass(ctx, llm_trace, reason_code)
     binding = dict(candidate.acceptance_binding or {}) if candidate is not None else {}
     tools = getattr(ctx, "tools", None)
     current_fingerprint = str(
@@ -4064,6 +4587,7 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         from ouroboros.task_status import FINAL_STATUSES
 
         children = _direct_child_results(ctx)
+        claimed = _claimed_child_dispositions(ctx)
 
         def _undecided(c: Dict[str, Any]) -> bool:
             if _child_disposition_state(c) in {
@@ -4081,6 +4605,32 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
+            # W2: a child whose LATEST blackboard decision row names a disposition
+            # that no longer binds the current result was READ and decided — say
+            # that instead of the misleading "unread". Say only what the ledger
+            # PROVES: the row EXISTS, so the write did NOT fail; what failed is the
+            # binding to the result standing now. (The pre-audit wording claimed a
+            # failed write, which the presence of the row disproves.)
+            # Scoped to children the projection genuinely left UNDECIDED: a child
+            # the projection DOES carry (deferred / integrated / irrelevant /
+            # discarded / cancelled) is not a failed-binding case, and telling its
+            # owner to "re-submit to close it" would be a false instruction.
+            claim = claimed.get(tid) if not _child_disposition_state(c) else None
+            if claim is not None:
+                disposition, row_sha = claim
+                from ouroboros.tools.join_ledger import _child_result_sha256
+
+                if _child_result_sha256(c) != row_sha:
+                    detail = (
+                        f"{disposition} recorded for an EARLIER result hash; the current "
+                        "result is not bound — re-inspect and re-submit the current hash"
+                    )
+                else:
+                    detail = (
+                        f"{disposition} recorded for this exact result hash but not carried "
+                        "by this round's disposition projection — re-submit to close it"
+                    )
+                return f"{tid} [{lifecycle}; {detail}]"
             terminal = str(c.get("child_status") or "").strip().lower()
             if terminal and terminal != st:
                 return f"{tid} [{lifecycle}; terminal_result={terminal}]"
@@ -4111,6 +4661,43 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         return "".join(notes)
     except Exception:
         return ""
+
+
+def _claimed_child_dispositions(ctx: _RoundLimitContext) -> Dict[str, tuple]:
+    """task_id -> (disposition, row_sha) from THIS parent's latest blackboard
+    decision rows (W2). Consulted only for children the disposition projection
+    left undecided: a row that exists but no longer binds is audit evidence of a
+    claimed-but-failed disposition write, and the forced orphan note must say so
+    instead of calling the child unread. Pure read, never raises."""
+    try:
+        from ouroboros.task_tree_ledger import CHILD_RESULT_DISPOSITION_TYPE, tree_ledger_rows
+
+        status_root = (
+            getattr(ctx, "status_drive_root", None)
+            or getattr(ctx, "drive_root", None)
+        )
+        root_id = str(getattr(ctx, "root_task_id", "") or getattr(ctx, "task_id", "") or "")
+        parent_id = str(getattr(ctx, "task_id", "") or "")
+        if status_root is None or not root_id or not parent_id:
+            return {}
+        claims: Dict[str, tuple] = {}
+        for row in tree_ledger_rows(root_id, data_root=pathlib.Path(status_root)):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if (
+                str(row.get("kind") or "") == "decision"
+                and str(payload.get("type") or "") == CHILD_RESULT_DISPOSITION_TYPE
+                and str(row.get("task_id") or "") == parent_id
+                and str(payload.get("child_task_id") or "")
+            ):
+                # Later rows win: the ledger is append-only and the newest decision
+                # is the one whose failure to bind is worth naming.
+                claims[str(payload["child_task_id"])] = (
+                    str(payload.get("disposition") or ""),
+                    str(payload.get("child_result_sha256") or ""),
+                )
+        return claims
+    except Exception:
+        return {}
 
 
 def _undispositioned_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
@@ -5914,8 +6501,18 @@ def run_llm_loop(
         )
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
+    # Published as a live reference so blocking tools (wait_task/wait_tasks/
+    # delegate_wait) can read RECORDED per-send facts — e.g. the APPLIED
+    # prompt-cache TTL (`_last_prompt_cache_ttl`) behind the cache-horizon
+    # disclosure — without a second, route-derived predictor.
+    tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
-    cost_ceiling_usd = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
+    cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
+    if cost_ceiling.root_cap_usd is not None:
+        # Loop-start seed (one rare ledger read): a resumed/late-started member
+        # of a spending tree must see the real tree number before its first
+        # pacing surface, not a process-local empty stash.
+        _loop_tree_accounting(refresh=True, max_age_sec=0.0)
     from ouroboros.tools import tool_discovery as _td
     _td.set_registry(tools)
 
@@ -6021,10 +6618,18 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
+            # Typed soft landing (v6.91): the ledger fence stays the untouched
+            # backstop; an exhausted ceiling wraps up BEFORE spending a round.
+            _soft_land = _soft_land_exhausted_ceiling(limit_ctx, cost_ceiling)
+            if _soft_land is not None:
+                text, accumulated_usage, forced_trace = _soft_land
+                _merge_finalization_trace(llm_trace, forced_trace)
+                return text, accumulated_usage, llm_trace
+
             _checkpoint_injected = _inject_round_checkpoints(
                 round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
                 emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
-                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd)
+                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
 
             messages, _compaction_usage = _run_round_compaction(
                 messages,
@@ -6040,28 +6645,14 @@ def run_llm_loop(
                     checkpoint_injected=_checkpoint_injected,
                     emit_progress=emit_progress,
                     active_model=active_model,
+                    tool_schemas=tool_schemas,
                 ),
             )
             if tools._ctx.messages is not messages:
                 tools._ctx.messages = messages
             limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
             if _compaction_usage:
-                add_usage(accumulated_usage, _compaction_usage)
-                _cm = get_light_model()
-                _cc = (
-                    float(_compaction_usage["cost"])
-                    if _compaction_usage.get("cost") is not None
-                    else estimate_cost_optional(
-                        _cm,
-                        int(_compaction_usage.get("prompt_tokens") or 0),
-                        int(_compaction_usage.get("completion_tokens") or 0),
-                        int(_compaction_usage.get("cached_tokens") or 0),
-                        int(_compaction_usage.get("cache_write_tokens") or 0),
-                        _compaction_usage.get("prompt_cache_ttl"),
-                        provider=str(_compaction_usage.get("provider") or "openrouter"),
-                    )
-                )
-                emit_llm_usage_event(event_queue, task_id, _cm, _compaction_usage, _cc, "compaction")
+                _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
 
             seal_task_transcript(messages)
 
@@ -6141,7 +6732,7 @@ def run_llm_loop(
             budget_result = _check_budget_limits(
                 limit_ctx,
                 budget_remaining_usd,
-                cost_ceiling_usd=cost_ceiling_usd,
+                cost_ceiling=cost_ceiling,
             )
             if budget_result is not None:
                 text, accumulated_usage, budget_trace = budget_result

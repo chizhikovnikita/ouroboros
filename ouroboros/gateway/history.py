@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.gateway._helpers import iter_jsonl_objects
+from ouroboros.gateway._helpers import read_rotated_jsonl_entries
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
@@ -135,8 +135,13 @@ def _compat_cost_groups(
 async def _project_history_context(
     data_dir: pathlib.Path,
     thread_id: int,
-) -> tuple[set[int], list[dict], Dict[str, Any]]:
-    """Load the three read-only Project history lenses off the event loop."""
+) -> tuple[set[int], list[dict], Dict[str, Any], Dict[str, int]]:
+    """Load the read-only Project history lenses off the event loop.
+
+    The task->project-chat bindings map is preloaded ONCE per request (v6.90.x
+    P2): `_bound_project_chat` previously re-read state/project_task_bindings.json
+    for every uncached (task, parent, root) lineage key — up to three file reads
+    per history row."""
     try:
         from ouroboros.projects_registry import reserved_project_chat_ids
 
@@ -157,7 +162,13 @@ async def _project_history_context(
         annotations = await asyncio.to_thread(latest_chat_annotations, data_dir)
     except Exception:
         annotations = {}
-    return project_chat_ids, source_refs, annotations
+    try:
+        from ouroboros.projects_registry import all_task_bindings
+
+        bindings_by_task = await asyncio.to_thread(all_task_bindings, data_dir)
+    except Exception:
+        bindings_by_task = {}
+    return project_chat_ids, source_refs, annotations, bindings_by_task
 
 
 def _matches_project_source(entry: Dict[str, Any], source_refs: list[dict]) -> bool:
@@ -324,7 +335,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
 
 
 def _read_chat_history_entries(live, adir, want, row_matches_thread):
-    """Read the live chat.jsonl plus a bounded, newest-first archive backfill.
+    """Read a bounded live chat.jsonl tail plus a newest-first archive backfill.
 
     The live chat.jsonl is rotated to ``archive/chat_<ts>.jsonl`` once it crosses
     ~800KB. Reading only the live file would erase the visible conversation right
@@ -336,9 +347,10 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
     quota only if it would survive the same filter applied in the render loop —
     otherwise a project-thread request whose live file already holds ``want``
     unrelated main-chat rows would skip the archives and still lose the rotated
-    project messages/documents this backfill exists to recover.
+    project messages/documents this backfill exists to recover. The live read is
+    a window-doubled byte tail (``read_rotated_jsonl_entries``), so the endpoint
+    is O(window), not O(whole live file).
     """
-    live_entries = list(iter_jsonl_objects(live))
 
     def _counts_toward_thread(e):
         if not isinstance(e, dict):
@@ -353,31 +365,24 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
             ec = 1
         return row_matches_thread(ec, e)
 
-    def _human_count(entries):
-        return sum(1 for e in entries if _counts_toward_thread(e))
+    return read_rotated_jsonl_entries(live, adir, "chat", want, _counts_toward_thread)
 
-    collected = _human_count(live_entries)
-    try:
-        archives = sorted(
-            adir.glob("chat_*.jsonl"), key=lambda p: p.name, reverse=True
-        )
-    except Exception:
-        archives = []
-    chosen: list = []
-    for ap in archives:
-        if collected >= want or len(chosen) >= 3:
-            break
-        try:
-            aents = list(iter_jsonl_objects(ap))
-        except Exception:
-            continue
-        chosen.append(aents)
-        collected += _human_count(aents)
-    ordered: list = []
-    for aents in reversed(chosen):  # oldest archive first
-        ordered.extend(aents)
-    ordered.extend(live_entries)
-    return ordered
+
+def _read_progress_history_entries(live, adir, want, counts_toward_quota):
+    """Bounded, rotation-aware read of logs/progress.jsonl (mirror of
+    ``_read_chat_history_entries``): a window-doubled live byte tail plus a
+    newest-first ``archive/progress_*.jsonl`` backfill (capped like chat's 3).
+
+    ``counts_toward_quota`` is the endpoint's filter for rows that satisfy the
+    ``n_progress`` slice: thread-matching, non-A2A, non-empty, NON-LINEAGE rows.
+    Subagent-lineage rows ride on top of the quota and are safe under this stop
+    condition by construction: the lineage recency floor is the ts of the oldest
+    retained non-lineage row, which the >=want stop guarantees to be inside the
+    returned window, and every lineage row at-or-after it is newer, hence also
+    in-window. That guarantee assumes progress rows are appended with
+    non-decreasing ts (the writers share one host clock); a backdated
+    out-of-order row older than the floor can fall outside the lineage window."""
+    return read_rotated_jsonl_entries(live, adir, "progress", want, counts_toward_quota)
 
 
 def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> None:
@@ -405,7 +410,14 @@ def _annotate_terminal_task_truth(
     combined: list[Dict[str, Any]],
     data_dir: pathlib.Path,
 ) -> None:
-    """Project bounded terminal truth onto the card rows that survive history replay."""
+    """Project bounded terminal truth onto the card rows that survive history replay.
+
+    Runs AFTER quota slicing (v6.90.x P2) on exactly the rows the response emits,
+    so the endpoint pays for the task ids of the WINDOW, not of the whole parsed
+    history. Intended behavior change: terminal truth (cost/axes/review) lands on
+    the latest IN-WINDOW progress row / the in-window summary row — previously it
+    was anchored to the globally-latest row and to summary rows that the quota may
+    then have evicted, leaving the surviving in-window card without the truth."""
 
     try:
         from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
@@ -426,7 +438,11 @@ def _annotate_terminal_task_truth(
         suggested_name_by_task: Dict[str, str] = {}
         for task_id in progress_task_ids | summary_task_ids:
             try:
-                result = load_effective_task_result(data_dir, task_id)
+                # Status/cost projection only — a history GET must never copy
+                # artifacts or claim disposition hashes (materialize contract).
+                result = load_effective_task_result(
+                    data_dir, task_id, materialize_artifacts=False
+                )
             except Exception:
                 result = None
             result = result or {}
@@ -501,27 +517,20 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         # external-transport mirror) it keeps the historic behavior of showing
         # every non-project, non-A2A row so transport conversations stay visible.
         thread_id = _int_param("chat_id", 1, 2**31 - 1) or 1
-        project_chat_ids, project_source_refs, chat_annotations = await _project_history_context(
-            data_dir, thread_id,
+        project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
+            await _project_history_context(data_dir, thread_id)
         )
-        bound_chat_cache: Dict[tuple, int] = {}
 
         def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
             # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
             # classify into its root's project thread (only the root is bound).
-            tid = str(task_id or "").strip()
-            if not tid:
-                return 0
-            key = (tid, str(parent_task_id or ""), str(root_task_id or ""))
-            if key in bound_chat_cache:
-                return bound_chat_cache[key]
-            try:
-                from ouroboros.projects_registry import project_chat_for_task_tree
-
-                bound_chat_cache[key] = int(project_chat_for_task_tree(data_dir, tid, parent_task_id, root_task_id) or 0)
-            except Exception:
-                bound_chat_cache[key] = 0
-            return bound_chat_cache[key]
+            # Same semantics as projects_registry.project_chat_for_task_tree, served
+            # from the ONE bindings map preloaded per request (no per-row file reads).
+            for candidate in (task_id, parent_task_id, root_task_id):
+                tid = str(candidate or "").strip()
+                if tid and bindings_by_task.get(tid):
+                    return int(bindings_by_task[tid])
+            return 0
 
         def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
             # A post-hoc bound task keeps its original (main) chat_id on its rows
@@ -606,8 +615,37 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             log.warning("Failed to read chat history: %s", exc)
 
         progress_path = data_dir / "logs" / "progress.jsonl"
+
+        def _progress_counts_toward_quota(entry) -> bool:
+            # A row satisfies the n_progress quota only if it survives the render
+            # filter below (A2A + thread + non-empty text) AND is NOT subagent
+            # lineage — lineage rows ride on top of the quota, so counting them
+            # here would let a swarm's lifecycle burst stop the tail read before
+            # the window holds n_progress ordinary telemetry rows.
+            if not isinstance(entry, dict):
+                return False
+            if is_a2a_chat_id(entry.get("chat_id", 1)):
+                return False
+            try:
+                entry_chat = int(entry.get("chat_id", 1) or 1)
+            except (TypeError, ValueError):
+                entry_chat = 1
+            if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
+                return False
+            if not str(entry.get("content", entry.get("text", ""))):
+                return False
+            if str(entry.get("delegation_role") or "").lower() == "subagent" or entry.get("subagent_event"):
+                return False
+            return True
+
         try:
-            _progress_entries = await asyncio.to_thread(lambda p=progress_path: list(iter_jsonl_objects(p)))
+            _progress_entries = await asyncio.to_thread(
+                _read_progress_history_entries,
+                progress_path,
+                archive_dir,
+                n_progress,
+                _progress_counts_toward_quota,
+            )
             for entry in _progress_entries:
                 # Skip A2A virtual chat_ids.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):
@@ -664,28 +702,6 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         except Exception as exc:
             log.debug("Failed to synthesize active lifecycle history: %s", exc)
 
-        # Annotate progress messages whose task already reached a terminal (or
-        # cancel-intent) status on disk. Tasks torn down by crash storm, hard
-        # timeout, or cancellation emit a live task_done but never write a
-        # task_summary, so on reload/reconnect the client would otherwise replay
-        # their progress and re-inflate a "Working" spinner that never resolves.
-        _annotate_terminal_task_truth(combined, data_dir)
-
-        # Background consciousness writes no task_result, so its progress would
-        # otherwise replay as a perpetual "thinking" card after reload. Mark its
-        # most recent progress entry terminal; a fresh live event re-activates the
-        # card if a new cycle starts. (Structured signal, consumed by log_events.js.)
-        try:
-            bg_msgs = [
-                m for m in combined
-                if m.get("is_progress") and str(m.get("task_id") or "") == "bg-consciousness"
-            ]
-            if bg_msgs:
-                latest = max(bg_msgs, key=lambda m: str(m.get("ts") or ""))
-                latest["task_terminal_status"] = "done"
-        except Exception as exc:
-            log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
-
         # Tail human conversation and progress telemetry with SEPARATE quotas so a
         # burst of progress messages can never push the user's real conversation out
         # (the previous single combined[-limit:] tail). Subagent lineage is kept on
@@ -735,6 +751,32 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             lineage = lineage[-lineage_cap:]  # keep the most recent lineage events
         progress_tail = lineage + other_tail
         messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
+
+        # Annotate progress messages whose task already reached a terminal (or
+        # cancel-intent) status on disk. Tasks torn down by crash storm, hard
+        # timeout, or cancellation emit a live task_done but never write a
+        # task_summary, so on reload/reconnect the client would otherwise replay
+        # their progress and re-inflate a "Working" spinner that never resolves.
+        # Runs AFTER the quota slice — on the rows actually emitted — so the
+        # response pays only for in-window task ids and the truth always lands on
+        # a row the client will see (see _annotate_terminal_task_truth).
+        _annotate_terminal_task_truth(messages, data_dir)
+
+        # Background consciousness writes no task_result, so its progress would
+        # otherwise replay as a perpetual "thinking" card after reload. Mark its
+        # most recent IN-WINDOW progress entry terminal; a fresh live event
+        # re-activates the card if a new cycle starts. (Structured signal,
+        # consumed by log_events.js.)
+        try:
+            bg_msgs = [
+                m for m in messages
+                if m.get("is_progress") and str(m.get("task_id") or "") == "bg-consciousness"
+            ]
+            if bg_msgs:
+                latest = max(bg_msgs, key=lambda m: str(m.get("ts") or ""))
+                latest["task_terminal_status"] = "done"
+        except Exception as exc:
+            log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
         return JSONResponse({"messages": messages})
 
     return api_chat_history

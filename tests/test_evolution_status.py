@@ -141,3 +141,33 @@ def test_evolution_data_strips_legacy_checkpoint_result_status(tmp_path, monkeyp
     assert "result_status" not in checkpoint["loop_outcome"]
     assert "compat_result_status" not in checkpoint["loop_outcome"]
     assert checkpoint["outcome_axes"]["execution"]["status"] == "failed"
+
+
+def test_budget_remaining_uses_valid_projection_and_self_computes_on_limit_mismatch(monkeypatch):
+    """De-triplication seam pin: a passed projection is used verbatim (zero
+    ledger reads) ONLY when its limit_usd equals the limit budget_remaining
+    reads itself; a mismatched limit (settings hot-reload race, wrong-limit
+    caller) falls through to self-computation."""
+    from ouroboros import usage_accounting as ua
+    from supervisor import state
+
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 10.0)
+    calls = {"projection": 0, "import": 0}
+
+    def _projection(_root, **_kwargs):
+        calls["projection"] += 1
+        return {"limit_usd": 10.0, "remaining_known_usd": 3.75}
+
+    monkeypatch.setattr(ua, "usage_projection", _projection)
+    monkeypatch.setattr(
+        ua, "ensure_legacy_imported",
+        lambda _root: calls.__setitem__("import", calls["import"] + 1),
+    )
+
+    valid = {"limit_usd": 10.0, "remaining_known_usd": 4.25}
+    assert state.budget_remaining({}, projection=valid) == 4.25
+    assert calls == {"projection": 0, "import": 0}
+
+    stale = {"limit_usd": 5.0, "remaining_known_usd": 4.25}
+    assert state.budget_remaining({}, projection=stale) == 3.75
+    assert calls == {"projection": 1, "import": 1}

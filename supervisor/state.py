@@ -285,21 +285,40 @@ def refresh_budget_from_settings(settings: Dict[str, Any]) -> None:
         pass
 
 
-def budget_remaining(st: Dict[str, Any], *, strict: bool = False) -> float:
+def budget_remaining(
+    st: Dict[str, Any],
+    *,
+    strict: bool = False,
+    projection: Optional[Dict[str, Any]] = None,
+) -> float:
     """Return ledger-derived remaining budget in USD.
 
     ``state.json`` is only a compatibility projection.  A corrupt or
     unavailable monetary ledger fails closed while a configured limit is in
     force, so the supervisor cannot dispatch against stale counters.
+
+    ``projection`` is an optional pre-computed global usage projection (same
+    ``global_limit_usd`` and drive root as this function would use itself) so a
+    caller that already replayed the ledger — e.g. ``/api/state`` — does not
+    trigger a second replay. It is accepted only when its ``limit_usd`` equals
+    the limit this function reads itself (``round(max(0.0, total), 6)``, the
+    exact value ``usage_projection`` stamps); a mismatch — e.g. a settings
+    hot-reload between the caller's computation and this call, or a caller
+    passing a projection built for a different limit — falls through to
+    self-computation. Default ``None`` preserves the exact prior behavior,
+    including the strict fail-closed path.
     """
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
         return float('inf')
+    if projection is not None and projection.get("limit_usd") != round(max(0.0, total), 6):
+        projection = None
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
+        if projection is None:
+            from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
 
-        ensure_legacy_imported(DRIVE_ROOT)
-        projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
+            ensure_legacy_imported(DRIVE_ROOT)
+            projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
         return float(projection.get("remaining_known_usd") or 0.0)
     except Exception:
         log.exception("Budget ledger unavailable; refusing new model dispatch")
@@ -886,33 +905,63 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
     return "\n".join(lines)
 
 
-def rotate_chat_log_if_needed(drive_root: pathlib.Path, max_bytes: int = 800_000) -> None:
-    """Rotate chat log if it exceeds max_bytes.
+def rotate_jsonl_log_if_needed(
+    drive_root: pathlib.Path,
+    name: str,
+    archive_prefix: str,
+    max_bytes: int = 800_000,
+) -> None:
+    """Rotate ``logs/<name>`` to ``archive/<archive_prefix>_<ts>.jsonl`` when it
+    exceeds ``max_bytes``.
 
-    Rotation is an atomic ``os.replace`` rename performed under the SAME
-    sidecar lock that ``append_jsonl`` writers take — the old copy+truncate
-    destroyed any line appended between the read and the truncate.
+    Rotation is an atomic ``os.replace`` rename performed under the SAME sidecar
+    lock that ``append_jsonl`` writers take — the old copy+truncate destroyed any
+    line appended between the read and the truncate.
+
+    Suppressed in isolated benchmark data roots (``ISOLATED_BENCHMARK_SENTINEL``):
+    bench harnesses read trial-local logs as one file from birth, the roots are
+    throwaway, and not every harness reader is archive-chain-aware.
+
+    Archives are durable history, NOT GC targets: no retention sweep touches
+    ``archive/`` (retention.py governs subagent worktrees, task drives, and
+    service logs only) and none may be added — readers backfill from these
+    segments, so pruning them would silently erase visible history (BIBLE P1).
     """
-    chat = drive_root / "logs" / "chat.jsonl"
-    if not chat.exists():
+    if (drive_root / ISOLATED_BENCHMARK_SENTINEL).exists():
         return
-    if chat.stat().st_size < max_bytes:
+    path = drive_root / "logs" / name
+    if not path.exists():
+        return
+    if path.stat().st_size < max_bytes:
         return
     ts = utc_now_iso().replace("-", "").replace(":", "").split(".")[0]
-    archive_path = drive_root / "archive" / f"chat_{ts}.jsonl"
+    archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}.jsonl"
+    # Second-resolution names can collide when a fast writer forces two rotations
+    # within one second; os.replace onto an existing archive would destroy it. The
+    # "_<n>" suffix sorts lexicographically AFTER "<ts>.jsonl" ("_" > "."), so
+    # name-ordered readers keep the true chronological chain.
+    suffix = 0
+    while archive_path.exists():
+        suffix += 1
+        archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}_{suffix}.jsonl"
     archive_path.parent.mkdir(parents=True, exist_ok=True)
 
     from ouroboros.utils import jsonl_append_lock_path
 
-    lock_path = jsonl_append_lock_path(chat)
+    lock_path = jsonl_append_lock_path(path)
     lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
     if lock_fd is None:
-        log.warning("chat.jsonl rotation skipped: append lock busy")
+        log.warning("%s rotation skipped: append lock busy", name)
         return
     try:
-        if not chat.exists() or chat.stat().st_size < max_bytes:
+        if not path.exists() or path.stat().st_size < max_bytes:
             return
-        os.replace(chat, archive_path)
-        chat.touch()
+        os.replace(path, archive_path)
+        path.touch()
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def rotate_chat_log_if_needed(drive_root: pathlib.Path, max_bytes: int = 800_000) -> None:
+    """Compatibility wrapper: chat.jsonl rotation via the generalized rotator."""
+    rotate_jsonl_log_if_needed(drive_root, "chat.jsonl", "chat", max_bytes)

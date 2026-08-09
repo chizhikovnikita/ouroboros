@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -109,6 +110,67 @@ def test_skill_advisory_failure_is_fail_open_but_visible(tmp_path, monkeypatch):
     events_path = ctx.drive_root / "logs" / "events.jsonl"
     assert events_path.exists()
     assert "skill_advisory_pre_review_warning" in events_path.read_text(encoding="utf-8")
+
+
+def test_skill_advisory_keyless_delegated_route_is_not_skipped(tmp_path, monkeypatch):
+    """#123 twin (skill_review): the key check is route-aware. On the keyless
+    delegated (agent_session) route the advisory attempt RUNS — a missing
+    ANTHROPIC_API_KEY is only decisive on the api route."""
+    import ouroboros.skill_review as skill_review
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "agent_session")
+    # Availability of the delegated route means "a session route RESOLVES":
+    # give the shared route a real value so the key-independence under test
+    # is not conflated with the unroutable-slot bypass corner.
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
+
+    called = {"n": 0}
+
+    def _fake_delegated(repo_dir, commit_message, ctx, goal="", scope="", paths=None, options=None):
+        called["n"] += 1
+        return [{"item": "bug_hunting", "verdict": "PASS"}], "[]", "fake-route", 10
+
+    monkeypatch.setattr(advisory, "_run_claude_advisory", _fake_delegated)
+    ctx = _make_ctx(tmp_path)
+    result = skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="plugin.py\nprint('ok')"
+    )
+
+    assert called["n"] == 1, "the delegated keyless advisory attempt must run"
+    assert result != {}
+    assert result.get("status") == "completed"
+
+
+def test_skill_advisory_keyless_api_route_skips_and_malformed_route_skips(tmp_path, monkeypatch):
+    """Keyless on the api route skips exactly as today; a malformed route token
+    is treated as unavailable — skill advisory stays OPTIONAL and fail-open,
+    never a hard block on skill review."""
+    import ouroboros.skill_review as skill_review
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", raising=False)
+
+    def _boom(*args, **kwargs):  # pragma: no cover - the point is silence
+        raise AssertionError("the advisory transport must not be called")
+
+    monkeypatch.setattr(advisory, "_run_claude_advisory", _boom)
+    ctx = _make_ctx(tmp_path)
+    assert skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="pack"
+    ) == {}
+
+    # Malformed route token: unavailable → skip (fail-open), no exception.
+    monkeypatch.setenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", "cursor")
+    assert skill_review._run_skill_advisory_pre_review(
+        ctx, skill_name="weather", file_pack="pack"
+    ) == {}
 
 
 _NEW_SKILL_REVIEW_PASS_ITEMS = [
@@ -948,6 +1010,26 @@ def test_review_skill_missing_skill_returns_pending_with_error(tmp_path, monkeyp
     assert "not found" in outcome.error
 
 
+def test_review_skill_malformed_reviewer_slots_block_before_any_reviewer(tmp_path, monkeypatch):
+    """#116: a malformed OUROBOROS_REVIEWER_SLOTS keeps the skill honestly
+    PENDING with the precise parse error — the reviewer wave is never
+    dispatched on the silently projected default panel."""
+    skills_root = _build_skill(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", "{broken")
+    ctx = _make_ctx(tmp_path)
+
+    with patch(
+        "ouroboros.tools.review._handle_multi_model_review",
+        side_effect=AssertionError("no reviewer dispatch on a malformed slot config"),
+    ):
+        outcome = review_skill(ctx, "weather")
+
+    assert outcome.status == "pending"
+    assert "invalid reviewer-slot configuration blocks skill review" in outcome.error
+    assert "not valid JSON" in outcome.error
+
+
 def test_skill_review_hard_blocks_extensionless_binary(tmp_path, monkeypatch):
     """Phase 3 round 15 regression: ANY non-UTF8 file in the runtime-
     reachable surface is a hard-block, not just extension-matched
@@ -1588,3 +1670,50 @@ def test_convergence_hint_silent_when_current_round_clears():
     ]
     # current round is clean -> streak broken, no consecutive-warnings hint
     assert _convergence_hint(history, [], current_status="clean") == ""
+
+
+def test_disabled_advisory_slot_never_dispatches_skill_advisory(monkeypatch, tmp_path):
+    """A standing owner disable must hold for skill review on EITHER route.
+
+    Slot-awareness, not just route-awareness: a disabled advisory slot with an
+    api key present used to dispatch anyway and spend review budget the owner
+    had switched off (authoritative triad finding, v6.90.2).
+    """
+    import json as _json
+
+    from ouroboros import skill_review as sr
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    def _slots(enabled, kind):
+        return _json.dumps({
+            "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "m"}}],
+            "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "m"}}],
+            "advisory": {"enabled": enabled, "route": {"kind": kind, "target_id": "codex" if kind == "agent_session" else ""}},
+        })
+
+    calls = []
+    monkeypatch.setattr(
+        advisory, "_run_claude_advisory",
+        lambda *a, **k: calls.append("dispatched") or ([], "", "model", 0),
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    for kind, key in (("api", "sk-present"), ("agent_session", "")):
+        calls.clear()
+        monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _slots(False, kind))
+        monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+        assert sr._run_skill_advisory_pre_review(
+            SimpleNamespace(repo_dir=str(tmp_path), drive_root=str(tmp_path)),
+            skill_name="s", file_pack="x",
+        ) == {}
+        assert calls == [], f"a disabled advisory slot dispatched on the {kind} route"
+
+    # Enabled again on the keyless delegated route: it MUST dispatch.
+    calls.clear()
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _slots(True, "agent_session"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    sr._run_skill_advisory_pre_review(
+        SimpleNamespace(repo_dir=str(tmp_path), drive_root=str(tmp_path)),
+        skill_name="s", file_pack="x",
+    )
+    assert calls == ["dispatched"]

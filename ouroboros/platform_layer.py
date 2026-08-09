@@ -1249,6 +1249,17 @@ def subprocess_new_group_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def install_shutdown_signal_handlers(handler) -> None:
+    """Register ``handler`` for the signals that ask a console process to shut
+    down: SIGINT everywhere, SIGTERM on POSIX. The platform-specific signal
+    surface lives HERE, never in callers (checklist 15). The handler must only
+    set a flag/event — real teardown belongs on the caller's main thread, not
+    inside a signal frame."""
+    signal.signal(signal.SIGINT, handler)
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGTERM, handler)
+
+
 def subprocess_hidden_kwargs() -> dict:
     """Return kwargs to suppress Windows console windows."""
     if IS_WINDOWS:

@@ -801,6 +801,55 @@ def test_allow_mutative_settings_applied(monkeypatch):
     assert get_allow_mutative_subagents() is False
 
 
+def test_allow_mutative_surface_aware_unset_default(monkeypatch):
+    """Q4 sandbox unwind (owner 2026-08-08): unset toggle + light allows the
+    EXTERNAL build surfaces (external_workspace/genesis) and keeps self_worktree
+    off; advanced/pro allow every surface; an explicit owner value applies to
+    every surface in every mode."""
+    from ouroboros.config import get_allow_mutative_subagents
+    monkeypatch.delenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_BOOT_RUNTIME_MODE", raising=False)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    assert get_allow_mutative_subagents("external_workspace") is True
+    assert get_allow_mutative_subagents("genesis") is True
+    assert get_allow_mutative_subagents("self_worktree") is False
+    # A bare query answers "may ANY acting child be scheduled" -> True in light.
+    assert get_allow_mutative_subagents() is True
+    # An unknown surface string fails closed (surface validity gate has its own message).
+    assert get_allow_mutative_subagents("bogus") is False
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    assert get_allow_mutative_subagents("self_worktree") is True
+    # Explicit owner value overrides the surface-aware default in BOTH directions.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
+    assert get_allow_mutative_subagents("self_worktree") is True
+    monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "false")
+    assert get_allow_mutative_subagents("external_workspace") is False
+
+
+def test_resolve_acting_light_unset_surface_aware(tmp_path, monkeypatch):
+    """The authoritative supervisor gate keys the unset-toggle default on the
+    requested surface: light rejects self_worktree but the reject detail names
+    the external lanes; the surface is validated BEFORE the toggle check."""
+    from supervisor.events import _resolve_subagent_constraint
+    monkeypatch.delenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_BOOT_RUNTIME_MODE", raising=False)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    ctx = SimpleNamespace(REPO_DIR=tmp_path / "repo")
+    c, wr, wm, detail = _resolve_subagent_constraint(
+        ctx, tid="t", requested_constraint={"mode": "acting_subagent", "surface": "self_worktree"},
+        workspace_root="", workspace_mode="", base_sha="", parent_task_id="",
+    )
+    assert c["mode"] == "local_readonly_subagent"
+    assert "self_worktree" in detail and "external_workspace" in detail
+    # Invalid surface is rejected with the surface message, not the toggle message.
+    c2, _, _, detail2 = _resolve_subagent_constraint(
+        ctx, tid="t2", requested_constraint={"mode": "acting_subagent", "surface": "bogus"},
+        workspace_root="", workspace_mode="", base_sha="", parent_task_id="",
+    )
+    assert c2["mode"] == "local_readonly_subagent" and "invalid acting write_surface" in detail2
+
+
 def test_integrate_lineage_forbidden_for_non_child(tmp_path):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
     repo = tmp_path / "repo"

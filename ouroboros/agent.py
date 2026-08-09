@@ -159,7 +159,7 @@ def _record_executor_resolution(
     if dispatch is None or dispatch.executor_resolution is None:
         return
     res = dispatch.executor_resolution
-    append_jsonl(drive_logs / "events.jsonl", {
+    row = {
         "ts": utc_now_iso(), "type": "subagent_executor_resolved",
         "task_id": str(task.get("id") or ""),
         "requested": res.requested,
@@ -167,7 +167,39 @@ def _record_executor_resolution(
         "reason": res.reason,
         "reset_at": res.reset_at,
         "route": res.route.route_id if res.route else "",
-    })
+    }
+    append_jsonl(drive_logs / "events.jsonl", row)
+    # ALSO the canonical events log: a delegated child's forked drive is pruned
+    # with the task, so this used to be the ONLY copy of the substrate decision
+    # (submarine forensics: zero subagent_executor_resolved rows in the canonical
+    # events.jsonl). The accounting axis the task already carries names the
+    # canonical root; the root agent's own drive IS canonical, so skip the dup.
+    try:
+        budget_root = str(task.get("budget_drive_root") or "").strip()
+        if budget_root:
+            canonical_logs = pathlib.Path(budget_root) / "logs"
+            if canonical_logs.resolve(strict=False) != pathlib.Path(drive_logs).resolve(strict=False):
+                append_jsonl(canonical_logs / "events.jsonl", row)
+    except Exception:
+        log.debug("Failed to mirror executor resolution to canonical events", exc_info=True)
+    # D28 exhaustion beacon: surface the spent-window fact to the WAITING parent
+    # NOW (via the task-tree attention channel the wait tools already poll),
+    # not at absorption after the wait window burned.
+    if res.reason == "subscription_window_exhausted" and str(task.get("parent_task_id") or "").strip():
+        root_id = str(task.get("root_task_id") or "").strip()
+        if root_id:
+            try:
+                from ouroboros.task_tree_ledger import record_subscription_window_exhausted
+
+                record_subscription_window_exhausted(
+                    root_id,
+                    child_task_id=str(task.get("id") or ""),
+                    reset_at=res.reset_at,
+                    route=res.route.route_id if res.route else "",
+                    executor=res.executor,
+                )
+            except Exception:
+                log.debug("Failed to append subscription-window beacon", exc_info=True)
 
 
 def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:

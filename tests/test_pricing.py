@@ -87,11 +87,11 @@ def test_missing_cache_prices_are_not_invented():
             "provider/model", 1_000, 100, provider="openrouter",
         ) == 0.0013
         assert estimate_cost_optional(
-            "provider/model", 1_000, 100, cached_tokens=10,
+            "provider/model", 1_000, 100, cache_usage={"cached_tokens": 10},
             provider="openrouter", allow_live_fetch=False,
         ) is None
         assert estimate_cost_optional(
-            "provider/model", 1_000, 100, cache_write_tokens=10,
+            "provider/model", 1_000, 100, cache_usage={"cache_write_tokens": 10},
             provider="openrouter", allow_live_fetch=False,
         ) is None
 
@@ -107,11 +107,13 @@ def test_cache_heavy_anthropic_usage_keeps_a_nonzero_fresh_input_component():
     ):
         # Provider row: input_tokens=500, cache_read=9_000, cache_creation=500.
         pre_fix = estimate_cost_optional(
-            "anthropic/claude-x", 500, 100, cached_tokens=9_000, cache_write_tokens=500,
+            "anthropic/claude-x", 500, 100,
+            cache_usage={"cached_tokens": 9_000, "cache_write_tokens": 500},
             provider="openrouter",
         )
         post_fix = estimate_cost_optional(
-            "anthropic/claude-x", 10_000, 100, cached_tokens=9_000, cache_write_tokens=500,
+            "anthropic/claude-x", 10_000, 100,
+            cache_usage={"cached_tokens": 9_000, "cache_write_tokens": 500},
             provider="openrouter",
         )
 

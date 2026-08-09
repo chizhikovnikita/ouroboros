@@ -217,6 +217,140 @@ def test_malformed_tagged_payloads_have_zero_mutation(tmp_path):
     assert tree_ledger_rows("parent1", data_root=tmp_path) == []
 
 
+def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
+    """W2: aggregated diagnostics — the old one-error-per-round shape cost a live
+    parent 9 paid rounds discovering the constraints serially. One malformed call
+    now returns EVERY violated constraint plus a correct example, and stays an
+    atomic no-op (no truncation, no superset-key acceptance)."""
+    from ouroboros.task_tree_ledger import tree_ledger_rows
+    from ouroboros.tools.task_tree import _tree_note
+
+    _write_child(tmp_path)
+    bad = {
+        "type": "child_result_disposition",
+        "child_task_id": "child1",
+        "disposition": "absorbed",          # not in the enum
+        "child_result_sha256": "0" * 63,     # not 64-hex
+        "supports_claims": ["claim_1"],      # unknown key: rejected, never ignored
+    }
+    result = _tree_note(_parent_ctx(tmp_path), "decision", "x" * 501, payload=bad)
+
+    assert result.count("CHILD_RESULT_DISPOSITION_INVALID") == 1
+    for fragment in (
+        "unknown key(s) supports_claims",
+        "disposition must be one of",
+        "child_result_sha256 must be the 64-char hex sha",
+        "at most 500 characters",
+        "Correct example",
+        "atomic no-op",
+    ):
+        assert fragment in result, fragment
+    assert tree_ledger_rows("parent1", data_root=tmp_path) == []
+
+    # A valid payload with a MISSING rationale also gets the aggregated shape.
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    digest = _child_result_sha256(load_effective_task_result(tmp_path, "child1"))
+    no_reason = _tree_note(
+        _parent_ctx(tmp_path), "decision", "  ", payload=_payload("child1", "integrated", digest),
+    )
+    assert "tree_note text is required as the rationale" in no_reason
+    assert "Correct example" in no_reason
+
+
+def test_ledger_append_renders_the_same_aggregated_violations(tmp_path):
+    """One contract, ONE diagnostic authority: the ledger append path renders the
+    aggregated violations too, instead of keeping a second, weaker one-line
+    message for the same closed key set (it is unreachable through join_ledger
+    today, so the two could drift apart unnoticed)."""
+    from ouroboros.task_tree_ledger import CHILD_RESULT_DISPOSITION_TYPE, tree_ledger_append
+
+    out = tree_ledger_append(
+        "root1", "decision", "why",
+        task_id="parent1",
+        payload={
+            "type": CHILD_RESULT_DISPOSITION_TYPE,
+            "child_task_id": "child1",
+            "disposition": "absorbed",       # not in the enum
+            "child_result_sha256": "0" * 63,  # not 64-hex
+            "supports_claims": ["claim_1"],   # unknown key
+        },
+        allow_child_result_disposition=True,
+        data_root=tmp_path,
+    )
+
+    assert out.startswith("⚠️ CHILD_RESULT_DISPOSITION_INVALID:")
+    for fragment in (
+        "unknown key(s) supports_claims",
+        "disposition must be one of",
+        "child_result_sha256 must be the 64-char hex sha",
+    ):
+        assert fragment in out, fragment
+    # The superseded single-line message is gone, not merely shadowed.
+    assert "payload must contain exactly" not in out
+
+
+def test_disposition_violations_helper_is_the_normalizer_authority():
+    from ouroboros.task_tree_ledger import (
+        child_result_disposition_violations,
+        normalize_child_result_disposition_payload,
+    )
+
+    good = _payload("child1", "integrated", "a" * 64)
+    assert child_result_disposition_violations(good) == []
+    assert normalize_child_result_disposition_payload(good) is not None
+    for bad in (
+        None,
+        "text",
+        {**good, "extra": 1},
+        {**good, "disposition": "unknown"},
+        {**good, "child_result_sha256": "xyz"},
+        {"type": "child_result_disposition"},
+    ):
+        assert child_result_disposition_violations(bad), bad
+        assert normalize_child_result_disposition_payload(bad) is None
+
+
+def test_orphan_note_claim_detail_is_scoped_to_undecided_children(monkeypatch):
+    """The blackboard-derived claim detail belongs ONLY to children the exact-hash
+    disposition projection left UNDECIDED. A deferred child IS carried by that
+    projection (that is why it lands on the deferred list) and its row DOES bind,
+    so "not carried by this round's disposition projection — re-submit to close it"
+    would be a provably false owner-visible instruction."""
+    import ouroboros.loop as loop
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    child = {"task_id": "child1", "status": "completed", "result": "child work"}
+    digest = _child_result_sha256(child)
+    # The real projection fields: disposition rows are excluded from the hash, so
+    # this is a genuinely CARRIED, exactly-bound deferral (no monkeypatched state).
+    deferred_child = {
+        **child,
+        "child_result_disposition_source": "task_tree_ledger",
+        "child_result_disposition": "deferred",
+        "child_result_disposition_sha256": digest,
+    }
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(deferred_child)])
+    monkeypatch.setattr(
+        loop,
+        "_claimed_child_dispositions",
+        lambda _ctx: {"child1": ("deferred", digest)},
+    )
+
+    note = loop._forced_orphan_note(SimpleNamespace())
+
+    assert "DEFERRED CHILD RESULTS: child1 [completed]" in note
+    assert "re-submit" not in note
+    assert "disposition projection" not in note
+
+    # The undecided child the detail was written for still gets it.
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(child)])
+    undecided_note = loop._forced_orphan_note(SimpleNamespace())
+    assert "recorded for this exact result hash" in undecided_note
+    assert "re-submit to close it" in undecided_note
+
+
 def test_non_child_lineage_is_rejected_without_a_row(tmp_path):
     from ouroboros.task_results import load_task_result, write_task_result
     from ouroboros.task_status import load_effective_task_result

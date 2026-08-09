@@ -251,15 +251,21 @@ export function renderSubagentsSection() {
                 ${renderSegmentedField({
                     target: 's-allow-mutative-subagents',
                     title: 'Applies on the next task; no restart required.',
-                    options: [{ value: 'off', label: 'Off' }, { value: 'on', label: 'On' }],
+                    options: [
+                        { value: 'off', label: 'Off' },
+                        { value: 'auto', label: 'Auto' },
+                        { value: 'on', label: 'On' },
+                    ],
                 })}
                 <div class="settings-inline-note">
                     Whether a subagent may WRITE — in an isolated git worktree of this repo, an external
                     workspace, or a from-scratch project — and return patches for the parent to review.
                     Read-only subagents are always allowed, and this applies to delegated and API
-                    subagents alike. With no explicit choice the runtime mode decides: off in Light,
-                    on in Advanced and Pro. <strong>Human controlled:</strong> the agent cannot
-                    self-enable it; applies on the next task, no restart.
+                    subagents alike. With no explicit choice (Auto) the runtime mode decides:
+                    Advanced and Pro allow every surface; Light allows only children that build
+                    OUTSIDE the Ouroboros runtime (external workspaces and from-scratch projects)
+                    and keeps worktree-of-this-repo children off. <strong>Human controlled:</strong>
+                    the agent cannot self-enable it; applies on the next task, no restart.
                 </div>
             </div>
         </div>

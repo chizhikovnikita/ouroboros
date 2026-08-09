@@ -324,7 +324,6 @@ def _handle_task_acceptance_review(
             # the SSOT — once the actual reviewer slot count is known.
             "fail_closed_on_errors": True,
             "classify_outcome_tier": True,
-            "require_criterion_evidence": True,
             "max_physical_attempts_per_actor": 2,
         },
         task_id=str(getattr(ctx, "task_id", "") or ""),

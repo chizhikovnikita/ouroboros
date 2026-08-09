@@ -232,11 +232,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # declaration, so a pre-v6.80.0 settings.json and an env allowlist forwarding the
     # mode without this key both leave the BIBLE P3 scope gate ON.
     "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "",
-    # Web UI display language. "" means AUTO — the browser's own language decides,
-    # which is why the shipped default is empty rather than "en": an existing
-    # install keeps whatever its browser already produced. Interface chrome only;
-    # it never affects the language the agent thinks or answers in.
-    "UI_LANGUAGE": "",
+    "UI_LANGUAGE": "",  # UI chrome only; "" = AUTO (the browser decides), never the agent's own language
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
@@ -285,6 +281,13 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
     "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES": 1,
     "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
+    # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
+    # EVERY cache_control breakpoint on the Anthropic-normalizing family — main loop, review lanes, safety
+    # supervisor alike — at the ONE send-time finalizer (llm._normalize_payload_cache_ttl). 'default' = bare
+    # markers (provider default 5m tier); '5m'/'1h' = the explicit Anthropic ephemeral tiers ('1h' bills cache
+    # writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are a NO-OP by construction
+    # (Gemini documents no ttl field — the v5.30.0 outage class).
+    "OUROBOROS_PROMPT_CACHE_TTL": "1h",
     # Reasoning effort per task type: none | low | medium | high
     "OUROBOROS_EFFORT_TASK": "medium",
     "OUROBOROS_EFFORT_EVOLUTION": "high",
@@ -583,6 +586,26 @@ def resolve_effort(task_type: str) -> str:
     return raw if raw in EFFORT_SCALE else default
 
 
+# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier),
+# '5m'/'1h' = the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (a dead value until an
+# adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
+PROMPT_CACHE_TTL_SCALE: tuple[str, ...] = ("default", "5m", "1h")
+
+
+def resolve_prompt_cache_ttl() -> str:
+    """The owner-configured global prompt-cache TTL ('default' | '5m' | '1h').
+
+    Validated like ``resolve_effort``: an unknown value falls back to the shipped default.
+    Consumed ONLY by the finalizer (``llm.LLMClient._normalize_payload_cache_ttl``), by
+    ``review_helpers.cached_prompt_blocks`` (its marker gets stamped to the same value anyway),
+    and by ``usage_accounting._reservation_cost`` as the payload-free admission fallback
+    (payload-carrying sites use the finalizer's applied TTL) — never by per-builder marking
+    sites (docs/DEVELOPMENT.md cache-friendliness invariant)."""
+    default = str(SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"])
+    raw = str(os.environ.get("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()
+    return raw if raw in PROMPT_CACHE_TTL_SCALE else default
+
+
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
     if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat"):
@@ -794,12 +817,18 @@ def get_max_subagent_depth() -> int:
     )
 
 
-def get_allow_mutative_subagents() -> bool:
+def get_allow_mutative_subagents(write_surface: str = "") -> bool:
     """Whether the parent may spawn mutative (acting) subagents.
 
-    Owner-controlled. Empty/unset => follow runtime mode (ON in advanced/pro, OFF in
-    light); explicit truthy/falsey overrides. Gates only SCHEDULING: light-mode self-repo
-    writes stay blocked by the runtime sandbox regardless."""
+    Owner-controlled. An explicit truthy/falsey value applies to EVERY surface.
+    Empty/unset follows the runtime mode: advanced/pro allow every acting
+    surface; light is SURFACE-AWARE (Q4 sandbox unwind, owner 2026-08-08) —
+    ``external_workspace``/``genesis`` children build OUTSIDE the Ouroboros
+    runtime and stay allowed (light is a self-modification boundary, not an OS
+    sandbox), while ``self_worktree`` (a checkout of the live body) stays off.
+    A bare call (no surface) answers "may ANY acting child be scheduled".
+    Gates only SCHEDULING: light-mode self-repo writes stay blocked by the
+    runtime sandbox regardless."""
     key = "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS"
     raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, ""))
     text = str(raw or "").strip().lower()
@@ -807,7 +836,14 @@ def get_allow_mutative_subagents() -> bool:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    return get_runtime_mode() in {"advanced", "pro"}
+    if get_runtime_mode() in {"advanced", "pro"}:
+        return True
+    surface = str(write_surface or "").strip().lower()
+    # Unset + light (or unknown mode): allowed for the external build surfaces,
+    # off for self_worktree; an unknown surface string fails closed (the surface
+    # validity gate elsewhere rejects it with its own message). A bare query
+    # reports True because SOME acting children are allowed.
+    return not surface or surface in {"external_workspace", "genesis"}
 
 
 def get_subagent_worktree_root() -> str:
@@ -1013,9 +1049,7 @@ def get_context_mode() -> str:
     P3 scope gate reads get_owner_context_mode instead. No boot-pin: hot-applies on the
     next task. The key is dropped from the agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
-    return normalize_context_mode(
-        os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
-    )
+    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val)
 
 
 def get_owner_context_mode() -> str:
@@ -1516,10 +1550,7 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     # LAN-reachable server silently became loopback at the first self-restart and stayed
     # there. A default standing in for an absent key is not an owner decision.
     "OUROBOROS_SERVER_HOST",
-    # Browser-display preference read by the SPA over /api/settings. Nothing in a
-    # worker, tool, or subprocess consults it, and exporting it would put a
-    # locale-shaped variable into every child env for no consumer.
-    "UI_LANGUAGE",
+    "UI_LANGUAGE",  # SPA reads it over /api/settings; no worker, tool or child env consults it
 })
 
 

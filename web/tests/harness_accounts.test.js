@@ -28,6 +28,8 @@ import {
     runtimeActionLabel,
     submitLoginInput,
     verificationBadge,
+    cancelLoginJob,
+    loginSettleProven,
 } from '../modules/harness_accounts.js';
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
@@ -961,4 +963,52 @@ test('a re-render never STEALS focus, and never focuses a field the code already
     const host3 = fakeCardHost(replacement, null);
     preserveCardFocus(host3, () => { host3.swaps += 1; }, null);
     assert.equal(host3.swaps, 1);
+});
+
+
+// ---------------------------------------------------------------------------
+// C7: login-job serialization — a new login only after the old one is gone.
+// ---------------------------------------------------------------------------
+
+test('cancelLoginJob reports gone only on ok/404/410; failures and network death are NOT cancelled', async () => {
+    const mk = (status, ok) => async () => ({ ok, status });
+    assert.equal(await cancelLoginJob('job-1', mk(200, true)), true);
+    assert.equal(await cancelLoginJob('job-1', mk(404, false)), true);   // already gone
+    assert.equal(await cancelLoginJob('job-1', mk(410, false)), true);   // already gone
+    assert.equal(await cancelLoginJob('job-1', mk(503, false)), false);  // daemon may still run it
+    assert.equal(await cancelLoginJob('job-1', mk(500, false)), false);
+    assert.equal(await cancelLoginJob('job-1', async () => { throw new Error('net'); }), false);
+    assert.equal(await cancelLoginJob('', async () => { throw new Error('must not be called'); }), true);
+});
+
+test('startLogin centralizes the C7 guard: cancel-or-refuse BEFORE the new login POST', () => {
+    // ESM keeps startLogin internal state untestable directly; pin the control
+    // flow at the source level (same source-based technique as the HTML pins
+    // in this file): the guard must sit inside startLogin ahead of the POST,
+    // and a failed cancellation must return without starting a second job.
+    const src = readFileSync(fileURLToPath(new URL('../modules/harness_accounts.js', import.meta.url)), 'utf8');
+    const fn = src.slice(src.indexOf('async function startLogin'));
+    const guardAt = fn.indexOf('cancelLoginJob(prev.jobId)');
+    const postAt = fn.indexOf("apiFetch('/api/claudexor/login'");
+    assert.ok(guardAt > -1, 'startLogin must call cancelLoginJob for a live previous job');
+    assert.ok(postAt > -1);
+    assert.ok(guardAt < postAt, 'the C7 guard must run before the new login POST');
+    const guarded = fn.slice(guardAt, postAt);
+    assert.match(guarded, /if \(!cancelled && !settledMeanwhile\) \{[\s\S]*?return;/,
+        'a failed cancel (with the job still unsettled) must refuse the new login');
+});
+
+
+test('loginSettleProven: only a TERMINAL job snapshot proves the settle — an unconfirmed verdict does NOT', () => {
+    assert.equal(loginSettleProven(null), false);
+    assert.equal(loginSettleProven({}), false);
+    assert.equal(loginSettleProven({ job: { state: 'running' } }), false);
+    // Lost contact: the give-up verdict must NEVER read as proof of settle —
+    // the job may still be live, and treating it as settled would let a
+    // dismiss/restart drop or duplicate a live login (round b7).
+    assert.equal(loginSettleProven({ job: { state: 'running' }, verdict: { kind: 'unconfirmed' } }), false);
+    assert.equal(loginSettleProven({ job: null, verdict: { kind: 'unconfirmed' } }), false);
+    assert.equal(loginSettleProven({ job: { state: 'succeeded' } }), true);
+    assert.equal(loginSettleProven({ job: { state: 'failed' } }), true);
+    assert.equal(loginSettleProven({ job: { state: 'cancelled' } }), true);
 });

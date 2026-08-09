@@ -1575,7 +1575,7 @@ def _run_supervisor(settings: dict) -> None:
         )
 
         from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
-        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed
+        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
         state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", 10.0)))
         init_state()
 
@@ -1752,6 +1752,10 @@ def _run_supervisor(settings: dict) -> None:
         try:
             _loop_liveness[0] = time.time()
             rotate_chat_log_if_needed(DATA_DIR)
+            # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
+            # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
+            # archive-chain-aware.
+            rotate_jsonl_log_if_needed(DATA_DIR, "progress.jsonl", "progress")
             ensure_workers_healthy()
 
             event_q = get_event_q()

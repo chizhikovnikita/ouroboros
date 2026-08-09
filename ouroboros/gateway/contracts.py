@@ -766,6 +766,33 @@ class TaskListResponse(TypedDict, total=False):
     error: str
 
 
+class TaskCostBreakdown(TypedDict):
+    """Read-time "where did the money go" projection on ``GET /api/tasks/{task_id}``
+    (ROOT tasks only). Computed from the physical-attempt ledger at read time and
+    never persisted; ``own + children + unattributed == subtree``. When the object
+    is present every key is present; the WHOLE object is absent — never a confident
+    $0 — when accounting is unavailable or holds no attributable row for the
+    subtree, and on non-root task details."""
+
+    own_usd: float
+    children_usd: float
+    unattributed_usd: float
+    delegated_disclosed_usd: float
+    subscription_sessions: int
+    unknown_unmetered: int
+    non_final_rows: int
+    cost_final: bool
+    authority: Literal["physical_attempt_ledger"]
+
+
+class TaskDetailResponse(TypedDict, total=False):
+    """``GET /api/tasks/{task_id}`` — the public task-result envelope (open shape;
+    stored task-result keys pass through) plus additive typed projections."""
+
+    cost_breakdown: TaskCostBreakdown
+    error: str
+
+
 class TaskEvent(TypedDict, total=False):
     seq: int
     source: str
@@ -982,6 +1009,8 @@ __all__ = [
     "TaskCreateRequest",
     "TaskCreateResponse",
     "TaskListResponse",
+    "TaskCostBreakdown",
+    "TaskDetailResponse",
     "TaskEvent",
     "TaskCancelResponse",
     "LogTailResponse",

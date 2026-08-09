@@ -299,7 +299,8 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
         i for i, line in enumerate(src)
         if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
     ]
-    assert len(starts) == 16, f"writer inventory changed: {len(starts)} call sites"
+    # 17th writer: the forced-rail acceptance-bypass recorder (typed, closed-enum reason).
+    assert len(starts) == 17, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",
@@ -693,7 +694,10 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     solved = rs.ReviewRunResult(
         request={"surface": "task_acceptance"},
         actors=[{"signal": "PASS", "slot_id": "s0",
-                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship it as-is"}}],
+                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship it as-is",
+                            "criteria_used": [{"criterion": "deliverable is verified",
+                                               "status": "supported",
+                                               "evidence_refs": ["verification_summary"]}]}}],
         parsed_findings=[], aggregate_signal="PASS",
     )
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)

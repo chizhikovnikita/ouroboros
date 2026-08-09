@@ -14,6 +14,8 @@ from ouroboros.gateway.contracts import (
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
+    TaskCostBreakdown,
+    TaskDetailResponse,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
     UpdateApplySuccessResponse,
@@ -93,6 +95,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "TaskCreateResponse",
         "TaskEvent",
         "TaskListResponse",
+        "TaskCostBreakdown",
+        "TaskDetailResponse",
         "TaskCancelResponse",
         "LogTailResponse",
         "SkillDeleteResponse",
@@ -116,7 +120,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
-                UpdateStatusReadyOutbound):
+                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
@@ -229,3 +233,36 @@ def test_v682_cancellation_contract_fields_are_mirrored_in_both_languages():
     assert "cascade: bool" in python_contract
     assert "@property {boolean=} cancelable" in js_contract
     assert "@property {boolean=} cascade" in js_contract
+
+
+def test_task_detail_cost_breakdown_emission_matches_contract(monkeypatch, tmp_path):
+    """api_task_get's additive cost_breakdown object must carry EXACTLY the key
+    set TaskCostBreakdown declares (the JS mirror is held to the same set by the
+    field-level parity loop above), stay optional on the detail response, and be
+    omitted on non-root task details."""
+    import ouroboros.usage_accounting as usage_accounting
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    fake_breakdown = {
+        "accounted_usd": 1.5,
+        "attempt_counts": {"settled": 2},
+        "subscription_sessions": 1,
+        "by_task": {"root1": {"accounted_usd": 0.5}},
+        "unattributed": {"task": {"accounted_usd": 0.25}},
+        "delegated": {"settled_usd": 0.75},
+        "unknown_unmetered": 0,
+        "non_final_rows": 0,
+        "cost_final": True,
+    }
+    monkeypatch.setattr(usage_accounting, "usage_breakdown", lambda *args, **kwargs: fake_breakdown)
+    view = _task_cost_breakdown_view(tmp_path, {"task_id": "root1", "root_task_id": "root1"})
+    assert view is not None
+    assert set(view) == set(get_type_hints(TaskCostBreakdown, include_extras=True))
+    assert view["authority"] == "physical_attempt_ledger"
+    # Non-root details omit the view: subtree math is ledger-attributable only at the root.
+    assert _task_cost_breakdown_view(tmp_path, {"task_id": "child1", "root_task_id": "root1"}) is None
+    # The detail response declares the projection as genuinely optional — absence is a
+    # legal shape (unavailable accounting is never rendered as a confident $0).
+    detail_hints = get_type_hints(TaskDetailResponse, include_extras=True)
+    assert detail_hints["cost_breakdown"] is TaskCostBreakdown
+    assert TaskDetailResponse.__required_keys__ == frozenset()

@@ -182,7 +182,17 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         return AdvisorySlotConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory must be an object")
-    kind = str((raw.get("route") or {}).get("kind") or raw.get("kind") or "api").strip().lower()
+    route = raw.get("route")
+    if route is not None and not isinstance(route, dict):
+        # Same typed refusal _parse_slot gives (:150). Without it a non-dict
+        # route reached `.get` on a str/list and raised AttributeError, which
+        # escapes every `except ValueError` that treats this parser as the
+        # typed authority — including the commit gate's fail-closed branch and
+        # reviewer_slot_config_error's callers.
+        raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory route must be an object "
+                         "{kind, target_id}")
+    route = route or {}
+    kind = str(route.get("kind") or raw.get("kind") or "api").strip().lower()
     if kind in ("", "api", "api_chat"):
         kind = "api"
     elif kind != ROUTE_KIND_SESSION:
@@ -190,7 +200,7 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
             f"{REVIEWER_SLOTS_ENV}: advisory names an unknown route kind {kind!r}; "
             "valid: api, agent_session"
         )
-    target = str((raw.get("route") or {}).get("target_id") or raw.get("target_id") or "").strip()
+    target = str(route.get("target_id") or raw.get("target_id") or "").strip()
     if kind == ROUTE_KIND_SESSION and "::" in target:
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: advisory session target {target!r} uses '::'")
     return AdvisorySlotConfig(
@@ -198,7 +208,7 @@ def _parse_advisory(raw: Any) -> AdvisorySlotConfig:
         kind=kind,
         target_id=target,
         effort=_valid_effort(raw.get("effort"), "advisory") or "low",
-        profile_id=str((raw.get("route") or {}).get("profile_id") or "").strip(),
+        profile_id=str(route.get("profile_id") or "").strip(),
     )
 
 
@@ -340,6 +350,25 @@ def load_reviewer_slot_config() -> ReviewerSlotConfig:
     if raw:
         return parse_reviewer_slots(raw)
     return _legacy_config()
+
+
+def reviewer_slot_config_error() -> str:
+    """The structured config's row-precise parse error, or '' when none (#116).
+
+    Thin facade for the surfaces that must refuse loudly instead of running on
+    a silently projected default panel (plan review, skill review). Reads ONLY
+    the structured raw value — a legacy-only config (comma keys, no structured
+    key) always returns '' (bench constraint: benches configure legacy keys
+    only and must stay unaffected). No caching: the check re-parses so a
+    hot-reloaded fix is seen immediately."""
+    raw = structured_reviewer_slots_raw()
+    if not raw:
+        return ""
+    try:
+        parse_reviewer_slots(raw)
+    except ValueError as exc:
+        return str(exc)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +727,7 @@ __all__ = [
     "reviewer_slot_api_fallback_warning",
     "load_reviewer_slot_config",
     "parse_reviewer_slots",
+    "reviewer_slot_config_error",
     "project_reviewer_slots_into_env",
     "record_reviewer_slot_executions",
     "reviewer_slot_last_executions",

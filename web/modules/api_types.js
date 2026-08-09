@@ -468,6 +468,33 @@
  */
 
 /**
+ * Read-time "where did the money go" projection on GET /api/tasks/{task_id}
+ * (ROOT tasks only; computed from the physical-attempt ledger at read time,
+ * never persisted). own + children + unattributed == subtree. When the object
+ * is present every key is present; the WHOLE object is absent — never a
+ * confident $0 — when accounting is unavailable or holds no attributable row
+ * for the subtree, and on non-root task details.
+ * @typedef {Object} TaskCostBreakdown
+ * @property {number} own_usd
+ * @property {number} children_usd
+ * @property {number} unattributed_usd
+ * @property {number} delegated_disclosed_usd
+ * @property {number} subscription_sessions
+ * @property {number} unknown_unmetered
+ * @property {number} non_final_rows
+ * @property {boolean} cost_final
+ * @property {"physical_attempt_ledger"} authority
+ */
+
+/**
+ * GET /api/tasks/{task_id} — the public task-result envelope (open shape;
+ * stored task-result keys pass through) plus additive typed projections.
+ * @typedef {Object} TaskDetailResponse
+ * @property {TaskCostBreakdown=} cost_breakdown
+ * @property {string=} error
+ */
+
+/**
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
  * @property {Object[]} tasks
@@ -592,4 +619,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.90.1';
+export const GATEWAY_CONTRACT_VERSION = '6.92.1';

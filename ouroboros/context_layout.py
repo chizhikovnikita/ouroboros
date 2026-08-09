@@ -6,15 +6,33 @@ kind. Centralizing it here keeps the low/max split from drifting across the
 surfaces that consume it (main task context, background consciousness, deep
 self-review).
 
-Doc matrix (agent cognition surfaces):
+Doc matrix (agent cognition surfaces; D-ARCH unification, owner 2026-08-08):
 
   | doc            | max            | low                                   |
   |----------------|----------------|---------------------------------------|
   | SYSTEM / BIBLE | full (tier-0; caller-owned, never varied here)              |
-  | ARCHITECTURE   | full           | navigation map (full sections on demand) |
-  | DEVELOPMENT    | full           | full when caller marks/keeps dev context; else pointer |
+  | ARCHITECTURE   | full — ALWAYS, every task class | navigation map (full sections on demand) |
+  | DEVELOPMENT    | full when the caller includes dev context, else pointer — MODE-INDEPENDENT |
   | README         | on-demand pointer (removed from always-on for all modes)     |
   | CHECKLISTS     | on-demand pointer (reviewers load their own copy)            |
+
+ARCHITECTURE.md follows the OWNER CONTEXT MODE alone — no per-task downgrade.
+Owner's motivation (recorded so it is not lost): architecture.md is Ouroboros's
+capability/tools/access map; it stays resident in max even for project/evolution
+work because without it the agent cannot reason about HOW to work effectively —
+context economy comes from dropping DEVELOPMENT.md for project work, never
+ARCHITECTURE. DEVELOPMENT.md inclusion is the caller's per-task decision and is
+deliberately decoupled from the mode.
+
+D-DEV (owner decision, 2026-08-08) fixes what that per-task decision keys on:
+DEVELOPMENT.md is the self-engineering handbook, so it loads exactly when the
+work targets Ouroboros's own body — and the signal is the ACTIVE REPO BINDING, a
+path fact, never a guess from message text (P5). ``context.py`` derives it from
+``not _task_uses_external_context(task)``: a bound workspace, a subagent, or an
+api/cli/scheduled surface means another codebase and gets the pointer, while a
+direct-chat turn in a PROJECT ROOM with no workspace bound keeps the handbook.
+Project MEMBERSHIP is deliberately not the signal — an id in a room does not mean
+the work left Ouroboros's body.
 
 The TIER-0 protected core (SYSTEM, BIBLE, identity, scratchpad, knowledge index,
 recent dialogue) is ALWAYS full in every mode (BIBLE P1 cognitive-horizon / P4)
@@ -111,7 +129,7 @@ def reference_doc_sections(
     env: Any,
     *,
     context_mode: str,
-    is_code_task: bool,
+    include_development: bool,
     architecture_text: str | None = None,
     development_text: str | None = None,
 ) -> List[str]:
@@ -121,8 +139,13 @@ def reference_doc_sections(
     ARCHITECTURE / DEVELOPMENT / README / CHECKLISTS per the doc matrix. Anything
     not inlined is named in a single visible on-demand pointer (P1: no silent
     omission).
+
+    ``context_mode`` is the OWNER context mode and decides only the ARCHITECTURE
+    form (full in max, nav map in low — D-ARCH, owner 2026-08-08).
+    ``include_development`` is the caller's mode-independent decision whether the
+    self-engineering handbook is inline (self-body/self-mod/evolution work) or an
+    on-demand pointer (project tasks — folder or not — and external surfaces).
     """
-    low = context_mode == "low"
     parts: List[str] = []
     on_demand: List[str] = []
 
@@ -140,10 +163,7 @@ def reference_doc_sections(
         else _read_doc(env, "docs/DEVELOPMENT.md")
     )
     if dev_text.strip():
-        # DEVELOPMENT is the engineering handbook — full in max; in low only
-        # when the caller marks/keeps development context, else an on-demand
-        # pointer. Direct chat is not a reliable non-code signal by itself.
-        if (not low) or is_code_task:
+        if include_development:
             parts.append("## DEVELOPMENT.md\n\n" + dev_text)
         else:
             on_demand.append("docs/DEVELOPMENT.md")

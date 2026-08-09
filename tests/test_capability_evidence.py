@@ -428,7 +428,7 @@ def test_no_observation_non_claude_main_route_keeps_todays_initial_mode(tmp_path
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
         semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
-        docs_need_development=False, force_low_docs=False,
+        docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
     monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
@@ -485,7 +485,7 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
         semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
-        docs_need_development=False, force_low_docs=False,
+        docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
     monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])

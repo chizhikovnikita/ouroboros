@@ -602,3 +602,19 @@ def test_actor_records_carry_response_ref_end_to_end(tmp_path):
     )
     assert row["response_ref"].get("call_id")
     assert row["response_ref"].get("sha256")
+
+
+def test_affordance_map_carries_label_path_pairs(tmp_path):
+    """root_paths gives label=resolved-path for every visible root (v6.54.3
+    lesson on the context digest — bare labels left the model guessing)."""
+    from ouroboros.tool_access import filesystem_affordance_map
+
+    result = filesystem_affordance_map(_ctx(tmp_path))
+    paths = result.get("root_paths")
+    assert isinstance(paths, dict) and paths
+    assert "skill_payload" not in paths  # needs bucket/skill args
+    for label, path in paths.items():
+        assert path and str(path).startswith("/") or ":" in str(path), (label, path)
+    # The read-only orchestrator root is resolvable when visible to the profile.
+    if "subagent_projects" in result.get("readonly_roots", []):
+        assert paths.get("subagent_projects")

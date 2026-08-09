@@ -61,8 +61,10 @@ from ouroboros.tools.review_helpers import (
 from ouroboros.tools.review_synthesis import (
     emit_plan_review_usage as _emit_plan_review_usage,  # noqa: F401 — test-compat re-export
     PLAN_REVIEW_CONTROL_PREFIX,
+    VACUOUS_CLAIMS_NOTE as _VACUOUS_CLAIMS_NOTE,
     VACUOUS_DISPOSITION_NOTE as _VACUOUS_DISPOSITION_NOTE,
     addressable_plan_findings,
+    vacuous_acceptance_claims as _vacuous_acceptance_claims,
     vacuous_review_disposition as _vacuous_review_disposition,
     all_planning_tasks_terminal as _all_planning_tasks_known_terminal,
     assemble_plan_raw_results as _assemble_plan_raw_results,
@@ -211,7 +213,7 @@ def get_tools():
                             "description": (
                                 "Optional structured intent boundary shown beside the goal: what is in scope, "
                                 "mandatory invariants, non-goals, the existing seam selected for extension, "
-                                "and explicitly rejected expansions."
+                                "explicitly rejected expansions, and optional pre-work acceptance claims."
                             ),
                             "properties": {
                                 "in_scope": {"type": "array", "items": {"type": "string"}},
@@ -219,6 +221,19 @@ def get_tools():
                                 "non_goals": {"type": "array", "items": {"type": "string"}},
                                 "selected_seam": {"type": "string"},
                                 "rejected_expansions": {"type": "array", "items": {"type": "string"}},
+                                "acceptance_claims": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Optional pre-work acceptance claims: concrete, checkable statements of "
+                                        "what 'done' means (plain strings). They enter the plan fingerprint when "
+                                        "set, reviewers see them beside the goal, and the CLOSED plan's claims "
+                                        "bind task acceptance (ids claim_1..N in list order — link "
+                                        "verify_and_record receipts via criterion_id). Keep the list stable "
+                                        "across re-plans (append-only) so receipt links survive; omit unless "
+                                        "you can state real checks — empty/blank values are treated as absent."
+                                    ),
+                                },
                             },
                         },
                         "review_disposition": {
@@ -336,6 +351,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             )
         if isinstance(result, str) and vacuous_disposition:
             result += _VACUOUS_DISPOSITION_NOTE
+        if isinstance(result, str) and _vacuous_acceptance_claims(params.get("scope")):
+            result += _VACUOUS_CLAIMS_NOTE
         return result
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return _plan_unavailable(
@@ -710,9 +727,11 @@ def _start_planning_swarm(
                 _cap = 3
             _desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
             roles = [f"planning-scout-{idx + 1}" for idx in range(max(1, min(int(_cap or 1), _desired)))]
+            scope_claims = request.scope.get("acceptance_claims") if isinstance(request.scope, dict) else None
             wave, created = reserve_plan_review_wave(
                 root, parent_id, fingerprint=fingerprint, plan_text_hash=plan_text_fingerprint(plan),
                 scout_roles=roles, cutoff_at=(_planning_now() + timedelta(seconds=max_wait)).isoformat(),
+                acceptance_claims=scope_claims if isinstance(scope_claims, list) else None,
             )
             resumed = not created
             if created:
@@ -1373,6 +1392,16 @@ async def _run_plan_review_async(
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
+    # #116: a malformed structured reviewer-slot config must refuse loudly here
+    # instead of running the panel on the silently projected default models.
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+
+    if err := reviewer_slot_config_error():
+        return _plan_unavailable(
+            ctx,
+            f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
+            "Fix Reviewer Slots in Settings.",
+            "reviewer_slot_config_invalid")
     if not list(_cfg.get_review_models() or []):
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",

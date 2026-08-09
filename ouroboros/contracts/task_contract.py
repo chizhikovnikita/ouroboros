@@ -174,14 +174,15 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
 
     ``cost_hard_stop_pct`` (v6.56.0, additive): the in-task cost hard-stop as a
     percentage of the budget remaining at task start. None -> the historical
-    default (50: force-finalize once the task has spent half the remaining
+    default (50: the global component of the stop is half the remaining
     budget). 0 -> NO in-task cost stop at all — the deadline/rounds axes and the
     global between-task budget gate remain the only bounds, and cost milestones
     become informational against the start snapshot. The ceiling is resolved in
-    ``task_pacing.resolve_cost_ceiling_usd`` (0 maps to no ceiling, never a $0
-    ceiling). A MALFORMED value (negative / non-numeric / a ``0<v<1`` fraction)
-    maps to None (the 50% default), NOT to 0 — it must not silently disable the
-    stop (see ``_opt_cost_hard_stop_pct``).
+    ``task_pacing.resolve_cost_ceiling`` (typed; 0 maps to the ``disabled``
+    state, never a $0 ceiling; a per-task root cap contributes a second
+    min-component). A MALFORMED value (negative / non-numeric / a ``0<v<1``
+    fraction) maps to None (the 50% default), NOT to 0 — it must not silently
+    disable the stop (see ``_opt_cost_hard_stop_pct``).
     """
     v = value if isinstance(value, Mapping) else {}
     policy = str(v.get("improvement_policy") or "").strip().lower()
@@ -195,10 +196,16 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
 
 
 def _bounded_claim_text(value: Any, limit: int = 600) -> str:
+    """Strip + disclosed truncation ONLY — internal whitespace is preserved.
+
+    This is the read-time binder for acceptance claims (ingress and plan-wave
+    alike); a lossy ``" ".join(split())`` here rewrote exact-output claims
+    (quoted code/expected spacing) between review and binding — the same
+    collapsed-quoted-whitespace class the receipt module bans outright."""
     from ouroboros.utils import truncate_review_artifact
 
-    text = " ".join(str(value or "").split()).strip()
-    return truncate_review_artifact(text, limit=limit).replace("\n", " ")
+    text = str(value or "").strip()
+    return truncate_review_artifact(text, limit=limit)
 
 
 _ANSWER_PROTOCOLS = ("", "final_answer_line")
@@ -280,6 +287,36 @@ def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
             "priority": priority,
         })
     return out
+
+
+def effective_acceptance_claims(
+    task: Mapping[str, Any] | None,
+    closed_plan_wave: Mapping[str, Any] | None = None,
+) -> tuple[list[Dict[str, str]], str]:
+    """The claims that bind a task, with provenance — the ONE seam the
+    acceptance-evidence builder and the child-contract builder both read (W2).
+
+    Ingress-contract claims win (adapter/gateway/parent-authored — already in the
+    built contract); the CLOSED plan wave's frozen claims apply ONLY when ingress
+    is empty. PURE: no I/O and no contract mutation — the running task contract is
+    never rebuilt mid-task; plan-frozen claims live in ``plan_review_state``
+    (``task_results.closed_plan_review_wave``) and are resolved at READ time.
+    Returns ``(claims, source)`` with source ``ingress_contract`` |
+    ``plan_review`` | ``""`` (no claims anywhere)."""
+    task = task if isinstance(task, Mapping) else {}
+    contract = (
+        task.get("task_contract")
+        if isinstance(task.get("task_contract"), Mapping)
+        else task
+    )
+    ingress = normalize_acceptance_claims(contract.get("acceptance_claims"))
+    if ingress:
+        return ingress, "ingress_contract"
+    wave = closed_plan_wave if isinstance(closed_plan_wave, Mapping) else {}
+    plan_claims = normalize_acceptance_claims(wave.get("acceptance_claims"))
+    if plan_claims:
+        return plan_claims, "plan_review"
+    return [], ""
 
 
 def normalize_resource_policy(value: Any) -> Dict[str, Any]:
@@ -404,9 +441,19 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
-        "success_criteria": list(merged.get("success_criteria") or [])
-        if isinstance(merged.get("success_criteria"), list)
-        else [],
+        # (W2) success_criteria is an INPUT ALIAS: it already feeds
+        # normalize_acceptance_claims above when no claims were given, so once
+        # acceptance_claims is populated the raw list is NOT double-persisted —
+        # one concept, one carrier. Historical records keep their stored shape
+        # untouched (no normalizer, v6.78 precedent); readers tolerate both
+        # shapes (the eligibility probe checks both keys).
+        "success_criteria": []
+        if acceptance_claims
+        else (
+            list(merged.get("success_criteria") or [])
+            if isinstance(merged.get("success_criteria"), list)
+            else []
+        ),
         "acceptance_claims": acceptance_claims,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
@@ -462,4 +509,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]

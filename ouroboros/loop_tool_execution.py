@@ -53,6 +53,10 @@ _FAILURE_PREFIXES = (
     "⚠️ ELEVATION_",
     "⚠️ SKILL_STATE_",
     "⚠️ SKILL_REDIRECT_",
+    # The undeclared-outputs nudge: is_error for trace/UI honesty (the ⚠️ is
+    # real), but its typed status is partitioned as a policy denial so it never
+    # degrades execution health ("_UNDECLARED" matches no generic marker).
+    "⚠️ ARTIFACT_OUTPUT_UNDECLARED",
     "⚠️ SKILL_PAYLOAD_ARG_",
     "⚠️ DATA_WRITE_",
     "⚠️ DATA_READ_BLOCKED",
@@ -399,6 +403,8 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
         status = "tool_reported_failure"
     elif text.startswith("⚠️ TOOL_TIMEOUT"):
         status = "timeout"
+    elif text.startswith("⚠️ SHELL_REGEX_AUTO_CORRECTED") and "⚠️ ARTIFACT_OUTPUT_UNDECLARED" in text:
+        status = "artifact_output_undeclared"
     elif text.startswith("⚠️ SHELL_REGEX_AUTO_CORRECTED") and "⚠️ ARTIFACT_OUTPUT_ERROR" in text:
         status = "artifact_output_error"
     elif text.startswith("⚠️ SHELL_REGEX_AUTO_CORRECTED") and "⚠️ SHELL_EXIT_ERROR" not in text:
@@ -460,8 +466,15 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
         # through to the generic `error` and become an execution-health failure,
         # which is the false `tool_failure` headline v6.57.0 removed for writes.
         status = "edit_ops_blocked"
+    elif text.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"):
+        # The undeclared-outputs NUDGE on a SUCCEEDED (exit_code=0) command —
+        # split from the real registration failure below so the policy-denial
+        # partition can absorb it (v6.57.0 class).
+        status = "artifact_output_undeclared"
     elif text.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"):
         status = "artifact_output_error"
+    elif text.startswith("⚠️ USER_FILES_PATH_BLOCKED"):
+        status = "user_files_path_blocked"
     elif text.startswith("⚠️ SAFETY_VIOLATION") or text.startswith("⚠️ CRITICAL SAFETY_VIOLATION"):
         status = "safety_violation"
     elif text.startswith("⚠️ HEAL_MODE_BLOCKED"):

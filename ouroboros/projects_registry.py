@@ -521,7 +521,12 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    allowed = {"name", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at"}
+    allowed = {
+        "name", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
+        # Write-once legacy-activity fact seeded by the boot-reconcile backfill
+        # (_backfill_thread_activity); read by projects_summary's derivation.
+        "thread_activity_seen",
+    }
     with _file_write_lock(_registry_path(drive_root)):
         data = _load(drive_root)
         for entry in data["projects"]:
@@ -663,38 +668,133 @@ def reconcile_projects(drive_root: Any) -> int:
     added = 0
     try:
         projects_root = pathlib.Path(drive_root) / "projects"
-        if not projects_root.is_dir():
-            return 0
-        with _file_write_lock(_registry_path(drive_root)):
-            data = _load(drive_root)
-            known = {p.get("id") for p in data["projects"]}
-            for entry in sorted(projects_root.iterdir()):
-                if not entry.is_dir() or entry.name.startswith("."):
-                    continue
-                pid = sanitize_project_id(entry.name)
-                if not pid or pid in known:
-                    continue
-                data["projects"].append({
-                    "id": pid,
-                    "name": pid,
-                    "chat_id": project_chat_id(pid),
-                    "working_dir": "",
-                    "origin": "reconcile",
-                    "created_at": utc_now_iso(),
-                    "last_active_at": utc_now_iso(),
-                    "lifecycle": PROJECT_ACTIVE,
-                    "routing_generation": 0,
-                    "visible_revision": 0,
-                    "delete_error": "",
-                })
-                known.add(pid)
-                added += 1
-            if added:
-                _save(drive_root, data)
-                log.info("Project registry reconcile: %d store(s) registered", added)
+        if projects_root.is_dir():
+            with _file_write_lock(_registry_path(drive_root)):
+                data = _load(drive_root)
+                known = {p.get("id") for p in data["projects"]}
+                for entry in sorted(projects_root.iterdir()):
+                    if not entry.is_dir() or entry.name.startswith("."):
+                        continue
+                    pid = sanitize_project_id(entry.name)
+                    if not pid or pid in known:
+                        continue
+                    data["projects"].append({
+                        "id": pid,
+                        "name": pid,
+                        "chat_id": project_chat_id(pid),
+                        "working_dir": "",
+                        "origin": "reconcile",
+                        "created_at": utc_now_iso(),
+                        "last_active_at": utc_now_iso(),
+                        "lifecycle": PROJECT_ACTIVE,
+                        "routing_generation": 0,
+                        "visible_revision": 0,
+                        "delete_error": "",
+                    })
+                    known.add(pid)
+                    added += 1
+                if added:
+                    _save(drive_root, data)
+                    log.info("Project registry reconcile: %d store(s) registered", added)
     except Exception:
         log.warning("Project registry reconcile failed", exc_info=True)
+    _backfill_thread_activity(drive_root)
     return added
+
+
+# Drive roots whose legacy thread-activity backfill already ran in this process.
+# The scan is a boot-reconcile concern: once per process per root is enough,
+# because everything AFTER the backfill is covered by the registry-facts
+# derivation in projects_summary (visible_revision/bindings/origin).
+_ACTIVITY_BACKFILL_DONE: set = set()
+
+
+def _backfill_thread_activity(drive_root: Any) -> int:
+    """One-time archive-aware seeding of the durable ``thread_activity_seen`` flag.
+
+    ``projects_summary`` derives thread activity from registry facts alone
+    (origin, bindings, ``visible_revision``) — but a legacy project whose
+    activity predates the ``visible_revision`` counter would read inactive
+    forever. So the boot reconcile scans live + archived chat/progress logs
+    ONCE per process for a row carrying each such project's chat_id, and
+    persists a write-once flag through the registry's own write path
+    (``update_project``). This never runs on the GET path, never removes the
+    flag, and a scan that finds nothing simply leaves the project inactive.
+    The done-marker is set only AFTER a successful scan/write pass, so a
+    transiently failed backfill retries on the next reconcile tick instead of
+    silently waiting for a process restart.
+    """
+    key = str(pathlib.Path(drive_root).resolve(strict=False))
+    if key in _ACTIVITY_BACKFILL_DONE:
+        return 0
+    flagged = 0
+    try:
+        bindings = _load_bindings(drive_root).get("bindings", {})
+        bound_pids = {
+            str(row.get("project_id") or "")
+            for row in bindings.values()
+            if isinstance(row, dict)
+        }
+        candidates: Dict[int, str] = {}
+        with _LOCK:
+            projects = _load(drive_root)["projects"]
+        for project in projects:
+            # update_project persists only ACTIVE rows; deleting/tombstoned
+            # projects keep deriving from origin/bindings/visible_revision.
+            if project.get("lifecycle") != PROJECT_ACTIVE:
+                continue
+            if project.get("thread_activity_seen"):
+                continue
+            pid = str(project.get("id") or "")
+            if (
+                not pid
+                or str(project.get("origin") or "") == "owner_ui"
+                or int(project.get("visible_revision") or 0) > 0
+                or pid in bound_pids
+            ):
+                continue  # already active by derivation — no flag needed
+            try:
+                cid = int(project.get("chat_id") or 0)
+            except (TypeError, ValueError):
+                cid = 0
+            if cid:
+                candidates[cid] = pid
+        if not candidates:
+            _ACTIVITY_BACKFILL_DONE.add(key)
+            return 0
+        logs_dir = pathlib.Path(drive_root) / "logs"
+        archive_dir = pathlib.Path(drive_root) / "archive"
+        paths = [logs_dir / "chat.jsonl", logs_dir / "progress.jsonl"]
+        if archive_dir.is_dir():
+            paths.extend(sorted(archive_dir.glob("chat_*.jsonl"), reverse=True))
+            paths.extend(sorted(archive_dir.glob("progress_*.jsonl"), reverse=True))
+        seen: set = set()
+        for path in paths:
+            if len(seen) == len(candidates):
+                break
+            if not path.is_file():
+                continue
+            try:
+                for row in iter_jsonl_objects(path):
+                    try:
+                        cid = int(row.get("chat_id") or 1)
+                    except (TypeError, ValueError):
+                        continue
+                    if cid in candidates and cid not in seen:
+                        seen.add(cid)
+                        if len(seen) == len(candidates):
+                            break
+            except Exception:
+                log.debug("thread-activity backfill scan failed for %s", path, exc_info=True)
+        for cid in sorted(seen):
+            if update_project(drive_root, candidates[cid], thread_activity_seen=True) is not None:
+                flagged += 1
+        if flagged:
+            log.info("Thread-activity backfill: %d legacy project(s) flagged", flagged)
+        _ACTIVITY_BACKFILL_DONE.add(key)
+    except Exception:
+        log.warning("Thread-activity backfill failed", exc_info=True)
+    return flagged
 
 
 def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) -> str:
@@ -735,35 +835,26 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
     bindings = _load_bindings(drive_root).get("bindings", {})
 
     def _has_thread_activity(project: Dict[str, Any]) -> bool:
+        # Registry-facts derivation ONLY — the GET path never scans logs and
+        # never writes. Micro-delta vs the retired per-request log scan
+        # (disclosed): a project whose thread carries ONLY telemetry rows (no
+        # owner-visible canonical row, no binding) reads inactive until its
+        # first visible row — exactly the junk-row shape this filter exists
+        # to hide. Legacy projects whose activity predates the
+        # visible_revision counter are covered by the write-once
+        # `thread_activity_seen` flag seeded at boot reconcile
+        # (_backfill_thread_activity).
         pid = str(project.get("id") or "")
         # v6.59.0: a project the OWNER explicitly created in the UI is always shown —
         # the activity filter exists to hide junk reconcile rows, not a fresh project
         # the owner just made (which has no chat rows yet by definition).
         if str(project.get("origin") or "") == "owner_ui":
             return True
-        try:
-            cid = int(project.get("chat_id") or 0)
-        except (TypeError, ValueError):
-            cid = 0
         if any(isinstance(row, dict) and row.get("project_id") == pid for row in bindings.values()):
             return True
-        if not cid:
-            return False
-        logs = pathlib.Path(drive_root) / "logs"
-        for rel in ("chat.jsonl", "progress.jsonl"):
-            path = logs / rel
-            if not path.is_file():
-                continue
-            try:
-                for row in iter_jsonl_objects(path):
-                    try:
-                        if int(row.get("chat_id") or 1) == cid:
-                            return True
-                    except (TypeError, ValueError):
-                        continue
-            except Exception:
-                log.debug("project activity scan failed for %s", path, exc_info=True)
-        return False
+        if int(project.get("visible_revision") or 0) > 0:
+            return True
+        return bool(project.get("thread_activity_seen"))
 
     for project in list_sidebar_projects(drive_root)[: max(1, int(limit))]:
         out.append({

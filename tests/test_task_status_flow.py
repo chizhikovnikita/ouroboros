@@ -427,6 +427,192 @@ def test_get_task_result_returns_full_completed_output(tmp_path):
     assert "[BEGIN_SUBTASK_OUTPUT]" in output
 
 
+def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
+    """W2: the FULL single-child handoff (get_task_result/wait_task) shows WHICH
+    checks passed as bounded identity rows — OUTSTANDING first, then newest, hard
+    cap 10, exact omitted count — while the wait_tasks batch projection stays
+    counts-compact.
+
+    The bound must not be able to bury the fact the parent's absorption decision
+    turns on: a child that failed a check early and then produced ten greens for
+    OTHER criteria used to hand up an affirmatively all-green list."""
+    import json as _json
+
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    write_task_result(tmp_path, "abc123", STATUS_COMPLETED, result="done", cost_usd=0.1)
+    for idx in range(12):
+        append_verification_receipt(tmp_path, "abc123", {
+            "status": "pass" if idx else "fail",
+            "check": f"pytest tests/x{idx}.py",
+            "criterion_id": f"claim_{idx}",
+        })
+
+    output = _get_task_result(SimpleNamespace(drive_root=tmp_path), "abc123")
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+
+    rows = summary["verification_receipts"]
+    assert len(rows) == 10                                   # hard cap
+    assert summary["verification_receipts_omitted"] == 2     # disclosed, exact
+    # The still-unreconciled RED is carried FIRST and says why, even though ten
+    # newer greens exist — no green of another criterion clears it.
+    assert rows[0]["criterion_id"] == "claim_0"
+    assert rows[0]["status"] == "fail"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+    # ...the rest of the cap is the newest remaining receipts, and only the OLDEST
+    # greens are the ones left out.
+    assert [row["criterion_id"] for row in rows[1:]] == [
+        f"claim_{idx}" for idx in range(11, 2, -1)
+    ]
+    assert all("outstanding" not in row for row in rows[1:])
+    assert "check" in rows[0] and "reconciliation_identity" in rows[0]
+
+    # A red that a LATER green for the same criterion reconciles is not carried:
+    # the rule is the shared unreconciled-set SSOT, not "always float failures".
+    write_task_result(tmp_path, "closed", STATUS_COMPLETED, result="done", cost_usd=0.1)
+    append_verification_receipt(tmp_path, "closed", {
+        "status": "fail", "check": "pytest tests/a.py", "criterion_id": "claim_a",
+    })
+    for idx in range(11):
+        append_verification_receipt(tmp_path, "closed", {
+            "status": "pass", "check": "pytest tests/a.py", "criterion_id": "claim_a"
+            if idx == 0 else f"claim_b{idx}",
+        })
+    closed = _json.loads(
+        _get_task_result(SimpleNamespace(drive_root=tmp_path), "closed")
+        .split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    assert all("outstanding" not in row for row in closed["verification_receipts"])
+    assert closed["verification_receipts"][0]["criterion_id"] == "claim_b10"
+    # No receipts -> no rows key at all (the wave1 zero-receipt shape stays visible
+    # through the ledger counts, not an empty list).
+    write_task_result(tmp_path, "noreceipts", STATUS_COMPLETED, result="done")
+    bare = _get_task_result(SimpleNamespace(drive_root=tmp_path), "noreceipts")
+    assert "verification_receipts_omitted" not in bare
+
+
+def _receipt_rows_of(output):
+    import json as _json
+
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    return summary.get("verification_receipts")
+
+
+def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
+    """S3 seam (a): every real schedule_subagent child runs memory_mode forked|empty
+    on an ISOLATED drive, so verify_and_record writes its receipts under the CHILD
+    drive while the parent-side W2 reader resolves them against the canonical root.
+    Child finalization (headless.copy_child_task_result) must publish
+    verification_receipts.jsonl to the canonical root alongside the artifact rebase
+    — WITHOUT any parent read in between (the opportunistic effective-read artifact
+    sync must not be the only carrier: it dies with the child drive, which the
+    cancel path and the startup prune both delete)."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childsplit"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert child_drive == tmp_path / "state" / "headless_tasks" / tid / "data"
+
+    # Parent-side scheduled record (the shape schedule_subagent writes); the child
+    # self-finalizes and records receipts ONLY on its isolated drive.
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="child split done", cost_usd=0.2)
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/green.py", "criterion_id": "claim_green",
+    })
+    assert read_verification_receipts(tmp_path, tid) == []
+
+    # Finalization copy-back publishes the receipts file to the canonical root
+    # (no parent-side read has happened yet — the publish alone must carry them).
+    copied = copy_child_task_result(tmp_path, {"id": tid, "drive_root": str(child_drive)})
+    assert copied is not None
+    canonical = read_verification_receipts(tmp_path, tid)
+    assert [r["criterion_id"] for r in canonical] == ["claim_red", "claim_green"]
+
+    # Durability: the receipts survive child-drive pruning (retention GC / the
+    # cancel path delete the drive; the canonical copy is the durable record).
+    import shutil as _shutil
+
+    _shutil.rmtree(child_drive)
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 2
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+
+
+def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
+    """S3 seam (a) re-entry: copy_child_task_result runs more than once per child
+    (task_done + reaper/cancel re-checks). The publish is a whole-file refresh of
+    the append-only child store — newer child receipts land, nothing duplicates."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+
+    tid = "childagain"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="done")
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    task = {"id": tid, "drive_root": str(child_drive)}
+    copy_child_task_result(tmp_path, task)
+    copy_child_task_result(tmp_path, task)  # re-entry: no duplication
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == ["claim_red"]
+
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    copy_child_task_result(tmp_path, task)
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == [
+        "claim_red", "claim_red",
+    ]
+
+
+def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
+    """S3 seam (b): before ANY canonical copy exists (child still running, or
+    self-finalized but the supervisor copy-back / effective-read sync has not
+    landed), _get_task_result falls back to the child drive recorded on the
+    result, so the W2 rows are never silently absent in the window the parent
+    most often absorbs the child in."""
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childlive"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    # The child has recorded receipts but NO result yet (still running): nothing
+    # exists canonically and the effective read has no child result to sync from.
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    assert read_verification_receipts(tmp_path, tid) == []
+
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 1
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+
+
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
     from ouroboros.tools.control import _get_task_result
@@ -577,6 +763,219 @@ def test_wait_for_tasks_rejected_duplicate_carries_duplicate_of(tmp_path):
     assert dupe["status"] == STATUS_REJECTED_DUPLICATE
     assert dupe["duplicate_of"] == "original123"
     assert "cost_usd" in dupe
+
+
+# --- v6.91 wait terminality: cancel_requested is a latch, not a settled record
+
+
+def test_wait_for_effective_tasks_keeps_polling_cancel_requested(tmp_path):
+    """The cancel-INTENT latch is not settled: the worker may still be exiting
+    and the supervisor finalizes to `cancelled` shortly after. Returning
+    "completed after 0.0s" here (pre-v6.91 FINAL_STATUSES) disagreed with the
+    acceptance fence's SETTLED_STATUSES quiescence and looped the parent on the
+    gap (wave3's $1.64 endgame loop). The wait stays bounded by its timeout."""
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, write_task_result
+    from ouroboros.task_status import wait_for_effective_tasks
+
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is False
+    assert waited["timed_out"] is True
+    # The latch is reported as ITSELF — a known live state, never terminal/unknown.
+    assert waited["live_child_status"]["cancelling1"] == STATUS_CANCEL_REQUESTED
+
+    # Once the supervisor settles it, the same wait completes normally.
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCELLED, result="cancelled")
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is True
+
+
+def test_wait_task_does_not_claim_completion_on_cancel_requested(tmp_path):
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    write_task_result(tmp_path, "cancelling2", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    output = _wait_for_task(SimpleNamespace(drive_root=tmp_path), "cancelling2", timeout_sec=0)
+    assert output.startswith("Task wait timed out")
+    assert not output.startswith("Task wait completed")
+
+
+# --- v6.91 wait_tasks typed unknown ids + children roster ---------------------
+
+
+def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path):
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    # A READABLE queue snapshot that does not know the phantom: a MISSING
+    # snapshot fail-softs to "known" (never brand a real child unknown on an
+    # unreadable surface), so the unknown verdict needs all surfaces present.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    write_task_result(
+        tmp_path,
+        "realchild1",
+        STATUS_COMPLETED,
+        result="real child finished",
+        cost_usd=0.55,
+        parent_task_id="waitparent1",
+        root_task_id="waitparent1",
+        delegation_role="subagent",
+    )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent1",
+        task_metadata={"root_task_id": "waitparent1"},
+    )
+    payload = json.loads(_wait_for_tasks(ctx, ["realchild1", "phantomid9"], timeout_sec=0))
+
+    # The phantom id gets a TYPED marker row, not a silent empty projection.
+    phantom = payload["tasks"]["phantomid9"]
+    assert phantom["unknown_task_id"] is True
+    assert "not yet registered or never scheduled" in phantom["note"]
+    assert payload["unknown_task_ids"] == ["phantomid9"]
+
+    # The real child still projects the normal compact row.
+    real = payload["tasks"]["realchild1"]
+    assert real["status"] == STATUS_COMPLETED
+    assert "unknown_task_id" not in real
+
+    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
+    # only — no result/trace envelope fields, absent accounting projects null.
+    roster = payload["children_roster"]
+    assert [row["task_id"] for row in roster] == ["realchild1"]
+    assert set(roster[0]) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+    assert roster[0]["cost_usd"] == 0.55
+    # Nothing was capped away, and the projection SAYS so (BIBLE P1).
+    assert payload["children_roster_omitted"] == 0
+
+
+def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
+    """A parent with MORE direct children than the roster cap: the repair surface
+    stays bounded, but the bound is disclosed — `children_roster_omitted` carries
+    the exact count of real children the cap hid. A silent [:30] here could hide
+    the very replacement id wait_tasks' unknown-id repair exists to surface."""
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _children_roster_projection
+
+    total = 33
+    for idx in range(total):
+        write_task_result(
+            tmp_path,
+            f"bigchild{idx:03d}",
+            STATUS_COMPLETED,
+            result=f"child {idx} finished",
+            parent_task_id="bigparent1",
+            root_task_id="bigparent1",
+            delegation_role="subagent",
+        )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="bigparent1",
+        task_metadata={"root_task_id": "bigparent1"},
+    )
+    projected = _children_roster_projection(ctx, tmp_path)
+    roster = projected["children_roster"]
+    assert len(roster) == 30  # the cap holds — the surface stays compact
+    assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
+    assert all(
+        set(row) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+        for row in roster
+    )
+
+
+def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):
+    """A wait set in which NOTHING was ever minted ends after the registration
+    grace instead of blocking the whole requested window — and says so."""
+    import json as _json
+
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent3", task_metadata={})
+    started = time.monotonic()
+    payload = json.loads(control._wait_for_tasks(ctx, ["phantomid7", "phantomid8"], timeout_sec=600))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, "phantom-only wait must not block for the requested window"
+    short = payload["wait_short_circuited"]
+    assert short["reason"] == "all_task_ids_unminted"
+    assert short["requested_timeout_sec"] == 600.0
+    assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+
+
+def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
+    """The grace is for the registration race: an id that becomes real during it
+    is a genuine child, so the wait resumes with the remaining window."""
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    real_calls = {"n": 0}
+    original = control._unminted_wait_ids
+
+    def _mint_after_grace(ctx, drive_root, task_ids):
+        real_calls["n"] += 1
+        if real_calls["n"] > 1:
+            # The child registered during the grace window.
+            write_task_result(
+                tmp_path, "latechild1", STATUS_COMPLETED, result="registered late",
+                parent_task_id="waitparent4", root_task_id="waitparent4",
+                delegation_role="subagent",
+            )
+        return original(ctx, drive_root, task_ids)
+
+    monkeypatch.setattr(control, "_unminted_wait_ids", _mint_after_grace)
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent4", task_metadata={})
+    payload = json.loads(control._wait_for_tasks(ctx, ["latechild1"], timeout_sec=5))
+
+    assert "wait_short_circuited" not in payload
+    assert payload["timeout_sec"] == 5.0
+    assert payload["tasks"]["latechild1"]["status"] == STATUS_COMPLETED
+
+
+def test_wait_for_tasks_queue_scheduled_id_is_not_unknown(tmp_path):
+    """An id with a queue-snapshot row but no task result yet is a REAL child
+    (just-scheduled), never a phantom — and without unknowns the roster is not
+    attached (the compact batch stays compact, v6.71.2)."""
+    import json as _json
+
+    from ouroboros.tools.control import _wait_for_tasks
+
+    snapshot = {"pending": [{"id": "queuedonly1", "task": {}}], "running": []}
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(_json.dumps(snapshot), encoding="utf-8")
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent2", task_metadata={})
+    payload = json.loads(_wait_for_tasks(ctx, ["queuedonly1"], timeout_sec=0))
+
+    assert "unknown_task_ids" not in payload
+    assert "children_roster" not in payload
+    assert "unknown_task_id" not in payload["tasks"]["queuedonly1"]
 
 
 def test_recent_tasks_includes_outcome_contract_and_ledger(tmp_path):

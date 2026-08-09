@@ -101,6 +101,44 @@ def test_non_json_refuses_typed():
         parse_reviewer_slots("{nope")
 
 
+# ---------------------------------------------------------------------------
+# reviewer_slot_config_error (#116): the loud-check facade for plan/skill review.
+# ---------------------------------------------------------------------------
+
+
+def test_config_error_is_empty_on_absent_valid_and_legacy_only(monkeypatch):
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    assert reviewer_slot_config_error() == ""
+    _set_structured(monkeypatch)
+    assert reviewer_slot_config_error() == ""
+    # Legacy-only configs (bench constraint: benches configure ONLY the comma
+    # keys — including deliberate single-reviewer duplicates) must never trip
+    # this check: the facade reads the STRUCTURED raw value alone. Even a
+    # broken legacy route env stays out of scope here (it refuses typed on its
+    # own consumers instead).
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one,m/one")
+    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "m/scope")
+    assert reviewer_slot_config_error() == ""
+    monkeypatch.setenv("OUROBOROS_REVIEW_ROUTES", "carrier-pigeon")
+    assert reviewer_slot_config_error() == ""
+
+
+def test_config_error_reports_row_precise_text(monkeypatch):
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+
+    monkeypatch.setenv(REVIEWER_SLOTS_ENV, "{broken")
+    assert "not valid JSON" in reviewer_slot_config_error()
+    monkeypatch.setenv(
+        REVIEWER_SLOTS_ENV,
+        json.dumps({"triad": [], "scope": [], "advisory": None}),
+    )
+    assert "triad needs at least one slot" in reviewer_slot_config_error()
+
+
 def test_api_rows_keep_the_existing_provider_tagged_spelling():
     """`provider::model` is the EXISTING direct-routing spelling for API model
     ids; the owner's no-'::' directive is about harness routes only."""
@@ -638,3 +676,30 @@ def test_runner_facts_carry_the_applied_receipt_fields():
     source = inspect.getsource(review_execution.run_delegated_review_session)
     assert '"applied_profile"' in source and "authRoute" in source
     assert '"applied_access"' in source and "effectiveAccess" in source
+
+
+def test_malformed_advisory_route_raises_typed_not_attributeerror(monkeypatch):
+    """A non-dict advisory route must be a ValueError, not an AttributeError.
+
+    The commit gate's fail-closed branch and reviewer_slot_config_error's
+    callers all treat this parser as the TYPED authority and catch ValueError
+    only; `(raw.get("route") or {}).get(...)` let a string/list route raise
+    AttributeError straight through those handlers.
+    """
+    from ouroboros import reviewer_slot_config as rsc
+
+    base_rows = {
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "m"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "m"}}],
+    }
+    for bad_route in ("notadict", [1, 2], 7):
+        raw = json.dumps({**base_rows, "advisory": {"route": bad_route}})
+        with pytest.raises(ValueError, match="advisory route must be an object"):
+            rsc.parse_reviewer_slots(raw)
+        monkeypatch.setenv(rsc.REVIEWER_SLOTS_ENV, raw)
+        assert "advisory route must be an object" in rsc.reviewer_slot_config_error()
+
+    good = json.dumps({**base_rows, "advisory": {"route": {"kind": "agent_session", "target_id": "codex"}}})
+    monkeypatch.setenv(rsc.REVIEWER_SLOTS_ENV, good)
+    assert rsc.reviewer_slot_config_error() == ""
+    assert rsc.parse_reviewer_slots(good).advisory.target_id == "codex"

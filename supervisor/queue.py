@@ -1380,14 +1380,21 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     return tid
 
 
-def get_evolution_status_snapshot() -> Dict[str, Any]:
-    """Return a non-mutating evolution scheduling snapshot."""
+def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a non-mutating evolution scheduling snapshot.
+
+    ``budget_projection``: optional pre-computed global usage projection from a
+    caller that already replayed the ledger this request (``/api/state``), so the
+    snapshot does not replay it again. Default ``None`` keeps the self-computing,
+    strict fail-closed behavior — a caller whose own computation FAILED must pass
+    nothing, so the paused-evolution disclosure still comes from this snapshot.
+    """
     st = load_state()
     enabled = bool(st.get("evolution_mode_enabled"))
     owner_chat_id = int(st.get("owner_chat_id") or 0)
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     try:
-        remaining: Optional[float] = round(float(budget_remaining(st, strict=True)), 2)
+        remaining: Optional[float] = round(float(budget_remaining(st, strict=True, projection=budget_projection)), 2)
         accounting_available = True
     except Exception:
         remaining = None

@@ -636,6 +636,10 @@ def test_chat_anthropic_sends_tool_cache_control_without_ttl(monkeypatch):
     from types import SimpleNamespace
     import requests
 
+    # Pinned under the explicit 'default' global TTL: this golden is about the
+    # finalizer's marker placement, not the global-override stamping (which has
+    # its own goldens in test_review_prompt_caching.py).
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
     captured = {}
     fake_response = SimpleNamespace(

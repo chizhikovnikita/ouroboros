@@ -82,12 +82,12 @@ def test_prepare_onboarding_settings_preserves_existing_auto_grant_choice():
     ("TOTAL_BUDGET", -1, "Budget must be greater than zero."),
     ("TOTAL_BUDGET", 0.005, "Budget must be at least 0.01."),
     ("TOTAL_BUDGET", "nan", "Budget must be a number."),
-    ("OUROBOROS_PER_TASK_COST_USD", 0, "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", "0", "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", -1, "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", 0.005, "Per-task soft threshold must be at least 0.01."),
-    ("OUROBOROS_PER_TASK_COST_USD", "nan", "Per-task soft threshold must be a number."),
-    ("OUROBOROS_PER_TASK_COST_USD", False, "Per-task soft threshold must be a number."),
+    ("OUROBOROS_PER_TASK_COST_USD", 0, "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", "0", "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", -1, "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", 0.005, "Per-task cost cap must be at least 0.01."),
+    ("OUROBOROS_PER_TASK_COST_USD", "nan", "Per-task cost cap must be a number."),
+    ("OUROBOROS_PER_TASK_COST_USD", False, "Per-task cost cap must be a number."),
 ])
 def test_prepare_onboarding_settings_rejects_invalid_budget_values(key, value, error):
     payload = _base_payload()
@@ -619,3 +619,77 @@ def test_launcher_binds_the_settings_writer_the_wizard_callback_calls():
     assert callable(getattr(launcher, "save_settings", None))
     source = pathlib.Path(launcher.__file__).read_text(encoding="utf-8")
     assert "onboarding_safety_default=wizard_authors_safety" in source
+
+
+def test_wizard_rejects_a_newly_typed_short_key():
+    """The length check still guards a credential the owner actually authored."""
+    payload = _base_payload()
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+    payload["OPENAI_COMPATIBLE_API_KEY"] = "ollama"
+
+    prepared, error = prepare_onboarding_settings(payload, {})
+
+    assert prepared == {}
+    assert error == "OpenAI-compatible API key looks too short."
+
+
+def test_wizard_is_not_deadlocked_by_a_short_key_already_on_disk():
+    """A stored too-short key must not veto the save that replaces it.
+
+    build_initial_setup_state prefills every provider field from disk, so an
+    untouched field posts the stored value back. Rejecting it discards the WHOLE
+    payload — including the replacement typed in the same form — which makes the
+    offending value the one value the wizard can never overwrite.
+
+    The stored fixture deliberately carries ONLY the short key: a stored
+    OPENAI_COMPATIBLE_BASE_URL would make has_startup_ready_provider() true and
+    the wizard would never open for this install in the first place.
+    """
+    stored = {
+        "OPENAI_COMPATIBLE_API_KEY": "ollama",
+    }
+
+    # 1. An unrelated change saves even though the short key rides along untouched.
+    payload = _base_payload()
+    payload["OPENAI_COMPATIBLE_API_KEY"] = "ollama"
+    payload["OPENAI_COMPATIBLE_BASE_URL"] = "http://127.0.0.1:4000/v1"
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    assert prepared["OPENAI_COMPATIBLE_API_KEY"] == "ollama"
+
+    # 2. The owner can replace the short key with a real one.
+    payload["OPENAI_COMPATIBLE_API_KEY"] = "sk-replacement-key-1234"
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    assert prepared["OPENAI_COMPATIBLE_API_KEY"] == "sk-replacement-key-1234"
+
+
+def test_wizard_still_rejects_shortening_a_stored_key():
+    """Editing a stored key DOWN to a too-short value is authorship, not a prefill."""
+    stored = {"OPENAI_API_KEY": "sk-openai-1234567890"}
+    payload = _base_payload()
+    payload["OPENAI_API_KEY"] = "sk-short"
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert prepared == {}
+    assert error == "OpenAI API key looks too short."
+
+
+def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check():
+    """The client-side mirror of the length check carries the same authorship rule.
+
+    validateProvidersStep() runs the identical <10 rule against state prefilled
+    from disk and blocks Next/Save BEFORE the payload reaches the server, so the
+    server-side exemption alone leaves the wizard deadlocked. The JS must skip
+    the length check for a value equal to its INITIAL_STATE prefill — and only
+    for that value, so a newly typed short key is still rejected client-side.
+    """
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+
+    assert "value.length < 10 && value !== trim(INITIAL_STATE[field.stateKey])" in source

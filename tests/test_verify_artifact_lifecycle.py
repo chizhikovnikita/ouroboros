@@ -234,3 +234,36 @@ def test_acceptance_support_refs_disclose_bounded_claim_text(tmp_path):
     refs = _accept_claim_support_refs(contract, [])
     assert "OMISSION NOTE" in refs[0]["claim"]
     assert "OMISSION NOTE" in refs[0]["support_expected"]
+
+
+# --- submarine unwind (2026-08-08): observable roots derive from the _POLICY matrix
+
+def test_observe_artifacts_accepts_artifact_store_path(tmp_path):
+    """wave3 r24: the agent registered a screenshot into artifact_store and
+    verify_and_record REFUSED the very same path (private root list). The
+    observable roots now derive from the Tool API matrix — anything the profile
+    can already read_file it can also existence-observe."""
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.tools.verify import _observe_artifacts
+
+    ctx, _work = _ctx(tmp_path)
+    art = task_artifact_dir_path(ctx.drive_root, "t", create=True)
+    shot = art / "shot.png"
+    shot.write_bytes(b"png-bytes")
+
+    status, detail = _observe_artifacts(ctx, [str(shot)])
+    assert status == "observed", detail
+
+
+def test_observe_artifacts_still_refuses_control_plane(tmp_path):
+    """The anti-cheat boundary is unchanged: runtime_data/system-repo state files
+    outside the sanctioned observation roots stay refused."""
+    from ouroboros.tools.verify import _observe_artifacts
+
+    ctx, _work = _ctx(tmp_path)
+    secret = ctx.drive_root / "state" / "state.json"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("{}", encoding="utf-8")
+
+    status, detail = _observe_artifacts(ctx, [str(secret)])
+    assert status == "refused_out_of_scope", (status, detail)

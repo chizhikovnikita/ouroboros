@@ -6,6 +6,7 @@
 // overwrite a direct toggle (supervisor/queue.py) — control those via the skill itself.
 
 import { apiFetch, cancelTask } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import { showToast } from './toast.js';
 
 function esc(value) {
@@ -142,7 +143,14 @@ export function initActivity({ mount, ws } = {}) {
                 // Same declared semantics as the chat card's "Cancel run" (v6.82):
                 // the task AND its live subtree, so cancelling an orchestrator here
                 // never orphans its running subagents.
-                if (!window.confirm('Cancel this task and all its subagents?')) return;
+                const confirmedCancel = await openConfirmDialog({
+                    title: 'Cancel task',
+                    body: 'Cancel this task and all its subagents?',
+                    confirmLabel: 'Cancel task',
+                    cancelLabel: 'Keep running',
+                    danger: true,
+                });
+                if (!confirmedCancel) return;
                 // The endpoint answers only once the teardown is done, so a
                 // successful response means the subtree really is cancelled; a
                 // refusal throws and is surfaced below.
@@ -150,7 +158,13 @@ export function initActivity({ mount, ws } = {}) {
                 // below already sees terminal state — no settling delay needed.
                 await cancelTask(id, { cascade: true });
             } else if (act === 'schedule-delete') {
-                if (!window.confirm('Delete this schedule?')) return;
+                const confirmedDelete = await openConfirmDialog({
+                    title: 'Delete schedule',
+                    body: 'Delete this schedule?',
+                    confirmLabel: 'Delete',
+                    danger: true,
+                });
+                if (!confirmedDelete) return;
                 await apiFetch(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
             } else if (act === 'schedule-toggle') {
                 // Read-modify-write the FULL record (upsert replaces by id; never drop

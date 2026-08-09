@@ -28,6 +28,16 @@ from ouroboros.projects_registry import (
     project_binding_for_task,
 )
 
+
+@pytest.fixture(autouse=True)
+def _isolated_projects_root(tmp_path_factory, monkeypatch):
+    """Q10=A auto-provisions a genesis workspace for file-less project promotes;
+    keep it out of the real ~/Ouroboros/projects."""
+    monkeypatch.setenv(
+        "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
+        str(tmp_path_factory.mktemp("projects_root")),
+    )
+
 OWNER_TEXT = "сделай мне детализированную 3d игру про робота"
 
 

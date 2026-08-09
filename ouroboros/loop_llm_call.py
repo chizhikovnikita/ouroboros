@@ -604,9 +604,16 @@ def _normalize_usage_cost(
             display_model,
             int(usage.get("prompt_tokens") or 0),
             int(usage.get("completion_tokens") or 0),
-            int(usage.get("cached_tokens") or 0),
-            int(usage.get("cache_write_tokens") or 0),
-            usage.get("prompt_cache_ttl"),
+            cache_usage={
+                "cached_tokens": int(usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+                "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
+                "cache_write_tokens_by_ttl": (
+                    usage.get("cache_write_tokens_by_ttl")
+                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
+                    else None
+                ),
+            },
             provider=provider,
         )
     usage["cost"] = cost
@@ -759,6 +766,43 @@ def _context_fit_event_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
         "estimated_prompt_tokens": int(usage.get("_context_prompt_estimate") or 0),
         "context_fit_mode": str(usage.get("_context_fit_mode") or ""),
     }
+
+
+def _record_round_cache_facts(
+    accumulated_usage: Dict[str, Any],
+    usage: Dict[str, Any],
+    *,
+    round_idx: int,
+) -> tuple:
+    """Cold-restart telemetry — FACTS of this round only (no dollar counterfactuals).
+
+    Returns ``(prompt_cache_ttl, cache_hit_rate, cache_cold_restart,
+    gap_since_prev_round_sec)``: a later round whose prompt was almost entirely
+    re-written is a provider-cache expiry/invalidation made structurally visible,
+    and the gap since the previous successful round is the datum that separates a
+    TTL expiry (long wait) from a prefix rewrite. Also records the APPLIED TTL of
+    this task's latest send — the recorded fact the wait-tool cache-horizon
+    disclosure reads (one place, never re-derived).
+    """
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    cached_tokens = int(usage.get("cached_tokens") or 0)
+    cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
+    prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
+    cache_hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens > 0 else 0.0
+    prev_finished = accumulated_usage.get("_last_llm_round_finished_monotonic")
+    gap_since_prev_round_sec = (
+        round(max(0.0, time.monotonic() - float(prev_finished)), 1)
+        if isinstance(prev_finished, (int, float)) else None
+    )
+    cache_cold_restart = bool(
+        round_idx > 1
+        and prompt_tokens > 0
+        and cached_tokens < 0.2 * prompt_tokens
+        and cache_write_tokens > 0.5 * prompt_tokens
+    )
+    accumulated_usage["_last_llm_round_finished_monotonic"] = time.monotonic()
+    accumulated_usage["_last_prompt_cache_ttl"] = prompt_cache_ttl
+    return prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec
 
 
 def call_llm_with_retry(
@@ -969,8 +1013,8 @@ def call_llm_with_retry(
             completion_tokens = int(usage.get("completion_tokens") or 0)
             cached_tokens = int(usage.get("cached_tokens") or 0)
             cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
-            prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
-            cache_hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens > 0 else 0.0
+            prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec = (
+                _record_round_cache_facts(accumulated_usage, usage, round_idx=round_idx))
             _round_event = {
                 "ts": utc_now_iso(), "type": "llm_round",
                 "task_id": task_id,
@@ -988,6 +1032,8 @@ def call_llm_with_retry(
                 "cache_write_tokens": cache_write_tokens,
                 "prompt_cache_ttl": prompt_cache_ttl,
                 "cache_hit_rate": cache_hit_rate,
+                "cache_cold_restart": cache_cold_restart,
+                "gap_since_prev_round_sec": gap_since_prev_round_sec,
                 "cost_usd": cost,
                 **_context_fit_event_fields(accumulated_usage),
                 "request_ref": request_ref.get("manifest_ref") if request_ref else None,

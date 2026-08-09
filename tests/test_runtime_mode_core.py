@@ -801,6 +801,62 @@ def test_run_shell_blocks_shell_wrapped_git_mutation(cmd, tmp_path, monkeypatch)
     assert "GIT_VIA_SHELL_BLOCKED" in result
 
 
+def _outside_runtime_registry(tmp_path, monkeypatch):
+    """Registry whose repo/data/user-files roots are DISJOINT, so an out-of-runtime
+    git target is actually outside every protected root (repo_dir == drive_root ==
+    tmp_path in _registry makes everything runtime-contained)."""
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    repo = tmp_path / "repo"; repo.mkdir()
+    data = tmp_path / "data"; data.mkdir()
+    home = tmp_path / "home"; (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    return ToolRegistry(repo_dir=repo, drive_root=data), repo, home
+
+
+@pytest.mark.parametrize("runtime_mode", ["light", "advanced"])
+def test_default_lane_allows_mutating_git_outside_runtime(runtime_mode, tmp_path, monkeypatch):
+    """Q4=A sandbox unwind: the default (non-workspace) lane is TARGET-aware in
+    every runtime mode — `git init` in a user tree is legitimate task work."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", runtime_mode)
+    reg, _repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute("run_command", {"cmd": ["git", "init"], "cwd": str(home / "proj")})
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+    assert "WORKSPACE_GIT_BLOCKED" not in result
+
+
+def test_default_lane_blocks_mutating_git_targeting_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute(
+        "run_command",
+        {"cmd": ["git", "-C", str(repo), "commit", "-m", "x"], "cwd": str(home)},
+    )
+    assert "GIT_VIA_SHELL_BLOCKED" in result
+    assert "commit_reviewed" in result
+
+
+def test_default_lane_allows_readonly_git_at_runtime_cwd(tmp_path, monkeypatch):
+    """Read-only git stays allowed even at the system-repo cwd (v4.5.1 line)."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, _repo, _home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute("run_command", {"cmd": ["git", "status"]})
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+
+
+def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypatch):
+    """The default lane's DEFAULT cwd is the system repo; `git -C <outside>` must
+    be judged by its effective (-C) target, not the shell cwd, or the flip
+    re-creates the false-block class it removes."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, _repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute(
+        "run_command",
+        {"cmd": ["git", "-C", str(home / "proj"), "init"]},  # no cwd -> repo default
+    )
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+    assert "WORKSPACE_GIT_BLOCKED" not in result
+
+
 def test_advanced_mode_blocks_runshell_protected_python_writer(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)

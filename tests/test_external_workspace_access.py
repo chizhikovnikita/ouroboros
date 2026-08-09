@@ -253,3 +253,36 @@ def test_external_shell_read_blocks_relative_and_symlink_traversal(tmp_path):
     # A legitimate relative read inside the workspace stays allowed.
     (workspace / "ok.txt").write_text("x", encoding="utf-8")
     assert reg._run_shell_safety_check({"cmd": ["cat", "ok.txt"], "cwd": str(workspace)}, "advanced") is None
+
+
+def test_readonly_git_exemption_does_not_open_a_runtime_write_or_secret_read(tmp_path):
+    """The runtime/secret READ guard exempts commands proven read-only git in every
+    segment. Two git flag families are NOT read-only however read-only the
+    subcommand looks, and both were measured against real git: `--output=<file>`
+    (log/show/diff) TRUNCATES the file, and `--no-index` (diff/grep) prints ANY host
+    file. Riding the exemption, they let an external-workspace task overwrite
+    settings.json and read the credentials the guard exists to protect."""
+    system = tmp_path / "system"
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    for p in (system, workspace, data):
+        p.mkdir()
+    (data / "settings.json").write_text('{"OPENROUTER_API_KEY": "sk-secret"}', encoding="utf-8")
+    reg = ToolRegistry(repo_dir=system, drive_root=data)
+    reg.set_context(ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, workspace_mode="external"))
+
+    def _check(cmd):
+        return reg._run_shell_safety_check({"cmd": cmd, "cwd": str(workspace)}, "advanced") or ""
+
+    # WRITE via the diff `--output` option — glued, split, and through `-C`.
+    assert _check(["git", "log", f"--output={data / 'settings.json'}"])
+    assert _check(["git", "diff", "--output", str(system / "BIBLE.md")])
+    assert _check(["git", "-C", "/tmp", "show", f"--output={data / 'logs' / 'chat.jsonl'}"])
+    # READ of the credential file through `--no-index`.
+    assert _check(["git", "diff", "--no-index", "/dev/null", str(data / "settings.json")])
+    # The exemption itself must survive: read-only git AT a runtime target, and an
+    # `--output` that lands in host scratch, both stay allowed.
+    assert _check(["git", "-C", str(system), "status"]) == ""
+    assert _check(["git", "--git-dir", str(system / ".git"), "log"]) == ""
+    assert _check(["git", "log", "--output=/tmp/history.txt"]) == ""
+    assert _check(["git", "diff", "--no-index", "/tmp/a", "/tmp/b"]) == ""

@@ -33,7 +33,10 @@ def _codebase_health(ctx: ToolContext) -> str:
                 f"**Dropped files due review budget:** {stats['dropped']}"
                 + (f" ({preview}{' ...' if len(dropped_paths) > 5 else ''})" if preview else "")
             )
-        lines.append(f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python)")
+        lines.append(
+            f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python, "
+            f"{metrics.get('js_files', 0)} gated JS)"
+        )
         lines.append(f"**Total lines:** {metrics['total_lines']:,}")
         lines.append(f"**Functions:** {metrics['total_functions']}")
         lines.append(f"**Avg function length:** {metrics['avg_function_length']} lines")

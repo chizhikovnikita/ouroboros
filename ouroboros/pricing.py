@@ -100,12 +100,37 @@ def get_pricing(
         return dict(rows)
 
 
-def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int,
-                           cached_tokens: int = 0, cache_write_tokens: int = 0,
-                           prompt_cache_ttl: Optional[str] = None,
+def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int, *,
+                           cache_usage: Optional[Dict[str, Any]] = None,
                            allow_live_fetch: bool = True,
                            provider: Optional[str] = None) -> Optional[float]:
-    """Estimate cost from exact provider/model data, preserving unknown as None."""
+    """Estimate cost from exact provider/model data, preserving unknown as None.
+
+    ``cache_usage`` and everything after it are KEYWORD-ONLY: the 4th slot used
+    to be a positional ``cached_tokens: int``, and a stale positional caller
+    would otherwise be silently coerced through the isinstance guard to ``{}``,
+    dropping cache accounting invisibly. Keyword-only makes such a caller a
+    loud ``TypeError`` instead.
+
+    ``cache_usage`` folds the prompt-cache facts into one mapping (the <8-parameter
+    contract; keys are the usage-row field names, all optional):
+
+    - ``cached_tokens``: prompt tokens served from cache (read tier).
+    - ``cache_write_tokens``: prompt tokens written to cache this call.
+    - ``prompt_cache_ttl``: the requested write tier (``"5m"``/``"1h"``).
+    - ``cache_write_tokens_by_ttl``: Anthropic's per-tier write split
+      (``usage.cache_creation`` → ``{"5m": n, "1h": n}``), harvested when the
+      provider reports it: on a ``1h`` request whose payload also produced 5m
+      writes (e.g. a server-tool block cached at the default tier beside the 1h
+      prefix) only the genuine 1h share bills the extended-tier ratio. Absent the
+      split, every write bills the reported tier — the pre-split behavior, never
+      a loosened ratio.
+    """
+    cache_row = cache_usage if isinstance(cache_usage, dict) else {}
+    cached_tokens = int(cache_row.get("cached_tokens") or 0)
+    cache_write_tokens = int(cache_row.get("cache_write_tokens") or 0)
+    prompt_cache_ttl = cache_row.get("prompt_cache_ttl")
+    cache_write_tokens_by_ttl = cache_row.get("cache_write_tokens_by_ttl")
     raw_model = str(model or "").strip()
     normalized = normalize_model_identity(raw_model)
     route = str(provider or provider_for_model(raw_model) or "openrouter").strip().lower()
@@ -125,22 +150,33 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
     cached_price = float(pricing[1]) if pricing[1] is not None else None
     write_price = float(pricing[2]) if pricing[2] is not None else None
     output_price = float(pricing[3])
+    extended_write_tokens = 0
     if write_price is not None and str(prompt_cache_ttl or "") == "1h":
         # Provider catalogs carry the DEFAULT (5m) cache-write price. Anthropic's
         # extended 1h tier bills cache writes at 2x base input versus 1.25x for
         # 5m — a documented tier RATIO, not a hand-maintained tariff — so scale
         # the catalog write price accordingly (estimates/reservations only;
         # settlement always prefers provider-reported cost).
-        write_price *= 2.0 / 1.25
+        extended_write_tokens = max(0, int(cache_write_tokens or 0))
+        if isinstance(cache_write_tokens_by_ttl, dict):
+            try:
+                reported_1h = int(cache_write_tokens_by_ttl.get("1h") or 0)
+            except (TypeError, ValueError):
+                reported_1h = extended_write_tokens
+            # Clamp into the reported total: a malformed split never bills MORE
+            # extended-tier tokens than were written at all.
+            extended_write_tokens = max(0, min(reported_1h, extended_write_tokens))
     if cached_tokens and cached_price is None:
         return None
     if cache_write_tokens and write_price is None:
         return None
     regular_input = max(0, prompt_tokens - cached_tokens - cache_write_tokens)
+    default_write_tokens = max(0, int(cache_write_tokens or 0) - extended_write_tokens)
     cost = (
         regular_input * input_price / 1_000_000
         + cached_tokens * float(cached_price or 0.0) / 1_000_000
-        + cache_write_tokens * float(write_price or 0.0) / 1_000_000
+        + default_write_tokens * float(write_price or 0.0) / 1_000_000
+        + extended_write_tokens * float(write_price or 0.0) * (2.0 / 1.25) / 1_000_000
         + completion_tokens * output_price / 1_000_000
     )
     return round(cost, 6)

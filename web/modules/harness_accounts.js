@@ -26,10 +26,34 @@ import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const POLL_MS = 5000;
 const JOB_POLL_MS = 3000;
+export const JOB_POLL_MAX_DELAY_MS = 30000;
+export const JOB_POLL_GIVE_UP_FAILURES = 10;
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
+
+// #125: the status refresh is visibility-gated (each tick fans out to four
+// daemon round-trips), but a FORCED refresh — first load, the Refresh button,
+// the poll give-up — always runs. Pure so the gate is node-tested.
+export function shouldSkipStatusRefresh({ hostVisible = false, hidden = false, force = false } = {}) {
+    if (force) return false;
+    return !hostVisible || Boolean(hidden);
+}
+
+// #125: job-poll pacing over CONSECUTIVE failures (a successful read — any
+// parsed snapshot, pending included — resets the counter): 3s while healthy,
+// exponential backoff 6/12/24/30…s capped at 30s while the daemon is not
+// answering, and after 10 consecutive failures the chain gives up (~4 min)
+// instead of hammering a dead daemon forever.
+export function nextJobPollDelay(consecutiveFailures) {
+    const failures = Math.max(0, Number(consecutiveFailures) || 0);
+    if (failures >= JOB_POLL_GIVE_UP_FAILURES) return { delayMs: 0, giveUp: true };
+    return {
+        delayMs: Math.min(JOB_POLL_MS * 2 ** failures, JOB_POLL_MAX_DELAY_MS),
+        giveUp: false,
+    };
+}
 
 export function verificationBadge(profile) {
     // Q2-а: both statuses are shown honestly — vendor-verified is trusted,
@@ -699,7 +723,9 @@ export function loginCardHtml(active, nowMs = Date.now()) {
     // "Connected." a stale message would contradict the outcome, and while the
     // job is pending the live status line already owns the card.
     if (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed') {
-        const detail = jobDetail(active.job || {});
+        // #125: a verdict minted client-side (the poll give-up) carries its own
+        // sentence; a daemon-settled verdict keeps the engine's own message.
+        const detail = String(active.verdict?.detail || '').trim() || jobDetail(active.job || {});
         if (detail) {
             bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
         }
@@ -755,7 +781,11 @@ function renderLoginCard() {
 
 function wireLoginCard(host, active, summary) {
     host.querySelector('[data-login-retry]')?.addEventListener('click', () => {
-        stopJobPolling();
+        // NO preemptive stopJobPolling() here: if the C7 guard inside
+        // startLogin refuses (cancel unproven, job still live), the old poll
+        // must stay armed — it is the recovery path that clears the transient
+        // note and settles the real verdict. _startLoginLocked stops polling
+        // itself once the previous job is terminal or provably cancelled.
         startLogin(active.harness, active.profile);
     });
     host.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
@@ -779,14 +809,38 @@ function wireLoginCard(host, active, summary) {
         if (event.key === 'Enter') { event.preventDefault(); submitCodeFromCard(active); }
     });
     host.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
-    host.querySelector('[data-login-dismiss]')?.addEventListener('click', async () => {
-        if (active.jobId && !summary.terminal) {
-            try { await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { method: 'DELETE' }); } catch (err) { /* cancel is best-effort */ }
-        }
-        stopJobPolling();
-        state.activeJob = null;
-        renderLoginCard();
-        refreshStatus();
+    host.querySelector('[data-login-dismiss]')?.addEventListener('click', () => {
+        withLoginTransition(async () => {
+            // Stale wiring: a rebuilt card (or a completed transition) may
+            // have replaced the job this handler captured.
+            if (state.activeJob !== active) return;
+            if (active.jobId && !jobStateSummary(active.job || {}).terminal) {
+                // C7: the job id of a possibly-live login is never dropped on
+                // an UNPROVEN cancel — clearing it would let the next start
+                // bypass the serialization guard. The card stays with an
+                // honest error until the daemon confirms the job is gone.
+                const gone = await cancelLoginJob(active.jobId);
+                // Belt: the lock already excludes concurrent transitions, but
+                // an identity drift across the await must never clear a job
+                // this handler does not own.
+                if (state.activeJob !== active) return;
+                // A poll tick may have settled the job while the DELETE was in
+                // flight: a terminal job needs no cancel, the user asked the
+                // card to close — fall through to the clear instead of
+                // freezing a settled card on a stale cancel error.
+                const settledMeanwhile = loginSettleProven(active);
+                if (!gone && !settledMeanwhile) {
+                    active.error = 'Could not cancel this sign-in — it may still be running. '
+                        + 'Try dismissing again once the daemon is reachable.';
+                    renderLoginCard();
+                    return;
+                }
+            }
+            stopJobPolling();
+            state.activeJob = null;
+            renderLoginCard();
+            refreshStatus();
+        });
     });
 }
 
@@ -833,8 +887,77 @@ async function submitCodeFromCard(active) {
     renderLoginCard();
 }
 
-async function startLogin(harness, profile) {
+/**
+ * Cancel a login job and REPORT whether the daemon no longer runs it (C7):
+ * ok/404/410 mean the job is gone; anything else (5xx, network death) means
+ * it may still be live — the caller must not start a second job beside it.
+ */
+export async function cancelLoginJob(jobId, fetchImpl = apiFetch) {
+    if (!jobId) return true;
+    try {
+        const resp = await fetchImpl(`/api/claudexor/login/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+        return !!resp && (resp.ok || resp.status === 404 || resp.status === 410);
+    } catch (err) {
+        return false;
+    }
+}
+
+/**
+ * Whether the login job PROVABLY settled: only a TERMINAL job snapshot counts.
+ * A verdict alone is NOT proof — the give-up path issues {kind:'unconfirmed'}
+ * on LOST CONTACT, where the job may still be live server-side; the
+ * terminal-derived kinds (success/failure/recheck) always ride a terminal
+ * snapshot anyway, so the snapshot is the one honest witness.
+ */
+export function loginSettleProven(active) {
+    return jobStateSummary(active?.job || {}).terminal;
+}
+
+// ONE lock for EVERY login lifecycle transition (C7): start AND dismiss.
+// Each transition is an async section that reads and replaces
+// state.activeJob across awaits (create POST while jobId is still '';
+// cancel DELETE while a start could run) — serializing only the starts
+// left the dismiss-vs-start overlap able to drop custody of a live job.
+let loginTransitionBusy = false;
+
+async function withLoginTransition(fn) {
+    if (loginTransitionBusy) return false;
+    loginTransitionBusy = true;
+    try {
+        await fn();
+        return true;
+    } finally {
+        loginTransitionBusy = false;
+    }
+}
+
+export async function startLogin(harness, profile) {
     if (!harness) return;
+    await withLoginTransition(() => _startLoginLocked(harness, profile));
+}
+
+async function _startLoginLocked(harness, profile) {
+    // C7 (plan roast, accepted): a NEW login may start only once the previous
+    // job is terminal or PROVABLY cancelled — a second job beside a live one
+    // races the daemon and orphans the old job server-side. Centralized HERE
+    // so every entry point (Connect, Add account, Retry) inherits the guard.
+    const prev = state.activeJob;
+    if (prev && prev.jobId && !jobStateSummary(prev.job || {}).terminal) {
+        const cancelled = await cancelLoginJob(prev.jobId);
+        // Re-read the world after the await: a poll tick may have settled the
+        // job (succeeded/failed) while the DELETE was in flight — a terminal
+        // job needs no cancellation, and writing a cancel error AFTER the
+        // settle would freeze the card on a stale face (the terminal tick
+        // schedules no further poll to clear it).
+        const settledMeanwhile = state.activeJob !== prev || loginSettleProven(prev);
+        if (!cancelled && !settledMeanwhile) {
+            prev.error = 'Could not cancel the active sign-in — it may still be running. '
+                + 'Retry from its card, or dismiss it first.';
+            renderLoginCard();
+            return;
+        }
+    }
+    stopJobPolling();
     // One start shape for every harness: the in-app flow is asked for and the
     // server/engine decide the hosting (loginFlow rides only for codex).
     const body = { harness, login_flow: 'device_auth' };
@@ -875,18 +998,21 @@ async function startLogin(harness, profile) {
 
 function startJobPolling() {
     stopJobPolling();
-    // ONE poll in flight at a time. The tick is async while the interval is
-    // not, so a slow round-trip used to let the next tick overtake it — and
-    // two responses landing out of order meant an OLDER snapshot could
-    // overwrite a terminal one. That is the contradictory card the owner hit
-    // by hand: a live "waiting" line beside a settled verdict.
-    let inFlight = false;
-    state.jobTimer = setInterval(async () => {
+    // #125: a setTimeout CHAIN, not an interval — the next tick is armed only
+    // after the previous round-trip settled, so overlapping polls (and the
+    // out-of-order snapshot that overwrote a terminal one) are structurally
+    // impossible; the pollResponseApplies ordering guard still stands for a
+    // card closed/reopened mid-flight. Failures back off exponentially and
+    // after 10 CONSECUTIVE failures the chain stops with an honest
+    // "unconfirmed" verdict instead of hammering a dead daemon forever.
+    let consecutiveFailures = 0;
+    const schedule = (delayMs) => { state.jobTimer = setTimeout(tick, delayMs); };
+    const tick = async () => {
+        state.jobTimer = 0;
         const active = state.activeJob;
-        if (!active?.jobId) return stopJobPolling();
-        if (inFlight) return;
-        inFlight = true;
+        if (!active?.jobId) return;
         let snapshot = null;
+        let readOk = false;
         try {
             const resp = await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { cache: 'no-store' });
             const data = await resp.json().catch(() => ({}));
@@ -894,19 +1020,53 @@ function startJobPolling() {
             // copy-paste command: it issues one exactly for a client_pty job,
             // while the poll route hands one back for every job including the
             // daemon-transport codex device flow, which must never show it.
-            if (resp.ok) snapshot = data.job || null;
-        } catch (err) { /* transient poll failure; the next tick retries */
-        } finally { inFlight = false; }
+            if (resp.ok) {
+                snapshot = data.job || null;
+                readOk = true;
+            }
+        } catch (err) { /* transient poll failure; the chain retries with backoff */ }
         if (!pollResponseApplies(active, state.activeJob)) return;
+        // ANY parsed answer (a pending snapshot included) resets the failure
+        // streak — a legitimate multi-minute sign-in must never trip give-up.
+        consecutiveFailures = readOk ? 0 : consecutiveFailures + 1;
         if (snapshot) active.job = snapshot;
+        if (readOk && active.error) {
+            // A successful job read re-establishes the true state: the
+            // cancel-failure note (a Dismiss whose DELETE the daemon never
+            // confirmed) is TRANSIENT and must not mask a live/terminal face
+            // forever — a recovered daemon + succeeded login used to leave the
+            // card stuck on the cancel-error face while the account row said
+            // connected. Fatal START errors never reach this line: a job that
+            // failed to create has no jobId and is never polled.
+            active.error = '';
+        }
         const verdict = loginVerdict(active.job || {});
         if (verdict.kind !== 'pending') {
-            stopJobPolling();
             settleVerdict(active, verdict);
             return;
         }
+        const next = nextJobPollDelay(consecutiveFailures);
+        if (next.giveUp) {
+            // Contact with the job is lost, NOT the login: the sign-in may
+            // well have completed. The EXISTING typed unconfirmed verdict path
+            // owns this face. Deliberately NOT active.error — its Try-again
+            // would start a SECOND login while the old jobId may still be
+            // live; a fresh attempt goes through Close (which DELETEs a
+            // non-terminal job) or the account row once the daemon answers.
+            active.verdict = {
+                kind: 'unconfirmed',
+                reason: 'job_poll_lost_contact',
+                detail: 'Lost contact with the sign-in job — the sign-in may '
+                    + 'still have completed. Press Refresh to re-check the account.',
+            };
+            renderLoginCard();
+            refreshStatus({ force: true });
+            return;
+        }
         renderLoginCard();
-    }, JOB_POLL_MS);
+        schedule(next.delayMs);
+    };
+    schedule(nextJobPollDelay(0).delayMs);
 }
 
 async function settleVerdict(active, verdict) {
@@ -939,17 +1099,25 @@ async function settleVerdict(active, verdict) {
 }
 
 function stopJobPolling() {
-    if (state.jobTimer) clearInterval(state.jobTimer);
+    if (state.jobTimer) clearTimeout(state.jobTimer);
     state.jobTimer = 0;
 }
 
-export async function refreshStatus() {
+export async function refreshStatus({ force = false } = {}) {
     // Poll only while the section is actually on screen. Each tick fans out to four
     // daemon round-trips, and the interval started at app load and never stopped —
     // so every page in the app paid for them (`.page` is display:none when inactive,
-    // which is exactly what offsetParent reports).
+    // which is exactly what offsetParent reports). #125: the SAME gate used to
+    // suppress the very first fetch too (init runs before the page is shown), so
+    // the section sat on "Checking daemon…" until the 5s interval; a FORCED
+    // refresh (first load, the Refresh button, the poll give-up) skips the gate.
     const host = document.getElementById('harness-accounts-rows');
-    if (!host || host.offsetParent === null || document.hidden) return;
+    if (!host) return;
+    if (shouldSkipStatusRefresh({
+        hostVisible: host.offsetParent !== null,
+        hidden: document.hidden,
+        force,
+    })) return;
     try {
         const resp = await apiFetch('/api/claudexor/status', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
@@ -958,9 +1126,35 @@ export async function refreshStatus() {
     renderRows();
 }
 
+// #125: wake the visibility-gated refresh the moment the section can actually
+// be seen again — browser tab restored, Settings page shown, Providers subtab
+// activated. Registered once per app lifetime (module flag); each handler
+// calls the UNFORCED refresh, so the gate still filters invisible states.
+let activationHandlersRegistered = false;
+
+function registerActivationHandlers() {
+    if (activationHandlersRegistered) return;
+    activationHandlersRegistered = true;
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshStatus();
+    });
+    window.addEventListener('ouro:page-shown', (event) => {
+        // The boot default subtab does not dispatch a subtab event; page-shown
+        // covers reaching Settings with Providers already active.
+        if (event?.detail?.page === 'settings') refreshStatus();
+    });
+    window.addEventListener('ouro:settings-subtab-shown', (event) => {
+        if (event?.detail?.tab === 'providers') refreshStatus();
+    });
+}
+
 export function initHarnessAccounts() {
-    document.getElementById('btn-harness-refresh')?.addEventListener('click', refreshStatus);
-    refreshStatus();
+    document.getElementById('btn-harness-refresh')
+        ?.addEventListener('click', () => refreshStatus({ force: true }));
+    registerActivationHandlers();
+    // Forced: init runs while the page may not be visible yet, and the first
+    // daemon read must not wait 5 seconds for the interval (#125).
+    refreshStatus({ force: true });
     if (state.pollTimer) clearInterval(state.pollTimer);
     state.pollTimer = setInterval(refreshStatus, POLL_MS);
 }

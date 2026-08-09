@@ -55,6 +55,25 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _read_jsonl_chain(data_dir: Path, name: str, archive_prefix: str) -> list[dict[str, Any]]:
+    """Read ``logs/<name>`` plus its rotated ``archive/<prefix>_*.jsonl`` chain.
+
+    The runtime rotates chat.jsonl and progress.jsonl into ``archive/`` once they
+    cross ~800KB. Rotation is suppressed in sentinel-marked isolated benchmark
+    roots, but not every harness writes the sentinel — so the trajectory builder
+    must read the full chain (oldest archive first, then live) rather than assume
+    a from-birth single file."""
+    rows: list[dict[str, Any]] = []
+    try:
+        archives = sorted((data_dir / "archive").glob(f"{archive_prefix}_*.jsonl"))
+    except OSError:
+        archives = []
+    for path in archives:
+        rows.extend(_read_jsonl(path))
+    rows.extend(_read_jsonl(data_dir / "logs" / name))
+    return rows
+
+
 def _read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -191,7 +210,7 @@ def _detect_version(events: list[dict[str, Any]]) -> str | None:
 
 
 def _final_answer(agent_dir: Path) -> str:
-    chat = _read_jsonl(agent_dir / "ouroboros-data" / "logs" / "chat.jsonl")
+    chat = _read_jsonl_chain(agent_dir / "ouroboros-data", "chat.jsonl", "chat")
     for row in reversed(chat):
         if row.get("direction") == "out" and isinstance(row.get("text"), str):
             return row["text"]
@@ -223,7 +242,7 @@ def build_trajectory(
     ]
     narration_rows = [
         r
-        for r in _read_jsonl(logs_dir / "progress.jsonl")
+        for r in _read_jsonl_chain(agent_dir / "ouroboros-data", "progress.jsonl", "progress")
         if r.get("type") == "send_message" and isinstance(r.get("text"), str)
     ]
 

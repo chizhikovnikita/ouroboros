@@ -5816,3 +5816,151 @@ def test_bounded_poll_retries_the_git_atomic_object_race_once():
         raised = True
     assert raised
     assert not is_transient_git_object_race(RuntimeError("connection refused"))
+
+
+def test_executor_resolution_row_also_lands_in_canonical_events(tmp_path):
+    """W3 adjacent (c): a delegated child's forked drive is pruned with the task,
+    so the subagent_executor_resolved row must ALSO land in the canonical
+    events.jsonl (the accounting root the task already carries). The root
+    agent's own drive IS canonical — no duplicate row there."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.agent import _record_executor_resolution
+
+    child_logs = tmp_path / "child_drive" / "logs"
+    canonical = tmp_path / "data"
+    child_logs.mkdir(parents=True)
+    (canonical / "logs").mkdir(parents=True)
+
+    dispatch = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="native",
+        reason=SUBSCRIPTION_WINDOW_EXHAUSTED, reset_at="2030-01-01T00:00:00Z", route=None,
+    ))
+    task = {"id": "child1", "budget_drive_root": str(canonical)}
+    _record_executor_resolution(child_logs, task, dispatch)
+
+    def _rows(path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    child_rows = _rows(child_logs / "events.jsonl")
+    canon_rows = _rows(canonical / "logs" / "events.jsonl")
+    assert len(child_rows) == 1 and len(canon_rows) == 1
+    assert canon_rows[0]["type"] == "subagent_executor_resolved"
+    assert canon_rows[0]["reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
+    assert canon_rows[0]["reset_at"] == "2030-01-01T00:00:00Z"
+
+    # Same drive (the root agent): exactly one row, no self-duplicate.
+    root_task = {"id": "root1", "budget_drive_root": str(canonical)}
+    _record_executor_resolution(canonical / "logs", root_task, dispatch)
+    canon_rows = _rows(canonical / "logs" / "events.jsonl")
+    assert len([r for r in canon_rows if r["task_id"] == "root1"]) == 1
+
+
+def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path, monkeypatch):
+    """W3 adjacent (c): the D28 spent-window resolution appends a typed ADVISORY
+    delegation_constraint to the task-tree ledger (reset_at + child id), riding
+    the attention channel the wait tools already early-wake on — and the
+    enforcement reducer skips it (advisory = disclosure, not a gate)."""
+    from types import SimpleNamespace
+
+    from ouroboros import task_tree_ledger as ledger_mod
+    from ouroboros.agent import _record_executor_resolution
+    from ouroboros.tools.control_delegation import effective_delegation_budget
+
+    monkeypatch.setattr(ledger_mod, "DATA_DIR", tmp_path)
+    child_logs = tmp_path / "child_drive" / "logs"
+    child_logs.mkdir(parents=True)
+
+    dispatch = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="native",
+        reason=SUBSCRIPTION_WINDOW_EXHAUSTED, reset_at="2030-01-01T00:00:00Z", route=None,
+    ))
+    task = {"id": "childbeacon1", "parent_task_id": "parentroot1", "root_task_id": "parentroot1"}
+    _record_executor_resolution(child_logs, task, dispatch)
+
+    beacons = ledger_mod.tree_ledger_attention_after("parentroot1", "")
+    assert len(beacons) == 1
+    row = beacons[0]
+    assert row["kind"] == "delegation_constraint"
+    assert row["needs_parent_attention"] is True
+    payload = row["payload"]
+    assert payload["advisory"] is True
+    assert payload["reset_at"] == "2030-01-01T00:00:00Z"
+    assert payload["child_task_id"] == "childbeacon1"
+    assert payload["reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
+
+    # Advisory: the schedule-time enforcement reducer must NOT gate on it.
+    decision = effective_delegation_budget(
+        {}, missing_capabilities=[],
+        unresolved_constraints=ledger_mod.open_delegation_constraints("parentroot1"),
+        write_surface="", role="researcher", requested_lane="", intended_lane="light",
+        active_child_count=0,
+    )
+    assert decision.ok
+
+    # A healthy (non-exhausted) resolution appends NO beacon.
+    healthy = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="harness", reason="harness_ready", reset_at="", route=None,
+    ))
+    _record_executor_resolution(child_logs, {"id": "childbeacon2", "parent_task_id": "parentroot1",
+                                             "root_task_id": "parentroot1"}, healthy)
+    assert len(ledger_mod.tree_ledger_attention_after("parentroot1", "")) == 1
+
+
+def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
+    """W3 adjacent (d): a project registration is shared by every run delegated
+    into it — while siblings are unsettled, only the LOWEST-run_id sharer keeps
+    attempting the removal (one honest, disclosed retry lane; the deterministic
+    tie-break means some sharer always attempts, so deferral cannot deadlock);
+    the rest defer QUIETLY: no doomed daemon call, no PROJECT_RETIRE_FAILED
+    spam (the submarine wave-2 retire loop). The daemon's refusal text rides
+    the failure row as `reason`."""
+    import json as _json
+
+    import ouroboros.delegate_custody as dc
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    class _RefusingGateway:
+        def __init__(self):
+            self.removals = []
+            self.refuse = True
+
+        def remove_project(self, pid):
+            self.removals.append(pid)
+            if self.refuse:
+                raise ClaudexorUnavailable("project_busy", "project has live runs", status_code=409)
+
+    gateway = _RefusingGateway()
+    for rid, tid in (("run-aa", "t-1"), ("run-bb", "t-2")):
+        dc.record_started(tmp_path, dc.RunCustody(
+            run_id=rid, task_id=tid, route_id="r", model="m",
+            project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+
+    # Non-canonical sharer (higher run_id): quiet deferral — no call, no row.
+    custody_b = dc.replay(tmp_path)["run-bb"]
+    dc.retire_project(tmp_path, gateway, custody_b)
+    assert gateway.removals == []
+    assert "delegate_run_project_retire_failed" not in _event_types(tmp_path)
+    assert custody_b.project_owned is True
+
+    # Canonical sharer (lowest run_id): attempts, and the refusal text is typed.
+    custody_a = dc.replay(tmp_path)["run-aa"]
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert gateway.removals == ["prj-shared"]
+    rows = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = [r for r in rows if r.get("type") == "delegate_run_project_retire_failed"]
+    assert len(failed) == 1
+    assert "live runs" in str(failed[0].get("reason"))
+
+    # Once the daemon accepts, the canonical sharer discharges the registration.
+    gateway.refuse = False
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert custody_a.project_owned is False
+    assert "delegate_run_project_retired" in _event_types(tmp_path)
+    dc._CUSTODY.clear()

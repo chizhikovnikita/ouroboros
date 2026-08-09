@@ -110,6 +110,31 @@ def note_success(connection_id: str) -> None:
         _COOLDOWN_UNTIL.pop(connection_id, None)
 
 
+_AUTH_FAILURE_MARKERS = ("401", "403", "invalid api key", "unauthorized", "authentication")
+
+
+def note_attempt_outcome(connection_id: str, exc: BaseException | None) -> None:
+    """Record how one physical send ended, classifying the failure for rotation.
+
+    Called from the accounting path, which owns money rather than routing — the
+    classification therefore lives here. Best-effort by design: routing health is
+    a hint, and failing an otherwise good accounting path over it would trade a
+    real result for a heuristic.
+    """
+    connection_id = str(connection_id or "")
+    if not connection_id:
+        return
+    try:
+        if exc is None:
+            note_success(connection_id)
+            return
+        text = f"{type(exc).__name__}: {exc}".lower()
+        kind = "auth" if any(marker in text for marker in _AUTH_FAILURE_MARKERS) else "error"
+        note_failure(connection_id, kind=kind)
+    except Exception:
+        log.debug("connection health note skipped", exc_info=True)
+
+
 def cooling_down(connection_id: str) -> bool:
     with _COOLDOWN_LOCK:
         until = _COOLDOWN_UNTIL.get(str(connection_id or ""), 0.0)

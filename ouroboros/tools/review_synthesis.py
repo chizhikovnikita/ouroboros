@@ -278,6 +278,11 @@ def _has_billable_usage(usage: Any) -> bool:
 # Pure plan-review contract helpers live here so plan_review.py remains the single
 # state/LLM orchestrator without crossing the repository's module-size gate.
 _PLAN_SCOPE_LIST_FIELDS = ("in_scope", "invariants", "non_goals", "rejected_expansions")
+# Optional scope list fields enter the normalized scope — and therefore the plan
+# fingerprint — ONLY when non-empty (the v6.61.0 plan_class precedent: historical
+# fingerprints stay valid, and vacuous values normalize to ABSENT rather than
+# wedging a submission — the v6.65.1/.2 lesson: no min-constraints).
+_PLAN_SCOPE_OPTIONAL_LIST_FIELDS = ("acceptance_claims",)
 PLAN_REVIEW_CONTROL_PREFIX = "PLAN_REVIEW_CONTROL_JSON: "
 
 
@@ -286,18 +291,20 @@ def normalize_plan_scope(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("scope must be an object")
-    allowed = set(_PLAN_SCOPE_LIST_FIELDS) | {"selected_seam"}
+    allowed = set(_PLAN_SCOPE_LIST_FIELDS) | set(_PLAN_SCOPE_OPTIONAL_LIST_FIELDS) | {"selected_seam"}
     unknown = sorted(str(key) for key in raw if key not in allowed)
     if unknown:
         raise ValueError(f"unknown scope fields: {', '.join(unknown)}")
     result: Dict[str, Any] = {key: [] for key in _PLAN_SCOPE_LIST_FIELDS}
-    for key in _PLAN_SCOPE_LIST_FIELDS:
+    for key in _PLAN_SCOPE_LIST_FIELDS + _PLAN_SCOPE_OPTIONAL_LIST_FIELDS:
         value = raw.get(key)
         if value is None:
             continue
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise ValueError(f"scope.{key} must be an array of strings")
         items = [item.strip() for item in value if item.strip()]
+        if key in _PLAN_SCOPE_OPTIONAL_LIST_FIELDS and not items:
+            continue  # vacuous == absent (identity-preserving; disclosed by the caller)
         result[key] = items
     seam = raw.get("selected_seam")
     if seam is not None and not isinstance(seam, str):
@@ -864,6 +871,26 @@ VACUOUS_DISPOSITION_NOTE = (
     "Omit the field when submitting a plan; to close REVIEW_REQUIRED, make a separate "
     "call containing a complete review_disposition only."
 )
+
+VACUOUS_CLAIMS_NOTE = (
+    "\n\nNOTE: scope.acceptance_claims was empty/blank and was treated as absent. "
+    "Omit the field unless you can state concrete, checkable claims of what 'done' "
+    "means for this plan."
+)
+
+def vacuous_acceptance_claims(scope: object) -> bool:
+    """True when the raw scope CARRIES an acceptance_claims key that normalizes to
+    absent (None / [] / blank strings) — the caller appends VACUOUS_CLAIMS_NOTE so
+    the treatment is disclosed, never an error (the v6.65.1/.2 lesson)."""
+    if not isinstance(scope, dict) or "acceptance_claims" not in scope:
+        return False
+    value = scope.get("acceptance_claims")
+    if value is None:
+        return True
+    if not isinstance(value, list):
+        return False  # shape errors surface through normalize_plan_scope instead
+    return not any(isinstance(item, str) and item.strip() for item in value)
+
 
 def vacuous_review_disposition(value: object) -> bool:
     """True for a schema-shaped but semantically empty disposition: models routinely

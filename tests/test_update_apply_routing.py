@@ -528,6 +528,7 @@ def test_replace_apply_publishes_smoke_proof_only_after_pass(monkeypatch):
 
 
 def test_writer_fence_order(monkeypatch):
+    import ouroboros.process_custody as process_custody
     import ouroboros.tools.services as services
     import supervisor.workers as workers
 
@@ -544,9 +545,21 @@ def test_writer_fence_order(monkeypatch):
         "kill_all_services",
         lambda *_args, **_kwargs: calls.append("kill_services") or [],
     )
+    # The custody sweep is the fence's fifth step and reads
+    # supervisor.git_ops.DRIVE_ROOT, which is bound at IMPORT time — an
+    # isolated OUROBOROS_DATA_DIR does not rebind it (docs/DEVELOPMENT.md
+    # hermetic-preflight rule). Unpatched, this unit test of ORDER reached the
+    # operator's live process ledger: it reported live entries as blockers
+    # (any machine running Ouroboros failed this test) and, worse, would have
+    # killed a ledgered task/session service that happened to be running.
+    monkeypatch.setattr(
+        process_custody,
+        "quiesce_custodied_services",
+        lambda *_args, **_kwargs: (calls.append("quiesce_custody") or (True, [])),
+    )
 
     assert control._quiesce_repo_writers("test") == []
-    assert calls == ["close", "drain", "kill_workers", "kill_services"]
+    assert calls == ["close", "drain", "kill_workers", "kill_services", "quiesce_custody"]
 
 
 def test_failed_direct_turn_drain_does_not_kill_pool(monkeypatch):

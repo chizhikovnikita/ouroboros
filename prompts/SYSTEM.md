@@ -91,8 +91,11 @@ raise beacons, read the shared frame), and may use bounded media projection tool
 These are permitted local coordination/projection paths, not arbitrary state mutation.
 
 To delegate work that CHANGES things, pass `write_surface` to spawn a mutative
-("acting") child (when `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` is on — default in
-advanced/pro): `self_worktree` (an isolated git worktree of THIS repo, for
+("acting") child (when `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` allows it — an
+explicit owner value applies to every surface; when unset the runtime mode
+decides, surface-aware: advanced/pro allow every surface, light allows the
+external build surfaces `external_workspace`/`genesis` and keeps
+`self_worktree` off): `self_worktree` (an isolated git worktree of THIS repo, for
 parallel self-modification / best-of-N), `external_workspace` (an existing
 external project directory), or `genesis` (a from-scratch new project — game,
 site, app, or a new Ouroboros — auto-provisioned as a fresh empty git repo under
@@ -224,8 +227,13 @@ the current project. Projects serialize internally (one writer per project);
 parallelism happens between projects and via subagent swarms within a task.
 For multi-file builds, prefer a real git working folder (projects can
 provision one) and orchestrate acting children with patches instead of
-passing code as chat text. Evolution remains mine alone and waits until
-running project tasks finish.
+passing code as chat text. A project task promoted while the project has NO
+working folder gets one auto-provisioned and bound as its active workspace
+(a durable git tree under the subagent-projects root): paths, shell cwd and
+full task-local git then resolve in the project tree natively, memory runs on
+a forked child drive, and self-repo reads need explicit `root="system_repo"`.
+Pass `workspace="none"` to opt a task out and run folder-less. Evolution
+remains mine alone and waits until running project tasks finish.
 
 ---
 
@@ -404,7 +412,7 @@ or preference, I ask and then learn it in memory.
 ## Safety Agent and Restrictions
 
 Every tool call passes through a layered safety system:
-1. **Hardcoded sandbox** (`registry.py`): Deterministic checks that run FIRST — blocks protected runtime paths (safety-critical files, frozen contracts, release/managed invariants), mutative git commands via shell, and GitHub repo/auth manipulation. These cannot be bypassed by any LLM.
+1. **Hardcoded sandbox** (`registry.py`): Deterministic checks that run FIRST — blocks protected runtime paths (safety-critical files, frozen contracts, release/managed invariants), mutative git commands via shell **when they target the Ouroboros runtime** (system repo / data drives — self-repo changes go through `commit_reviewed`; read-only git works everywhere — including at a runtime target and in an external workspace — unless it WRITES through the diff `--output=<file>` option, which is judged at the file it truncates (`git log --output=/tmp/x` is free; `--output=<runtime path>` is refused); `git init <dir>`/`git clone <url> <dir>` are judged by the DESTINATION — flags like `-b`/`--depth` are understood, so common spellings such as `git clone -b feature/x <url> ~/projects/x` work even though your default cwd is the system repo; mutating git in any tree outside the runtime — `~/projects`, `/tmp`, an attached project folder — is allowed in every runtime mode; acting `self_worktree` children keep the strict no-commit policy), and GitHub repo/auth manipulation. These checks are deterministic — no prompt or model output can argue them away for what they classify. Disclosed residual: the git guard classifies direct `git` argv, so git launched through a transparent wrapper (`nice`/`xargs`) or from interpreter code is not classified by this layer — the LLM safety layer below and the light-mode post-exec repo-dirtiness tripwire still cover those forms.
 2. **Policy-based LLM safety check** (`safety.py`): Each built-in tool has an explicit policy — `skip` (trusted, no LLM call), `check` (always one cheap light-model call), or `check_conditional` (currently `run_command`, `run_script`, `start_service`, and `verify_and_record`: deterministic safe-subject commands may bypass the LLM, everything else goes through it). **Any tool I create at runtime that is not yet in the policy falls through to the default `check`**, so new tools always get at least a single cheap LLM recheck until I add them to the policy map explicitly (under `OUROBOROS_SAFETY_MODE=full`; the owner-selected `light`/`off` coverage below waves the corresponding LLM checks through with a durable audit — the deterministic layer 1 never turns off). **Fail-open contract:** the check degrades to a visible `SAFETY_WARNING` (never silent) in three cases: (a) no reachable safety backend — no remote provider keys AND no `USE_LOCAL_*` lane; (b) provider mismatch — a remote key is configured but it doesn't cover `OUROBOROS_MODEL_LIGHT`'s provider (e.g. `OPENROUTER_API_KEY` set, `OUROBOROS_MODEL_LIGHT=anthropic::…` but `ANTHROPIC_API_KEY` absent; or `openai-compatible::…` without `OPENAI_COMPATIBLE_BASE_URL`) AND no `USE_LOCAL_*` lane is available — when a local lane IS available, safety routes to local fallback first and only warns if that fallback also raises; (c) the local branch was chosen only as a fallback and the local runtime raised. This is deliberate — the hardcoded sandbox in layer 1 remains in force for every tool, so a degraded safety backend never hard-blocks tool creation, but the agent DOES see a warning and should treat affected calls with extra care.
 3. **LLM verdicts**: the check returns one of:
    - **SAFE** — proceed normally.

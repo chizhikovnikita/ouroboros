@@ -377,6 +377,75 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
         return {"status": "skipped"}, 0
 
 
+# Hot-store growth tripwires (perf/lifecycle sprint; BIBLE P2 "autonomy in
+# class detection"): the append-only stores whose interactive readers degrade
+# with file size get a deterministic size WARNING. Thresholds are the justified
+# constants in ouroboros/context_budget.py. Each row: drive-relative path,
+# threshold in bytes, remediation pointer appended to the WARNING.
+def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
+    from ouroboros.context_budget import (
+        EVENTS_LOG_WARN_BYTES,
+        PROGRESS_LOG_WARN_BYTES,
+        TOOLS_LOG_WARN_BYTES,
+        USAGE_LEDGER_WARN_BYTES,
+    )
+
+    no_rotation = (
+        "This store has no rotation; readers that replay it degrade with size. "
+        "Rotation/archival is the remediation (tracked as a GitHub issue)."
+    )
+    return (
+        (
+            "state/usage_attempts.jsonl",
+            USAGE_LEDGER_WARN_BYTES,
+            "Every reservation re-reads the ledger under the monetary lock "
+            "(~0.5s hold at 20MB — see usage_ledger.py); ledger compaction is "
+            "the remediation (tracked as a GitHub issue).",
+        ),
+        ("logs/events.jsonl", EVENTS_LOG_WARN_BYTES, no_rotation),
+        ("logs/tools.jsonl", TOOLS_LOG_WARN_BYTES, no_rotation),
+        (
+            "logs/progress.jsonl",
+            PROGRESS_LOG_WARN_BYTES,
+            "progress.jsonl is expected to be rotation-bounded far below this "
+            "threshold; rotation is broken or missing — investigate the "
+            "supervisor rotation tick (rotate_chat_log_if_needed pattern).",
+        ),
+    )
+
+
+def hot_store_growth_notes(env: Any) -> list:
+    """Health-invariant WARNING lines for hot stores past their thresholds.
+
+    Reused live by context.py::build_health_invariants (the
+    check_stray_server_processes pattern). Deliberately NOT TTL-cached
+    (contrast context._STRAY_PROBE_CACHE): four os.stat calls per task turn
+    are orders of magnitude cheaper than the pgrep probe that cache exists
+    for, and a stale reading would delay the regression signal."""
+    from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
+
+    drive_root = pathlib.Path(getattr(env, "drive_root", None) or env.drive_path("state").parent)
+    # Isolated benchmark data roots are throwaway by construction and may
+    # legitimately accumulate unbounded logs for the run's duration; a
+    # perpetual WARNING in every bench task context is noise that steers the
+    # agent, not a signal (the sentinel is the same marker
+    # reset_per_task_budget keys on — a live root never carries it).
+    if (drive_root / ISOLATED_BENCHMARK_SENTINEL).exists():
+        return []
+    notes: list = []
+    for rel, threshold, remediation in _hot_store_thresholds():
+        try:
+            size = env.drive_path(rel).stat().st_size
+        except OSError:
+            continue
+        if size > threshold:
+            notes.append(
+                f"WARNING: HOT STORE GROWTH — {rel} is {size / 1_000_000:.1f} MB "
+                f"(threshold {threshold // 1_000_000} MB). {remediation}"
+            )
+    return notes
+
+
 def check_extension_health(env: Any) -> Tuple[Dict[str, Any], int]:
     """Surface extensions that were live at a prior version but are broken now (P1/P3)."""
     try:
@@ -442,6 +511,14 @@ def verify_system_state(env: Any, git_sha: str) -> None:
 
     checks["stray_server_processes"], issue_count = check_stray_server_processes(env)
     issues += issue_count
+
+    # Boot-time surfacing of the same probe context.py::build_health_invariants
+    # reuses per task turn (benchmark-sentinel suppression lives in the probe).
+    growth_notes = hot_store_growth_notes(env)
+    checks["hot_store_growth"] = (
+        {"status": "warning", "notes": growth_notes} if growth_notes else {"status": "ok"}
+    )
+    issues += 1 if growth_notes else 0
 
     # Reconcile stale hung reviewed attempts left by abrupt process death
     try:

@@ -13,6 +13,7 @@ from ouroboros.provider_models import (
     MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
 )
+from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 
 
 def _rows(keys: tuple[str, ...], specs: tuple[tuple[Any, ...], ...]) -> list[dict]:
@@ -49,7 +50,7 @@ _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
     ("providers", "Add your access", "Keys + local", "Fill at least one remote key or a local model source. The next step adapts to what you configured here.", "Paste only what you already have. OpenRouter, direct provider keys, and an optional local model can coexist."),
     ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
     ("review_mode", "Choose review mode", "Advisory vs blocking", "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.", "Pick both review enforcement and the initial runtime mode before Ouroboros starts."),
-    ("budget", "Set your budget", "Session limits", "Budget is its own step because it directly shapes how far Ouroboros can go in one session and in a single task.", "Total budget is global. Per-task cost cap is a soft reminder, not a hard kill switch."),
+    ("budget", "Set your budget", "Session limits", "Budget is its own step because it directly shapes how far Ouroboros can go in one session and in a single task.", "Total budget is global. Per-task cost cap is a hard cap over one task's whole tree, subagents included: the task wraps up gracefully just before the ledger fence force-stops it."),
     ("summary", "Review before launch", "Final check", "Check the final provider, model, review, and budget picture. Ouroboros will save these onboarding values before starting.", "The same onboarding values remain editable later in Settings."),
 ))
 _STEP_ORDER = [step["id"] for step in _STEPS]
@@ -123,9 +124,20 @@ _BUDGET_FIELDS = [
         "settingKey": "OUROBOROS_PER_TASK_COST_USD",
         "inputId": "per-task-budget",
         "settingsInputId": "s-settings-per-task-cost",
-        "title": "Per-task soft threshold",
+        "title": "Per-task cost cap",
         "label": "Per-task Cost Cap (USD)",
-        "note": "This does not hard-stop the task. It injects a budget reminder when one task starts getting expensive.",
+        # The wrap-up sentence is only true above the planning margin: a cap at
+        # or below it resolves to `exhausted_soft_land`, which force-finalizes at
+        # the TOP of round 0 — no work rounds at all. The field still accepts
+        # such a cap (owner power stays), so the note states the consequence
+        # instead of the setting silently meaning something else.
+        "note": (
+            "Hard cap over one task's WHOLE tree, subagents included: further model calls are "
+            "refused and the task is force-stopped once the tree's accounted spend reaches this "
+            "(a graceful wrap-up fires just before). The wrap-up itself needs about "
+            f"${COST_PLANNING_MARGIN_USD:.2f} of room, so a cap at or below that finalizes the "
+            "task immediately instead of running any work rounds."
+        ),
         "default": float(SETTINGS_DEFAULTS.get("OUROBOROS_PER_TASK_COST_USD", 20.0)),
         "min": "0.01",
         "step": "any",
@@ -158,7 +170,7 @@ def parse_budget_setting(
 ) -> Tuple[float | None, str | None]:
     """Parse one shared budget setting for onboarding and Settings saves."""
     field = _BUDGET_FIELDS_BY_KEY[key]
-    name = "Budget" if key == "TOTAL_BUDGET" else "Per-task soft threshold"
+    name = "Budget" if key == "TOTAL_BUDGET" else "Per-task cost cap"
     if raw_value is None or raw_value == "":
         if use_default_for_blank:
             raw_value = field["default"]
@@ -317,7 +329,16 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     runtime_mode = raw_runtime_mode.lower() if raw_runtime_mode else _string(current_settings.get("OUROBOROS_RUNTIME_MODE")) or str(SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"])
 
     for field in _PROVIDER_FIELDS:
-        value = keys[field["settingKey"]]
+        setting_key = field["settingKey"]
+        value = keys[setting_key]
+        # Only a credential the owner authored in THIS payload is length-checked.
+        # build_initial_setup_state prefills every provider field from disk, so a
+        # stored value the owner never touched arrives here unchanged; rejecting it
+        # deadlocks the wizard, because the rejection discards the WHOLE payload —
+        # including the replacement key typed in the same form. The value that
+        # triggers the error then becomes the one value that can never be replaced.
+        if value == _string(current_settings.get(setting_key)):
+            continue
         if (
             value
             and (field.get("inputType") or "password") == "password"

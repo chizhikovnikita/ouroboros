@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -65,6 +66,7 @@ from ouroboros.platform_layer import (
     embedded_python_candidates,
     force_kill_pid,
     git_install_hint,
+    install_shutdown_signal_handlers,
     kill_pid_tree,
     kill_process_group_id,
     kill_process_on_port,
@@ -179,74 +181,6 @@ def _show_windows_message(title: str, message: str) -> None:
         pass
 
 
-_LINUX_GUI_APT_PACKAGES = "python3-gi python3-gi-cairo gir1.2-webkit2-4.1"
-
-
-def _show_linux_message(title: str, message: str) -> None:
-    """Best-effort desktop dialog on Linux.
-
-    Deliberately NOT a webview window: this reports that the webview backend is
-    the thing that is missing. Callers always log and print the same text, so a
-    host with neither dialog tool still tells the owner what to do.
-    """
-    if not IS_LINUX:
-        return
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        # No display means no dialog can render; attempting one only adds
-        # "Failed to open display" noise on top of the real message.
-        return
-    for argv in (
-        ["zenity", "--error", f"--title={title}", f"--text={message}"],
-        ["kdialog", "--title", title, "--error", message],
-    ):
-        tool = shutil.which(argv[0])
-        if not tool:
-            continue
-        try:
-            subprocess.run([tool, *argv[1:]], check=False, timeout=30)
-            return
-        except Exception:
-            continue
-
-
-def _prepare_linux_webview_runtime() -> tuple[bool, str]:
-    """Verify the GTK/WebKit backend before importing webview on Linux.
-
-    pywebview renders through the SYSTEM PyGObject + WebKit2GTK; there is no pip
-    package for them, and a venv created without `--system-site-packages` cannot
-    see them at all. Without this check `import webview` dies with a bare
-    traceback that names none of that.
-    """
-    if not IS_LINUX:
-        return True, ""
-
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return False, (
-            "No graphical display detected (neither DISPLAY nor WAYLAND_DISPLAY is set).\n"
-            "The desktop UI needs a running desktop session. For a headless host use the "
-            "server instead:\n\n    ouroboros server\n\nthen open http://127.0.0.1:8765."
-        )
-
-    try:
-        import gi
-
-        gi.require_version("Gtk", "3.0")
-        gi.require_version("WebKit2", "4.1")
-        from gi.repository import Gtk, WebKit2  # noqa: F401
-    except Exception as exc:
-        return False, (
-            f"The GTK/WebKit backend that the desktop UI renders through is unavailable: {exc}\n\n"
-            "1. Install the system packages:\n"
-            f"     sudo apt install {_LINUX_GUI_APT_PACKAGES}\n\n"
-            "2. If you run from source inside a virtualenv, expose them to it:\n"
-            "     python scripts/setup_linux_desktop.py\n\n"
-            "Prefer the browser UI instead? Run `ouroboros server` and open "
-            "http://127.0.0.1:8765."
-        )
-
-    return True, ""
-
-
 def _prepare_windows_webview_runtime() -> tuple[bool, str]:
     """Prepare pythonnet/pywebview runtime before importing webview on Windows."""
     if not IS_WINDOWS:
@@ -354,9 +288,7 @@ def _bootstrap_context() -> BootstrapContext:
         # Launcher is owner-process boundary; first-launch migration may set runtime mode.
         save_settings=lambda settings: save_settings(settings, allow_elevation=True),
         log=log,
-        # Same frozen check `_bundle_dir()` above keys off, passed by value so the
-        # bootstrap never has to re-derive packaging state on its own.
-        packaged=bool(getattr(sys, "frozen", False)),
+        packaged=bool(getattr(sys, "frozen", False)),  # same check _bundle_dir() keys off
     )
 
 
@@ -380,6 +312,11 @@ _agent_job: Optional[object] = None
 _agent_lock = threading.Lock()
 _shutdown_event = threading.Event()
 _webview_window = None
+# Linux-only browser-fallback flag (#56): set by _detect_headless() when no
+# pywebview GUI backend can initialize. Stays False on macOS/Windows — the
+# probe never runs there, so every `if _headless:` branch is dead code on
+# those platforms and their behavior is unchanged.
+_headless = False
 
 
 def _server_process_identity_matches(record: dict) -> bool:
@@ -680,13 +617,19 @@ def _kill_stale_runtime_ports(port: int) -> None:
     _kill_stale_on_port(_host_service_port())
 
 
-def _wait_for_server(port: int, timeout: float = 30.0) -> bool:
-    """Wait for the agent HTTP server to respond."""
+def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool:
+    """Wait for the agent HTTP server to respond.
+
+    ``abort_event`` (headless mode) lets a shutdown signal cut the wait short:
+    the handlers only set the event, so without this check a SIGTERM during
+    startup would still sit out the full readiness timeout."""
     import urllib.request
 
     url = f"http://127.0.0.1:{port}/api/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if abort_event is not None and abort_event.is_set():
+            return False
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 if response.status == 200:
@@ -1042,6 +985,23 @@ def _run_first_run_wizard() -> bool:
     if has_startup_ready_provider(settings):
         return True
 
+    if _headless:
+        # Browser mode (#56): the desktop wizard window cannot open, but the
+        # caller's existing "Launching anyway" path continues to server start,
+        # where the ESTABLISHED web-onboarding flow (/api/onboarding + blocking
+        # web overlay + hot supervisor start after save) takes over — the same
+        # path Docker/browser installs already use. No new onboarding code.
+        log.info(
+            "First-run wizard skipped: no GUI backend; onboarding will be "
+            "served in the browser."
+        )
+        print(
+            "No GUI backend (GTK/QT) for the setup wizard; onboarding will be "
+            "served in the browser once Ouroboros starts.",
+            flush=True,
+        )
+        return False
+
     import webview
 
     _wizard_done = {"ok": False}
@@ -1132,6 +1092,144 @@ def _run_first_run_wizard() -> bool:
     webview.start()
     return _wizard_done["ok"]
 
+
+def _display_ready(backend) -> tuple[bool, str]:
+    """Linux: does a usable DISPLAY actually exist for the chosen backend?
+
+    `initialize()` only proves the backend MODULE imports (the first real
+    display access is `BrowserView.__init__` → `Gdk.Display.get_default()`
+    inside webview.start()), so a box WITH gi bindings but WITHOUT a display
+    passed the import probe and crashed. The session-env check runs BEFORE
+    initialize() in _webview_ready; here the chosen backend is refined: GTK's
+    display handle answers None on a dead display, never a raise. DISCLOSED
+    RESIDUAL: Qt is judged on the env alone (probing Qt constructs a
+    QGuiApplication, which ABORTS). Full rationale: ARCHITECTURE.
+    """
+    if str(getattr(backend, "__name__", "")).endswith(".gtk"):
+        try:
+            from gi.repository import Gdk
+        except Exception as exc:  # gi vanished between import and probe
+            return False, f"GTK backend without gi.repository.Gdk: {type(exc).__name__}: {exc}"
+        if Gdk.Display.get_default() is None:
+            return False, "GTK backend has no default display (DISPLAY/WAYLAND_DISPLAY is unusable)"
+    return True, ""
+
+
+def _webview_ready() -> tuple[bool, str]:
+    """Probe whether pywebview can actually run a GUI window here.
+
+    pywebview 5.x picks its backend LAZILY inside webview.start(), so
+    `import webview` succeeds without GTK/QT and the process would only die
+    later, at the first window site (#56). initialize() reuses pywebview's
+    own backend selection as the SSOT (PYWEBVIEW_GUI, session detection);
+    its second run inside webview.start() is cheap. On Linux the import
+    answer is then refined by `_display_ready`; macOS/Windows keep the
+    import-only answer — `_detect_headless` never calls this there.
+    """
+    if IS_LINUX and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # BEFORE initialize(): even SELECTING a Qt backend constructs a
+        # QGuiApplication, which can ABORT on a display-less box.
+        return False, "no DISPLAY or WAYLAND_DISPLAY in the environment"
+    try:
+        import webview  # noqa: F401  (can itself fail on bare source checkouts)
+        from webview.guilib import initialize
+
+        backend = initialize()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if not IS_LINUX:
+        return True, ""
+    return _display_ready(backend)
+
+
+def _detect_headless() -> None:
+    """Set the module _headless flag on Linux when no GUI backend exists.
+
+    Linux-only by design (#56): macOS/Windows return before the probe and keep
+    their existing behavior untouched. Called once at the top of main().
+    """
+    global _headless
+    if not IS_LINUX:
+        return
+    ok, reason = _webview_ready()
+    if not ok:
+        _headless = True
+        log.warning(
+            "No usable pywebview GUI backend (%s); continuing in browser mode.",
+            reason,
+        )
+
+
+def _headless_signal_handler(signum, frame) -> None:
+    """SIGINT/SIGTERM in headless mode: ONLY set the shutdown event —
+    teardown runs on the main thread (signal-frame work risks re-entrancy)."""
+    _shutdown_event.set()
+
+
+def _open_browser_detached(url: str) -> None:
+    """Open the default browser without ever blocking the caller.
+
+    `webbrowser.open` waits for the child on a stdlib-resolved console
+    browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
+    keep-alive loop for that browser's lifetime; the URL is already printed,
+    so the open is best-effort and rides a daemon thread.
+
+    DELIBERATE (owner-approved): the opened browser is the USER'S own
+    application, intentionally outside process custody and launcher teardown —
+    the Emergency-Stop invariant governs the AGENT'S tree, and killing the
+    owner's browser would be hostile. A stdlib-resolved console browser
+    (w3m/lynx) may outlive the launcher; the printed URL is primary.
+    """
+    def _open() -> None:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            log.info("Could not open the default browser for %s", url, exc_info=True)
+
+    threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True).start()
+
+
+def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) -> None:
+    """Browser-mode replacement for the main webview window (Linux headless).
+
+    Prints the URL, best-effort opens the browser, keeps the process alive
+    until shutdown. CRITICAL: the keep-alive loop also watches lifecycle-
+    thread liveness — the crash fuse exits that thread WITHOUT setting
+    _shutdown_event, so waiting on the event alone would leave a zombie
+    launcher. Panic needs nothing here (it os._exit()s from the lifecycle
+    thread). sys.exit (not os._exit) is correct without a webview.
+    Never returns.
+    """
+    if not _shutdown_event.is_set():
+        # A signal can land between main()'s startup check and this entry:
+        # no URL announcement / browser launch mid-shutdown — straight to
+        # teardown (the keep-alive loop returns immediately).
+        log.info("Headless browser mode: serving the UI at %s", url)
+        print(
+            f"Ouroboros is running at {url}. No GUI backend (GTK/QT) — "
+            "opening in your default browser. Press Ctrl-C to stop.",
+            flush=True,
+        )
+        _open_browser_detached(url)
+    # Handlers were installed in main() BEFORE the lifecycle thread started;
+    # the browser open above rides a daemon thread because stdlib can resolve
+    # a console browser (GenericBrowser) that blocks for its whole lifetime.
+    while not _shutdown_event.wait(1.0):
+        if not lifecycle_thread.is_alive():
+            log.error(
+                "Agent lifecycle thread exited without a shutdown request "
+                "(crash fuse); shutting down."
+            )
+            break
+    stop_agent()
+    _kill_orphaned_children(port)
+    # NO explicit release_pid_lock(): sys.exit runs the atexit-registered
+    # release, and a second release would unconditionally unlink a lock a
+    # NEWER launcher may own (explicit calls stay only on os._exit paths).
+    # Event set == requested shutdown; otherwise crash fuse → exit nonzero.
+    sys.exit(0 if _shutdown_event.is_set() else 1)
+
+
 def main():
     if IS_WINDOWS:
         ok, reason = _prepare_windows_webview_runtime()
@@ -1145,20 +1243,19 @@ def main():
             )
             return
 
-    if IS_LINUX:
-        ok, reason = _prepare_linux_webview_runtime()
-        if not ok:
-            log.error("Linux UI runtime initialization failed: %s", reason)
-            # stderr too: a source run is started from a terminal, and the owner is
-            # far more likely to be looking at it than at launcher.log.
-            print(f"Ouroboros: desktop UI cannot start.\n\n{reason}", file=sys.stderr)
-            _show_linux_message("Ouroboros — Startup Failed", reason)
-            return
+    _detect_headless()
 
-    import webview
+    if not _headless:
+        import webview
 
     if not acquire_pid_lock():
         log.error("Another instance already running.")
+        if _headless:
+            print(
+                f"Ouroboros is already running at http://127.0.0.1:{_read_port_file()}",
+                file=sys.stderr,
+            )
+            return
         webview.create_window(
             "Ouroboros",
             html="<html><body style='background:#1a1a2e;color:white;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
@@ -1175,6 +1272,12 @@ def main():
 
     if not check_git():
         log.warning("Git not found.")
+        if _headless:
+            # No headless sudo flows: print the platform hint and stop.
+            log.error("Git is required; cannot run the GUI install helper in browser mode.")
+            print("Git is required to run Ouroboros.", file=sys.stderr)
+            print(git_install_hint(), file=sys.stderr)
+            sys.exit(1)
         _hint = git_install_hint()
         _install_status = (
             "Installing... A system dialog may appear."
@@ -1271,21 +1374,48 @@ def main():
     except OSError:
         pass
 
+    # Headless: handlers BEFORE the lifecycle thread spawns server.py — a
+    # SIGTERM in the ~60s readiness window must reach our teardown.
+    _abort = None
+    if _headless:
+        install_shutdown_signal_handlers(_headless_signal_handler)
+        _abort = _shutdown_event
+
     lifecycle_thread = threading.Thread(target=agent_lifecycle_loop, args=(port,), daemon=True)
     lifecycle_thread.start()
 
-    server_ready = _wait_for_server(port, timeout=15)
+    server_ready = _wait_for_server(port, timeout=15, abort_event=_abort)
     actual_port = _read_port_file()
     if actual_port != port:
-        server_ready = _wait_for_server(actual_port, timeout=45)
+        server_ready = _wait_for_server(actual_port, timeout=45, abort_event=_abort)
     else:
-        server_ready = server_ready or _wait_for_server(port, timeout=45)
+        server_ready = server_ready or _wait_for_server(port, timeout=45, abort_event=_abort)
+
+    if _headless and _shutdown_event.is_set():
+        # Shutdown during startup: same teardown the keep-alive loop performs
+        # (an aborted wait is a requested shutdown, not a startup failure).
+        log.info("Shutdown requested during headless startup; tearing down.")
+        stop_agent()
+        _kill_orphaned_children(actual_port)
+        # atexit owns release_pid_lock on sys.exit (a second release would
+        # unlink a newer launcher's lock).
+        sys.exit(0)
 
     if not server_ready:
         log.error("Agent failed to become healthy on port %d; aborting UI startup.", actual_port)
         _shutdown_event.set()
         stop_agent()
         lifecycle_thread.join(timeout=5)
+        if _headless:
+            _kill_orphaned_children(actual_port)
+            print(
+                "Ouroboros failed to start: the local agent server did not "
+                "become ready.\n"
+                f"See {_log_dir / 'launcher.log'} and "
+                f"{_log_dir / 'agent_stdout.log'} for details.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         webview.create_window(
             "Ouroboros — Startup Failed",
             html=(
@@ -1420,6 +1550,11 @@ def main():
         shutil.rmtree(_stale_open, ignore_errors=True)
 
     url = f"http://127.0.0.1:{actual_port}"
+
+    if _headless:
+        # Never returns: keep-alive loop + teardown + sys.exit inside.
+        _run_headless_main(url, actual_port, lifecycle_thread)
+
     window = webview.create_window(
         f"Ouroboros v{APP_VERSION}",
         url=url,

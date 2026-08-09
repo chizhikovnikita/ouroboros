@@ -136,7 +136,7 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     app = types.SimpleNamespace(state=types.SimpleNamespace(
         drive_root=root,
         app_start=0.0,
@@ -190,6 +190,54 @@ def test_cost_breakdown_fails_loudly_when_authoritative_history_is_corrupt(tmp_p
     assert "total_cost" not in payload
 
 
+def test_api_state_passes_projection_only_when_roots_match_and_computation_succeeded(
+    tmp_path, monkeypatch,
+):
+    """De-triplication seam pin: the snapshot receives this request's projection
+    exactly when the request root IS the supervisor root and accounting
+    computed; a foreign root or a failed computation passes NOTHING, so the
+    snapshot's own strict attempt keeps owning the paused-evolution disclosure."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_accounting(root)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 7.5)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    captured: list = []
+    monkeypatch.setattr(
+        queue, "get_evolution_status_snapshot",
+        lambda **kwargs: captured.append(kwargs) or {},
+    )
+
+    def _request():
+        return Request({
+            "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+            "query_string": b"", "scheme": "http", "server": ("test", 80),
+            "client": ("test", 1),
+            "app": types.SimpleNamespace(
+                state=types.SimpleNamespace(drive_root=root, app_start=0.0),
+            ),
+        })
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert list(captured[-1]) == ["budget_projection"]
+    assert captured[-1]["budget_projection"]["limit_usd"] == 7.5
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(tmp_path / "other-root"))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+
 def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, monkeypatch):
     from ouroboros.gateway.state import api_state
     from supervisor import queue, state, workers
@@ -203,7 +251,7 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     request = Request({
         "type": "http", "method": "GET", "path": "/api/state", "headers": [],
         "query_string": b"", "scheme": "http", "server": ("test", 80),
@@ -221,3 +269,134 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     assert payload["accounting"]["accounted_usd"] is None
     assert payload["accounting"]["remaining_known_usd"] is None
     assert payload["accounting"]["error_code"] == "ledger_unavailable"
+
+
+# --- v6.91 root task-detail cost_breakdown view ------------------------------
+
+
+def _settled_attempt(root, *, task_id, cost, category="task"):
+    attempt = _attempt(root, reservation_usd=cost, task_id=task_id, category=category)
+    ua.mark_dispatched(attempt)
+    ua.settle_attempt(
+        attempt,
+        {"prompt_tokens": 10, "completion_tokens": 5},
+        cost_usd=cost,
+        cost_final=True,
+    )
+    return attempt
+
+
+def _seed_tree_accounting(root):
+    """Root own spend + child spend + one disclosed-free and one undisclosed
+    delegated session — the submarine 'where did the money go' shape."""
+    _settled_attempt(root, task_id="root-1", cost=0.30)
+    _settled_attempt(root, task_id="child-1", cost=0.50)
+    ua.record_subscription_session(
+        "session-free", drive_root=root, route="claudexor/claude",
+        task_id="child-1", root_task_id="root-1", spend_usd=0.0,
+    )
+    ua.record_subscription_session(
+        "session-undisclosed", drive_root=root, route="claudexor/codex",
+        task_id="child-1", root_task_id="root-1", spend_usd=None,
+    )
+
+
+def test_usage_breakdown_delegated_axis_is_a_filter_not_a_new_sum(tmp_path, monkeypatch):
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    breakdown = ua.usage_breakdown(root, root_task_id="root-1")
+    delegated = breakdown["delegated"]
+    # The delegated bucket is the SAME subscription rows already counted in the
+    # top-level summary (sessions axis), filtered by execution kind.
+    assert delegated["subscription_sessions"] == 2
+    assert breakdown["subscription_sessions"] == 2
+    assert delegated["settled_usd"] == 0.0  # disclosed-free session
+    assert delegated["unknown_unmetered"] == 1  # undisclosed spend, never $0
+    assert delegated["physical_calls"] == 0  # sessions are not provider sends
+
+
+def test_task_detail_cost_breakdown_view_for_root(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.30
+    assert view["children_usd"] == 0.50  # subtree minus own — the by-hand subtraction, formalized
+    assert view["delegated_disclosed_usd"] == 0.0
+    assert view["subscription_sessions"] == 2
+    assert view["unknown_unmetered"] == 1
+    assert view["cost_final"] is False  # the undisclosed session keeps finality honest
+    assert view["authority"] == "physical_attempt_ledger"
+
+
+def test_task_detail_cost_breakdown_view_only_for_roots_and_fails_soft(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+    # Non-root: subtree math is not ledger-attributable mid-tree — omitted.
+    assert _task_cost_breakdown_view(root, {"task_id": "child-1", "root_task_id": "root-1"}) is None
+    # Unreadable ledger: absent view, never a confident $0 object.
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is None or view.get("cost_final") is False
+
+
+def test_task_detail_cost_breakdown_view_absent_when_nothing_was_accounted(tmp_path, monkeypatch):
+    """A READABLE but empty/legacy-only ledger must not publish a confident $0.
+
+    `_summary()` always returns a float for `accounted_usd`, so availability
+    decided on the dollar sum reports `own 0 / children 0 / cost_final true`
+    for a root whose real money was never ledger-attributed — the v6.64.1
+    "unknown rendered as a confident $0" class. Availability is decided on the
+    attributable ROW COUNTS instead."""
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    empty = ua.usage_breakdown(root, root_task_id="root-1")
+    # The trap: the ledger answers 0.0/final for a subtree it never measured.
+    assert empty["accounted_usd"] == 0.0 and empty["cost_final"] is True
+    assert _task_cost_breakdown_view(
+        root, {"task_id": "root-1", "root_task_id": "root-1", "cost_usd": 42.75},
+    ) is None
+
+    # Legacy-imported money is real but carries no root_task_id, so the
+    # root-filtered subtree is empty while the ledger holds dollars.
+    legacy_root = tmp_path / "legacy"
+    (legacy_root / "state").mkdir(parents=True)
+    (legacy_root / "logs").mkdir(parents=True)
+    (legacy_root / "state" / "state.json").write_text(
+        json.dumps({"spent_usd": 42.75, "spent_calls": 12}), encoding="utf-8",
+    )
+    ua.ensure_legacy_imported(legacy_root)
+    assert ua.usage_breakdown(legacy_root)["accounted_usd"] > 0.0
+    assert _task_cost_breakdown_view(
+        legacy_root, {"task_id": "root-1", "root_task_id": "root-1"},
+    ) is None
+
+    # One priced row makes the SAME subtree genuinely measured: the view returns
+    # and a root that spent nothing itself keeps its honest measured zero.
+    _settled_attempt(root, task_id="child-1", cost=0.25)
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.0 and view["children_usd"] == 0.25
+
+
+def test_task_detail_cost_breakdown_view_discloses_unattributed_money(tmp_path, monkeypatch):
+    """Subtree money that no task id claims gets its own axis, not the children's."""
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _settled_attempt(root, task_id="root-1", cost=0.30)
+    _settled_attempt(root, task_id="", cost=0.20)
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.30
+    assert view["unattributed_usd"] == 0.20
+    # Not silently folded into the children's share; the three axes still sum.
+    assert view["children_usd"] == 0.0
+    assert round(view["own_usd"] + view["children_usd"] + view["unattributed_usd"], 6) == 0.50

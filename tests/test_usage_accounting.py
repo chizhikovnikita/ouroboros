@@ -456,6 +456,97 @@ def test_explicit_reservation_is_not_inflated_by_tokenizer_margin(data_root):
     ua.release_attempt(opaque)
 
 
+def _isolated_anthropic_catalog(monkeypatch):
+    from ouroboros import pricing
+
+    monkeypatch.setattr(pricing, "_cached_pricing", {})
+    monkeypatch.setattr(pricing, "_pricing_fetched_at", {})
+    monkeypatch.setattr(pricing, "_pricing_retry_after", {})
+    monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
+    monkeypatch.setattr(
+        "ouroboros.llm.fetch_openrouter_pricing",
+        # (input, cached_read, cache_write(5m), output) per 1M tokens.
+        lambda **kwargs: {"anthropic/claude-test": (3.0, 0.3, 3.75, 15.0)},
+    )
+
+
+def test_reservation_prices_the_owner_cache_ttl_not_a_hardcoded_1h(data_root, monkeypatch):
+    """G3-5: `_reservation_cost` must bill the cache-write tier the owner's
+    global `OUROBOROS_PROMPT_CACHE_TTL` actually ships, not an unconditional
+    worst-case "1h". With the whole prompt assumed written to cache, 1h bills
+    2.0x base input while 5m/default bill 1.25x — a 1.28x admission inflation
+    that can reject calls the budget affords."""
+    _isolated_anthropic_catalog(monkeypatch)
+    request = _request(
+        data_root,
+        model="anthropic/claude-test",
+        provider="openrouter",
+        reservation_usd=None,
+        prompt_tokens_estimate=1_000,
+        max_completion_tokens=1_000,
+    )
+    # 1000 write-tokens * $3.75/M * (2.0/1.25) + 1000 out * $15/M = 0.021
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+    assert ua._reservation_cost(request) == 0.021
+    # 1000 write-tokens * $3.75/M + 1000 out * $15/M = 0.01875
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    assert ua._reservation_cost(request) == 0.01875
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
+    assert ua._reservation_cost(request) == 0.01875
+
+
+def test_request_carried_applied_ttl_wins_over_the_global_setting(data_root, monkeypatch):
+    """The dispatch path knows the finalizer's APPLIED wire TTL per payload;
+    that recorded fact outranks the global predictor. Junk values fall back to
+    the owner authority instead of becoming a third tier."""
+    _isolated_anthropic_catalog(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+
+    def _priced(ttl):
+        return ua._reservation_cost(_request(
+            data_root,
+            model="anthropic/claude-test",
+            provider="openrouter",
+            reservation_usd=None,
+            prompt_tokens_estimate=1_000,
+            max_completion_tokens=1_000,
+            prompt_cache_ttl=ttl,
+        ))
+
+    assert _priced("5m") == 0.01875
+    assert _priced("default") == 0.01875
+    assert _priced("1h") == 0.021
+    assert _priced("24h") == 0.021  # unknown value -> owner global ("1h")
+
+
+def test_admission_honors_the_cheaper_owner_tier(data_root, monkeypatch):
+    """G3-5 end-to-end: under a finite root limit sized between the 5m and 1h
+    reservation bounds, the owner's 5m selection must ADMIT the call that the
+    old hardcoded-1h pricing rejected — and 1h must still reject it."""
+    _isolated_anthropic_catalog(monkeypatch)
+
+    def _admit(root_id):
+        return ua.reserve_attempt(_request(
+            data_root,
+            model="anthropic/claude-test",
+            provider="openrouter",
+            reservation_usd=None,
+            prompt_tokens_estimate=1_000,
+            max_completion_tokens=1_000,
+            task_id=root_id,
+            root_task_id=root_id,
+            root_limit_usd=0.02,
+        ))
+
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+    with pytest.raises(ua.BudgetExceeded):
+        _admit("ttl-root-1h")
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    reservation = _admit("ttl-root-5m")
+    assert _ledger(data_root)[-1]["reservation_upper_bound_usd"] == 0.01875
+    ua.release_attempt(reservation)
+
+
 def test_known_hold_does_not_override_provider_reported_settlement(data_root):
     reservation = ua.reserve_attempt(_request(
         data_root,

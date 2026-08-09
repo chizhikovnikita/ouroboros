@@ -29,6 +29,7 @@ from ouroboros.tools.registry import (
     _authorized_managed_update_resolver,
     active_repo_dir_for,
 )
+from ouroboros.tools.claude_advisory_review import advisory_gate_unavailable
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
@@ -572,7 +573,32 @@ def _run_reviewed_stage_cycle(
             "block_reason": "no_advisory",
         }
 
-    _advisory_bypassed = skip_advisory_pre_review or not os.environ.get("ANTHROPIC_API_KEY", "")
+    # Route/slot-aware bypass detection (#123): the bare ANTHROPIC_API_KEY probe
+    # missed a disabled advisory slot (audited bypass with NO compensating test
+    # preflight) and falsely bypassed the keyless delegated route (duplicate
+    # hermetic pytest + a false "Advisory bypassed" progress line).
+    if skip_advisory_pre_review:
+        _advisory_bypassed = True
+    else:
+        try:
+            _advisory_bypassed = advisory_gate_unavailable()
+        except ValueError:
+            # Malformed slots/route config: fail closed INTO the compensating
+            # preflight — an unreadable advisory gate must cost a hermetic
+            # pytest run, never silently skip it.
+            _advisory_bypassed = True
+    # DISCLOSED RESIDUAL (owner decision, this release): this reads the CURRENT
+    # advisory availability, not the status of the advisory record that
+    # satisfied freshness above. Settings live outside the Git snapshot, so a
+    # run that recorded `bypassed` (slot off, or api route with no key) and was
+    # then followed by enabling the slot / adding the key reaches the commit
+    # with no compensating preflight. That is UNCHANGED from the key-only
+    # predicate this replaced — the same transition skipped it before — and the
+    # evidence-based alternative (deriving compensation from the matching
+    # AdvisoryRunRecord's recorded status) was weighed and deliberately not
+    # taken here. What DID change is the same-configuration case, which is
+    # where the silent gap actually lived: a disabled slot now costs the
+    # preflight instead of skipping both advisory and tests.
     _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
     _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
     if _advisory_bypassed and not skip_tests and not _doc_only:

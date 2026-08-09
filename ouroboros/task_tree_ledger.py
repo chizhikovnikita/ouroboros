@@ -60,33 +60,65 @@ def tree_ledger_path(
     return root / "task_trees" / validate_task_id(root_id) / "blackboard.jsonl"
 
 
+def child_result_disposition_violations(payload: Any) -> list[str]:
+    """EVERY violated constraint of the typed child-disposition row, in ONE pass.
+
+    Returns [] when the payload is valid. The aggregated list exists because the
+    old one-error-per-round shape cost a live parent 9 paid rounds discovering
+    the constraints serially (W2). The key set stays CLOSED and a malformed
+    payload stays an atomic no-op — unknown keys are rejected, never silently
+    ignored (a silently-dropped key would swallow future typed fields), and
+    nothing is truncated on the caller's behalf."""
+    if not isinstance(payload, dict):
+        return ["payload must be a JSON object"]
+    violations: list[str] = []
+    unknown = sorted(set(payload) - _CHILD_RESULT_DISPOSITION_FIELDS)
+    missing = sorted(_CHILD_RESULT_DISPOSITION_FIELDS - set(payload))
+    if unknown:
+        violations.append(
+            f"unknown key(s) {', '.join(unknown)} (the key set is CLOSED: exactly "
+            "type, child_task_id, disposition, child_result_sha256)"
+        )
+    if missing:
+        violations.append(f"missing key(s): {', '.join(missing)}")
+    if "type" not in missing and str(payload.get("type") or "") != CHILD_RESULT_DISPOSITION_TYPE:
+        violations.append(f"type must be exactly '{CHILD_RESULT_DISPOSITION_TYPE}'")
+    if "child_task_id" not in missing:
+        try:
+            validate_task_id(payload.get("child_task_id"))
+        except ValueError:
+            violations.append("child_task_id must be a valid task id")
+    if "disposition" not in missing:
+        disposition = str(payload.get("disposition") or "").strip().lower()
+        if disposition not in CHILD_RESULT_DISPOSITIONS:
+            violations.append(
+                f"disposition must be one of {'|'.join(sorted(CHILD_RESULT_DISPOSITIONS))}"
+            )
+    if "child_result_sha256" not in missing:
+        sha = str(payload.get("child_result_sha256") or "").strip().lower()
+        if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            violations.append(
+                "child_result_sha256 must be the 64-char hex sha of the child result "
+                "you actually read (from [SUBTASK_OUTCOME]/get_task_result)"
+            )
+    return violations
+
+
 def normalize_child_result_disposition_payload(payload: Any) -> Dict[str, str] | None:
     """Validate the one typed child-disposition row shape.
 
     The task-tree row is the sole durable authority. Consumers deliberately
     ignore malformed rows instead of interpreting free text or task-result
-    compatibility fields as a decision.
-    """
-
-    if not isinstance(payload, dict) or set(payload) != _CHILD_RESULT_DISPOSITION_FIELDS:
-        return None
-    if str(payload.get("type") or "") != CHILD_RESULT_DISPOSITION_TYPE:
-        return None
-    try:
-        child_task_id = validate_task_id(payload.get("child_task_id"))
-    except ValueError:
-        return None
-    disposition = str(payload.get("disposition") or "").strip().lower()
-    if disposition not in CHILD_RESULT_DISPOSITIONS:
-        return None
-    result_sha256 = str(payload.get("child_result_sha256") or "").strip().lower()
-    if len(result_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in result_sha256):
+    compatibility fields as a decision. Validity derives from
+    ``child_result_disposition_violations`` so the normalizer and the aggregated
+    diagnostics can never disagree."""
+    if child_result_disposition_violations(payload):
         return None
     return {
         "type": CHILD_RESULT_DISPOSITION_TYPE,
-        "child_task_id": child_task_id,
-        "disposition": disposition,
-        "child_result_sha256": result_sha256,
+        "child_task_id": validate_task_id(payload.get("child_task_id")),
+        "disposition": str(payload.get("disposition") or "").strip().lower(),
+        "child_result_sha256": str(payload.get("child_result_sha256") or "").strip().lower(),
     }
 
 
@@ -156,9 +188,13 @@ def tree_ledger_append(
         elif kind_norm == "decision" and allow_child_result_disposition:
             normalized = normalize_child_result_disposition_payload(payload)
             if normalized is None:
+                # ONE diagnostic authority for the closed contract: render the same
+                # aggregated violations `child_result_disposition_violations` gives
+                # the tool surface, instead of a second, weaker one-line message
+                # that could drift away from the constraints actually enforced.
                 return (
-                    "⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload must contain exactly "
-                    "type, child_task_id, disposition, and child_result_sha256."
+                    "⚠️ CHILD_RESULT_DISPOSITION_INVALID: "
+                    + "; ".join(child_result_disposition_violations(payload))
                 )
             # This flag is used only by join_ledger after direct-lineage and
             # current-result validation. Generic tree_note cannot bypass it.
@@ -210,6 +246,71 @@ def tree_ledger_append(
             "durably appended; no success acknowledgement was issued."
         )
     return f"OK: task-tree ledger[{rid}] += {kind_norm} entry ({len(body)} chars)."
+
+
+def record_subscription_window_exhausted(
+    root_id: str,
+    *,
+    child_task_id: str,
+    reset_at: str = "",
+    route: str = "",
+    executor: str = "",
+    data_root: pathlib.Path | None = None,
+) -> bool:
+    """Host-written ADVISORY ``delegation_constraint`` beacon for D28 exhaustion.
+
+    When a child's substrate resolution lands on ``subscription_window_exhausted``
+    (every plan window of the delegated route is spent — the child fell back to
+    metered tokens under ``auto`` or blocked under a ``harness`` pin), the parent
+    used to learn it only at absorption, typically AFTER blocking a full
+    wait_tasks window and after sibling fan-out kept scheduling onto the spent
+    route. This row rides the EXISTING attention channel — the kind is in
+    ``ATTENTION_KINDS``, so ``tree_ledger_attention_after`` (the wait tools'
+    early-wake poll) surfaces it mid-wait. ``advisory=True`` keeps it a
+    disclosure: the enforcement reducer (``effective_delegation_budget``) skips
+    advisory rows by contract, so nothing is gated — the woken parent decides
+    (wait for reset_at, accept metered spend, or reshape the fan-out).
+    Fail-soft: returns False on any write problem, never raises into dispatch.
+    """
+    try:
+        rid = validate_task_id(root_id)
+        child = validate_task_id(child_task_id)
+    except ValueError:
+        return False
+    reset = str(reset_at or "").strip()
+    text = (
+        f"Delegated substrate window exhausted for child {child}: every plan window of "
+        f"route {route or '?'} is spent"
+        + (f" (resets at {reset})" if reset else " (no reset instant reported)")
+        + f"; the child runs executor={executor or '?'}."
+    )
+    seed = "|".join([rid, child, "subscription_window_exhausted", reset])
+    row = {
+        "ts": utc_now_iso(),
+        "kind": DELEGATION_CONSTRAINT_KIND,
+        "text": text,
+        "task_id": child,
+        "role": "system",
+        "needs_parent_attention": True,
+        "payload": {
+            "constraint_id": "dc_" + sha256(seed.encode("utf-8")).hexdigest()[:16],
+            "directive": "halt_fanout",
+            "scope": {"route": str(route or ""), "executor": str(executor or "")},
+            "rationale": text[:1000],
+            "created_by": child,
+            "advisory": True,
+            "reason": "subscription_window_exhausted",
+            "reset_at": reset,
+            "child_task_id": child,
+        },
+    }
+    try:
+        path = tree_ledger_path(rid, data_root=data_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return bool(append_jsonl(path, row))
+    except Exception:
+        log.debug("Failed to append subscription-window-exhausted beacon for %s", rid, exc_info=True)
+        return False
 
 
 def tree_ledger_rows(
@@ -353,6 +454,7 @@ __all__ = [
     "CHILD_RESULT_DISPOSITIONS",
     "normalize_child_result_disposition_payload",
     "child_result_disposition_row",
+    "record_subscription_window_exhausted",
     "tree_ledger_path",
     "tree_ledger_append",
     "tree_ledger_rows",

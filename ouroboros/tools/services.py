@@ -354,7 +354,12 @@ def _start_service(
         workdir, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd, operation="service")
         workdir = pathlib.Path(workdir).resolve(strict=False)
     except Exception as exc:
-        return f"⚠️ SERVICE_CWD_ERROR: {type(exc).__name__}: {exc}"
+        # One failure class, one message (v6.54.3 SSOT): the canonical cwd block
+        # names every allowed root as label=path instead of a bare rootless
+        # ValueError echo; the SHELL_CWD_BLOCKED status is a typed policy denial.
+        from ouroboros.tool_access import shell_cwd_block_message
+
+        return shell_cwd_block_message(ctx, cwd, operation="service", error=exc)
     try:
         from ouroboros.protected_artifacts import shell_block_reason
 

@@ -147,6 +147,41 @@ def test_resolve_room_workspace_loud_fails_on_broken_working_dir(tmp_path):
     assert "unusable" in error and "broken" in error
 
 
+def test_resolve_room_workspace_loud_fails_when_registry_is_unreadable(tmp_path, monkeypatch):
+    """An UNREADABLE registry is not the same fact as "no working_dir".
+
+    Swallowing the read error returned ("", "") — indistinguishable from a file-less
+    project — so admission continued and the task ran workspace-less on the
+    self_modification profile over the SYSTEM repo. That is the same silent
+    degradation the v6.58.0 loud-fail invariant exists to kill."""
+    import ouroboros.projects_registry as projects_registry
+    from ouroboros.workspace_admission import resolve_room_workspace
+
+    data = tmp_path / "data"
+    data.mkdir()
+
+    def _boom(*_a, **_kw):
+        raise OSError("registry unreadable")
+
+    monkeypatch.setattr(projects_registry, "get_project", _boom)
+
+    resolved, error = resolve_room_workspace(
+        drive_root=data, system_repo_dir=tmp_path / "sys", project_id="room"
+    )
+    assert resolved == ""
+    assert error, "an unreadable registry must NOT resolve to a silent workspace-less task"
+    assert "unreadable" in error and "room" in error
+
+    # An explicit workspace_root never consults the registry, so it is unaffected.
+    ws = tmp_path / "explicit"
+    _init_git_repo(ws)
+    resolved_x, error_x = resolve_room_workspace(
+        drive_root=data, system_repo_dir=tmp_path / "sys", project_id="room",
+        explicit_workspace=str(ws),
+    )
+    assert error_x == "" and resolved_x == str(ws.resolve())
+
+
 # --- canonical source-ref truncation guard -------------------------------------
 
 def test_owner_request_source_ref_gets_full_hint_not_60_chars(tmp_path):

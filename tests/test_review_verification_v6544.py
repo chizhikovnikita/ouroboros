@@ -704,7 +704,9 @@ def test_clean_re_review_disposes_open_obligations(monkeypatch, tmp_path):
     solved = rs.ReviewRunResult(
         request={"surface": "task_acceptance"},
         actors=[{"signal": "PASS", "slot_id": "s0",
-                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship"}}],
+                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship",
+                            "criteria_used": [{"criterion": "deliverable is verified", "status": "supported",
+                                               "evidence_refs": ["verification_summary"]}]}}],
         parsed_findings=[], aggregate_signal="PASS",
     )
     prior = {"acceptance_obligations": [
@@ -731,8 +733,10 @@ def test_clean_pass_with_dissent_bullet_still_disposes_obligations(monkeypatch, 
     clean_with_dissent = rs.ReviewRunResult(
         request={"surface": "task_acceptance"},
         actors=[
-            {"signal": "PASS", "slot_id": "s0", "parsed": {"outcome_tier": "solved", "completion_coach": "ship"}},
-            {"signal": "PASS", "slot_id": "s1", "parsed": {"outcome_tier": "solved", "completion_coach": "ship"}},
+            {"signal": "PASS", "slot_id": "s0", "parsed": {"outcome_tier": "solved", "completion_coach": "ship",
+                                                           "criteria_used": [{"criterion": "verified", "status": "supported", "evidence_refs": ["verification_summary"]}]}},
+            {"signal": "PASS", "slot_id": "s1", "parsed": {"outcome_tier": "solved", "completion_coach": "ship",
+                                                           "criteria_used": [{"criterion": "verified", "status": "supported", "evidence_refs": ["verification_summary"]}]}},
             {"signal": "FAIL", "slot_id": "s2", "parsed": {
                 "outcome_tier": "best_effort",
                 "findings": [{"severity": "critical", "item": "doubt",

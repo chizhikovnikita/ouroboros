@@ -1331,7 +1331,7 @@ def test_store_task_result_marks_unresolved_tool_failure_failed(tmp_path):
             "tool_calls": [{
                 "tool": "run_command",
                 "args": {"cmd": "python3 -c ..."},
-                "result": "⚠️ ARTIFACT_OUTPUT_ERROR: undeclared output",
+                "result": "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.",
                 "is_error": True,
                 "status": "artifact_output_error",
             }],

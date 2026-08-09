@@ -194,6 +194,64 @@ def test_explicit_skip_still_bypasses_on_the_delegated_route(tmp_path, monkeypat
     assert payload["bypass_reason"] == "explicit skip_advisory_review=True"
 
 
+def test_commit_gate_bypass_detection_rides_the_route_slot_aware_predicate():
+    """The commit gate's twin of the four key sites (#123): the stage cycle's
+    bypass decision must go through the named route/slot-aware predicate
+    (``advisory_gate_unavailable``), never a bare ANTHROPIC_API_KEY env probe
+    that a new route or the advisory enable switch would silently defeat."""
+    import inspect
+
+    from ouroboros.tools import git as git_mod
+
+    source = inspect.getsource(git_mod._run_reviewed_stage_cycle)
+    assert "advisory_gate_unavailable" in source
+    assert 'os.environ.get("ANTHROPIC_API_KEY"' not in source
+
+
+def _clear_session_route_envs(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_REVIEW_SESSION_ROUTE", raising=False)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+
+
+def test_unroutable_session_slot_reports_the_gate_unavailable(monkeypatch):
+    """Triad a4 follow-up to #123: kind=agent_session with NO resolvable route
+    anywhere (no row target, no shared review/subagent route) structurally
+    cannot run — ``run_delegated_review_session`` refuses that exact state with
+    ``ReviewRouteUnavailable`` — so the gate must report UNAVAILABLE. The key
+    is present to prove the decision is route-driven, not key-driven."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-sentinel")
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
+    _clear_session_route_envs(monkeypatch)
+    assert advisory.advisory_gate_unavailable() is True
+
+
+def test_session_slot_with_shared_route_reports_the_gate_available(monkeypatch):
+    """The shared subagent route is the delegated advisory's documented
+    fallback target — with it set, the keyless session slot is AVAILABLE."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
+    _clear_session_route_envs(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claude")
+    assert advisory.advisory_gate_unavailable() is False
+
+
+def test_session_slot_with_its_own_target_reports_the_gate_available(monkeypatch):
+    """A structured advisory row carrying its own parseable session target
+    needs no shared route at all."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
+    _clear_session_route_envs(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
+        "advisory": {"enabled": True,
+                     "route": {"kind": "agent_session", "target_id": "codex"}},
+    }))
+    assert advisory.advisory_gate_unavailable() is False
+
+
 # ---------------------------------------------------------------------------
 # The advisory row's model/effort on the api route (6.1 + the D-5b fix)
 # ---------------------------------------------------------------------------

@@ -483,3 +483,52 @@ def test_settings_post_errors_on_max_route_change_when_provider_unreachable(monk
     # The model was NOT saved — the error path returns before persistence.
     assert current["OUROBOROS_MODEL"] == "openrouter/gpt-5.5"
     assert current["OUROBOROS_CONTEXT_MODE"] == "max"
+
+
+def test_max_context_auto_downgrade_writes_typed_attribution_event(tmp_path, monkeypatch):
+    """W3 adjacent (e): the system-initiated Max->Low narrowing (model change onto
+    an unverified route) used to leave ZERO rows in events.jsonl — the submarine
+    forensics mis-attributed it to the owner. It now writes a typed
+    context_mode_auto_downgraded event with actor=system_auto_low."""
+    import json
+
+    from ouroboros.gateway import settings as gw_settings
+
+    monkeypatch.setattr(gw_settings, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        gw_settings, "_max_context_block",
+        lambda *_a, **_k: {"error": "confirmed window 500K < 1M"},
+    )
+    monkeypatch.setattr(
+        gw_settings, "_active_main_route",
+        lambda s, **_k: {
+            "provider": "openrouter",
+            "model": str(s.get("OUROBOROS_MODEL") or ""),
+            "base_url": "",
+            "use_local": False,
+        },
+    )
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "false")
+
+    current = {"OUROBOROS_MODEL": "x-ai/grok-4.5"}
+    old = {"OUROBOROS_MODEL": "anthropic/claude-opus-5"}
+    notice, probe_error = gw_settings._apply_max_context_auto_downgrade(current, old)
+
+    assert probe_error is None
+    assert "Context mode switched to Low" in str(notice)
+    assert current["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "true"
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    events = [r for r in rows if r.get("type") == "context_mode_auto_downgraded"]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["actor"] == "system_auto_low"
+    assert (ev["from_mode"], ev["to_mode"]) == ("max", "low")
+    assert ev["model"] == "x-ai/grok-4.5"
+    assert "500K" in ev["reason"]

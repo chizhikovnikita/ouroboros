@@ -133,7 +133,7 @@ def test_history_annotates_terminal_from_effective_status(tmp_path, monkeypatch)
     # the raw on-disk file is still "running".
     monkeypatch.setattr(
         ts_mod, "load_effective_task_result",
-        lambda dr, tid: {"status": "failed"} if tid == "stuck1" else {},
+        lambda dr, tid, **kw: {"status": "failed"} if tid == "stuck1" else {},
     )
     msgs = _run(tmp_path, {})
     row = next(m for m in msgs if m.get("task_id") == "stuck1")
@@ -160,7 +160,7 @@ def test_history_projects_terminal_review_truth_without_task_summary(tmp_path, m
     monkeypatch.setattr(
         ts_mod,
         "load_effective_task_result",
-        lambda dr, tid: {
+        lambda dr, tid, **kw: {
             "status": "completed",
             "reason_code": "acceptance_degraded",
             "outcome_axes": {
@@ -217,7 +217,7 @@ def test_history_projects_terminal_review_truth_only_on_existing_summary(tmp_pat
     monkeypatch.setattr(
         ts_mod,
         "load_effective_task_result",
-        lambda _dr, tid: {
+        lambda _dr, tid, **kw: {
             "status": "completed",
             "reason_code": "acceptance_degraded",
             "outcome_axes": {

@@ -77,6 +77,12 @@ _PLAN_REVIEW_MAX_SCOUTS = 16
 _PLAN_REVIEW_STATE_MAX_BYTES = 1_000_000
 _PLAN_REVIEW_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLAN_REVIEW_REASON_MAX_CHARS = 2_000
+# Bounded per-wave copy of the plan scope's acceptance_claims (W2): the raw agent
+# text is the fingerprint identity; this copy exists because disposition-mode
+# closure cannot resend the envelope. Item bound = the contract claim-text cap
+# (600) plus the truncation marker's own length.
+_PLAN_REVIEW_MAX_CLAIMS = 24
+_PLAN_REVIEW_CLAIM_MAX_CHARS = 800
 _PLAN_REVIEW_PHASES = {
     "scheduling",
     "waiting",
@@ -524,6 +530,28 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: scout schedule reason is too large")
             roles.add(role)
             issued_ids.update(normalized_ids)
+        claims = wave.get("acceptance_claims")
+        if claims is not None:
+            if (
+                not isinstance(claims, list)
+                or not claims
+                or len(claims) > _PLAN_REVIEW_MAX_CLAIMS
+                or any(
+                    not isinstance(item, str)
+                    or not item.strip()
+                    or len(item) > _PLAN_REVIEW_CLAIM_MAX_CHARS
+                    for item in claims
+                )
+            ):
+                raise ValueError(
+                    "PLAN_REVIEW_STATE_INVALID: wave acceptance_claims must be a bounded "
+                    "list of non-empty strings"
+                )
+        claims_omitted = wave.get("acceptance_claims_omitted", 0)
+        if not isinstance(claims_omitted, int) or isinstance(claims_omitted, bool) or claims_omitted < 0:
+            raise ValueError(
+                "PLAN_REVIEW_STATE_INVALID: acceptance_claims_omitted must be a non-negative count"
+            )
         included = wave.get("included_task_ids")
         consumed = wave.get("consumed_task_ids")
         omissions = wave.get("omissions")
@@ -790,6 +818,38 @@ def plan_review_gate_projection(
     }
 
 
+def closed_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
+    """The wave holding the CURRENT CLOSED plan authority, or None.
+
+    Mirrors plan_review_gate_projection's closed branch exactly: the
+    ``current_attempt`` pointer wins over ``latest_review_fingerprint`` (so a newer
+    validated fingerprint never falls back to an older durable GREEN), and closed
+    means an INTEGRATED review with closed=true and outcome GREEN or
+    disposition-closed REVIEW_REQUIRED. Pure read; the returned wave is a private
+    copy (``plan_review_wave`` deep-copies)."""
+    if not isinstance(state, dict):
+        return None
+    attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
+    fingerprint = str(attempt.get("fingerprint") or "") or str(
+        state.get("latest_review_fingerprint") or ""
+    )
+    if not fingerprint:
+        return None
+    wave = plan_review_wave(state, fingerprint)
+    if wave is None:
+        return None
+    review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
+    integrated = bool(
+        review
+        and str(wave.get("phase") or "") == "reviewed"
+        and str(wave.get("review_evidence_status") or "integrated") != "pending"
+    )
+    closed = bool(review.get("closed")) and str(review.get("aggregate_signal") or "") in {
+        "GREEN", "REVIEW_REQUIRED",
+    }
+    return wave if (integrated and closed) else None
+
+
 def record_plan_review_attempt(
     results_drive_root: Any,
     task_id: str,
@@ -873,6 +933,34 @@ def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[s
     return None
 
 
+def _bounded_wave_acceptance_claims(acceptance_claims: Any) -> Dict[str, Any]:
+    """Bounded per-wave claims copy, only-when-set; an over-cap tail is DISCLOSED
+    (acceptance_claims_omitted), never silently dropped (BIBLE P1).
+
+    Claim text is frozen byte-for-byte apart from the disclosed truncation bound:
+    the review panel sees ``normalize_plan_scope`` output (per-item strip, internal
+    whitespace PRESERVED), so a lossy rewrite here — the historical
+    ``" ".join(split())`` — made acceptance bind DIFFERENT text than the panel
+    reviewed (an exact-output claim quoting code/spacing changed meaning)."""
+    from ouroboros.utils import truncate_review_artifact
+
+    cleaned = [
+        str(item).strip()
+        for item in (acceptance_claims if isinstance(acceptance_claims, list) else [])
+    ]
+    bounded = [
+        truncate_review_artifact(item, limit=600)
+        for item in cleaned if item
+    ]
+    if not bounded:
+        return {}
+    omitted = max(0, len(bounded) - _PLAN_REVIEW_MAX_CLAIMS)
+    out: Dict[str, Any] = {"acceptance_claims": bounded[:_PLAN_REVIEW_MAX_CLAIMS]}
+    if omitted:
+        out["acceptance_claims_omitted"] = omitted
+    return out
+
+
 def reserve_plan_review_wave(
     results_drive_root: Any,
     task_id: str,
@@ -881,6 +969,7 @@ def reserve_plan_review_wave(
     plan_text_hash: str,
     scout_roles: List[str],
     cutoff_at: str,
+    acceptance_claims: Optional[List[str]] = None,
 ) -> tuple[Dict[str, Any], bool]:
     created = False
 
@@ -905,6 +994,11 @@ def reserve_plan_review_wave(
             "omissions": [],
             "consumed_task_ids": [],
             "disposition_warnings": [],
+            # W2: the wave freezes a bounded copy of the scope's acceptance_claims at
+            # reserve time — the claims are part of the fingerprinted envelope, so they
+            # cannot drift within a wave, and disposition-mode closure (which cannot
+            # resend the envelope) still has the exact reviewed claims to bind.
+            **_bounded_wave_acceptance_claims(acceptance_claims),
         })
         return state
 

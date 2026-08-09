@@ -247,14 +247,7 @@ def review_wave_budget_gate(
         return None
 
 
-# Review prompt-cache TTL: review rounds repeat minutes apart (plan waves,
-# skill re-reviews, acceptance passes), sometimes past the provider's 5-minute
-# default cache lifetime. The 1h tier costs a higher one-time write multiplier
-# but keeps the large stable governance prefix warm across a whole review cycle.
-REVIEW_CACHE_TTL = "1h"
-
-
-def cached_prompt_blocks(stable_text: str, dynamic_text: str = "", *, ttl: str = REVIEW_CACHE_TTL) -> list:
+def cached_prompt_blocks(stable_text: str, dynamic_text: str = "", *, ttl: str | None = None) -> list:
     """System content as blocks: [stable prefix + cache marker][dynamic tail].
 
     The stable prefix MUST be genuinely stable across the surface's repeat calls
@@ -264,12 +257,22 @@ def cached_prompt_blocks(stable_text: str, dynamic_text: str = "", *, ttl: str =
     counters) belongs in the second, unmarked block. Models whose route does not
     honor cache_control simply have the marker stripped by the send-time policy
     (llm._copy_messages_with_cache_policy) — the block structure is portable.
+
+    ``ttl=None`` (every review call site) projects the owner's global
+    ``OUROBOROS_PROMPT_CACHE_TTL`` — the former ``REVIEW_CACHE_TTL='1h'`` constant
+    collapsed into that setting (owner decision 2026-08-08 Q2=A: an HONEST global
+    override, so '5m' really lowers review lanes; the shipped '1h' default keeps
+    the review economics; 'default' emits the bare marker). An explicit ``ttl``
+    stays a caller decision — the send-time finalizer still stamps the global
+    over it on the Anthropic-normalizing family whenever it names a tier.
     """
-    blocks: list = [{
-        "type": "text",
-        "text": stable_text,
-        "cache_control": {"type": "ephemeral", "ttl": ttl},
-    }]
+    if ttl is None:
+        from ouroboros.config import resolve_prompt_cache_ttl
+        ttl = resolve_prompt_cache_ttl()
+    cache_control: dict = {"type": "ephemeral"}
+    if ttl in ("5m", "1h"):
+        cache_control["ttl"] = ttl
+    blocks: list = [{"type": "text", "text": stable_text, "cache_control": cache_control}]
     if str(dynamic_text or "").strip():
         blocks.append({"type": "text", "text": dynamic_text})
     return blocks

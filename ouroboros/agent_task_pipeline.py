@@ -31,6 +31,7 @@ from ouroboros.outcomes import (
     maybe_write_verification_artifact,
     normalize_outcome_axes,
 )
+from ouroboros.connection_rating import record_outcome_from_loop
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.subagents import envelope_from_task
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
@@ -290,9 +291,7 @@ def _pre_synthesis_usage_snapshot(
         return snapshot
 
     task_id = str(task.get("id") or task.get("task_id") or "")
-    budget_root = pathlib.Path(
-        task.get("budget_drive_root") or getattr(env, "drive_root", ".")
-    )
+    budget_root = pathlib.Path(task.get("budget_drive_root") or getattr(env, "drive_root", "."))
     snapshot.update({
         "cost_snapshot_at": utc_now_iso(),
         "cost_final": False,
@@ -687,15 +686,6 @@ def _derive_host_bound_loop_outcome(
     return derive_loop_outcome(text or "", usage, llm_trace)
 
 
-def _rating_outcome_signal(task: Dict[str, Any], loop_outcome: Dict[str, Any], drive_root: Any) -> None:
-    """Seam to the connection rating; what counts as a good outcome lives there."""
-    try:
-        from ouroboros.connection_rating import record_outcome_from_loop
-        record_outcome_from_loop(task, loop_outcome, drive_root)
-    except Exception:
-        log.debug("connection outcome signal skipped", exc_info=True)
-
-
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -706,7 +696,7 @@ def emit_task_results(
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
-    _rating_outcome_signal(task, loop_outcome, getattr(env, "drive_root", None))
+    record_outcome_from_loop(task, loop_outcome, getattr(env, "drive_root", None))
     # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
     # flag HERE — once — so the SAME flagged loop_outcome feeds events and the durable
     # task_result.json. _store_task_result reuses this loop_outcome, so the
@@ -1434,10 +1424,15 @@ def build_review_context(env: Any) -> str:
             load_state,
             make_repo_key,
         )
-        from ouroboros.task_continuation import list_review_continuations
+        from ouroboros.task_continuation import (
+            list_review_continuations,
+            retire_settled_continuations_for_context,
+        )
         from ouroboros.task_results import load_task_result
 
         state = load_state(pathlib.Path(env.drive_root))
+        retired = retire_settled_continuations_for_context(
+            env.drive_root, state, lambda tid: load_task_result(env.drive_root, tid))
         continuations, corrupt = list_review_continuations(env.drive_root)
         repo_dir = pathlib.Path(env.repo_dir)
         repo_key = make_repo_key(repo_dir)
@@ -1518,6 +1513,11 @@ def build_review_context(env: Any) -> str:
         else:
             lines.append("- open_obligations=0")
 
+        if retired:
+            lines.append(f"- {len(retired)} settled continuation(s) archived out of context "
+                         "(durable under state/review_continuations/archived/): "
+                         + ", ".join(retired[:5])
+                         + (f" (+{len(retired) - 5} more)" if len(retired) > 5 else ""))
         scoped_continuations = [
             item for item in continuations
             if item.repo_key in ("", repo_key, _LEGACY_CURRENT_REPO_KEY)

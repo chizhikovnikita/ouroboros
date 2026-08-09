@@ -849,16 +849,13 @@ def _apply_max_context_auto_downgrade(
 ) -> tuple:
     """Narrow Max->Low IN PLACE when a model change lands on an unverified route.
 
-    Returns ``(notice, probe_error)``: at most one is set. ``probe_error`` means the
-    provider could not be reached at all and the caller must 503 WITHOUT saving.
-
-    Max-mode is fail-closed (BIBLE P1/P3). The low->max TOGGLE is gated by
-    api_owner_context_mode, but a model/provider CHANGE while already in Max must not
-    silently keep Max on an unverified (sub-1M / unknown) route. Owner decision
-    (v6.33.0 WS11): changing models stays FRICTION-FREE — the model change ALWAYS
-    succeeds; if the new route can't be confirmed >=1M the context mode
-    AUTO-DOWNGRADES to Low with a plain notice (never a 409 that blocks the save).
-    Every uncertainty resolves CLOSED (-> Low)."""
+    Returns ``(notice, probe_error)``: at most one is set. ``probe_error`` = the
+    provider could not be reached at all; the caller must 503 WITHOUT saving.
+    Max-mode is fail-closed (BIBLE P1/P3): the low->max TOGGLE is gated by
+    api_owner_context_mode, but a model/provider CHANGE in Max must not silently keep
+    Max on an unverified (sub-1M) route. Owner decision (v6.33.0 WS11): the model
+    change ALWAYS succeeds (friction-free); an unconfirmed >=1M route AUTO-DOWNGRADES
+    to Low with a plain notice, never a blocking 409. Uncertainty resolves CLOSED."""
     from ouroboros.config import get_context_mode
 
     try:
@@ -891,14 +888,23 @@ def _apply_max_context_auto_downgrade(
         )
     current["OUROBOROS_CONTEXT_MODE"] = "low"
     os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
-    # This narrowing is SYSTEM-initiated on an AGENT-REACHABLE path (a plain
-    # {"OUROBOROS_MODEL": ...} POST names neither the context key nor settings.json, so
-    # the self-lowering shell guard cannot see it). Since v6.80.0 the context mode also
-    # decides whether the BIBLE P3 blocking scope review applies, so the auto-low is
-    # marked as derived: get_owner_context_mode keeps reporting the OWNER's selection,
-    # and scope review stays ON. Context sizing is unchanged.
+    # SYSTEM-initiated narrowing on an AGENT-REACHABLE path (a plain model POST names
+    # neither the context key nor settings.json — the self-lowering shell guard cannot
+    # see it). Since v6.80.0 the mode also gates the BIBLE P3 blocking scope review, so
+    # the auto-low is marked DERIVED: the OWNER's selection keeps scope review ON.
     current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
     os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    # Typed attribution row (zero rows got blamed on the OWNER); pre-save: a failed save leaves it env-only-true.
+    try:
+        route = _active_main_route(current)
+        append_jsonl(pathlib.Path(DATA_DIR) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "context_mode_auto_downgraded",
+            "actor": "system_auto_low", "from_mode": "max", "to_mode": "low",
+            "reason": str(block.get("error") or "route_window_unverified"),
+            "provider": str(route.get("provider") or ""),
+            "model": str(route.get("model") or ""), "use_local": bool(route.get("use_local"))})
+    except Exception:
+        log.debug("Failed to record context auto-downgrade event", exc_info=True)
     return (
         str(block.get("error") or "")
         + " Context mode switched to Low. To use Max with this model, confirm it "

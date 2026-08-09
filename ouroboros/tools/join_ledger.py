@@ -26,6 +26,7 @@ from ouroboros.task_tree_ledger import (
     CHILD_RESULT_DISPOSITIONS,
     CHILD_RESULT_DISPOSITION_TYPE,
     child_result_disposition_row,
+    child_result_disposition_violations,
     normalize_child_result_disposition_payload,
     tree_ledger_append,
 )
@@ -148,23 +149,34 @@ def _record_child_result_disposition(
 ) -> str:
     """Append the sole authoritative, exact-hash child disposition row."""
 
-    normalized = normalize_child_result_disposition_payload(payload)
-    if normalized is None:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload must contain exactly "
-            "type, child_task_id, disposition, and child_result_sha256."
+    # Aggregated diagnostics (W2): name EVERY violated constraint in ONE reply —
+    # the old one-error-per-round shape cost a live parent 9 paid rounds. The
+    # typed exact-hash authority is unchanged: no truncation on the caller's
+    # behalf, no superset keys accepted, malformed = atomic no-op.
+    problems = child_result_disposition_violations(payload)
+    reason_text = " ".join(str(rationale or "").split())
+    if not reason_text:
+        problems.append("tree_note text is required as the rationale")
+    elif len(reason_text) > 500:
+        problems.append(
+            f"tree_note rationale must be at most 500 characters (got {len(reason_text)}; "
+            "shorten it yourself — it is never truncated for you)"
         )
+    if problems:
+        return (
+            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: " + "; ".join(problems) + ". "
+            "Correct example: tree_note(kind='decision', text='<short why, ≤500 chars>', "
+            "payload={'type': 'child_result_disposition', 'child_task_id': '<id>', "
+            "'disposition': 'integrated'|'irrelevant'|'deferred', "
+            "'child_result_sha256': '<the 64-hex sha from [SUBTASK_OUTCOME]/get_task_result>'})."
+            " Nothing was recorded (atomic no-op)."
+        )
+    normalized = normalize_child_result_disposition_payload(payload)
+    if normalized is None:  # unreachable: violations above are the same authority
+        return "⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload failed normalization."
     tid = normalized["child_task_id"]
     disposition = normalized["disposition"]
     expected = normalized["child_result_sha256"]
-    reason_text = " ".join(str(rationale or "").split())
-    if not reason_text:
-        return "⚠️ CHILD_RESULT_DISPOSITION_INVALID: tree_note text is required as rationale."
-    if len(reason_text) > 500:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: tree_note rationale must be "
-            "at most 500 characters."
-        )
 
     status_drive_root = _status_drive_root(ctx)
     if not _is_own_child(ctx, status_drive_root, tid):

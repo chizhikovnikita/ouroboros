@@ -167,6 +167,105 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
         raise
 
 
+@pytest.mark.ui_browser
+def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data):
+    """Open/close cycles keep one live panel, flat ws listeners, and flat DOM.
+
+    P3 lifecycle concrete: closing or switching a project DESTROYS its chat
+    instance (disposing every ws.on subscription, the ResizeObserver, the
+    window/document listeners, and all timers), so repeated open/close cycles
+    cannot accumulate hidden panels, listeners, or DOM nodes. Panels marked
+    data-pending-work (staged attachments / in-flight upload) are the one
+    sanctioned exception and are excluded from the live-panel count.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    project_ids = [f"leak-{idx}" for idx in range(1, 4)]
+    for idx, project_id in enumerate(project_ids, start=1):
+        create_project(data_dir, project_id, name=f"Leak project {idx}")
+
+    # window.__ouroWs is the loopback debug hook app.js exposes for exactly
+    # this count; the module-scoped ws is unreachable from page.evaluate.
+    count_listeners = """() => {
+        const ws = window.__ouroWs;
+        return Object.values(ws.listeners).reduce((total, set) => total + set.size, 0);
+    }"""
+    live_panels = """() => [...document.querySelectorAll('.chat-instance-panel')]
+        .filter((panel) => panel.dataset.pendingWork !== '1').length"""
+    dom_count = "() => document.getElementsByTagName('*').length"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                for project_id in project_ids:
+                    page.wait_for_selector(
+                        f'.nav-project-row[data-project-id="{project_id}"]', timeout=30_000
+                    )
+
+                def open_project(project_id):
+                    page.click(f'.nav-project-row[data-project-id="{project_id}"]')
+                    page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
+                    page.wait_for_selector(
+                        f'[id="panel-pchat-{project_id}"]:not([hidden])', timeout=30_000
+                    )
+
+                def close_project():
+                    page.click("#project-panel-close")
+                    page.wait_for_function(
+                        "() => !document.getElementById('project-panel')"
+                        ".classList.contains('open')",
+                        timeout=30_000,
+                    )
+
+                # Baseline AFTER one full open/close cycle so one-time lazy
+                # registrations cannot masquerade as leaks.
+                open_project(project_ids[0])
+                close_project()
+                listeners_baseline = page.evaluate(count_listeners)
+                dom_baseline = page.evaluate(dom_count)
+                assert listeners_baseline > 0
+
+                # Small slack for churn outside the panel (badges, toasts);
+                # a leaked panel or card timeline is hundreds of nodes.
+                dom_slack = 30
+                for project_id in project_ids:
+                    open_project(project_id)
+                    assert page.evaluate(live_panels) <= 1
+                    close_project()
+                    assert page.evaluate(live_panels) == 0
+                    # Every cycle returns to the baseline: no monotonic growth.
+                    cycle_dom = page.evaluate(dom_count)
+                    assert cycle_dom <= dom_baseline + dom_slack, (dom_baseline, cycle_dom)
+                    assert page.evaluate(count_listeners) == listeners_baseline
+
+                # Direct project-to-project switch (no explicit close) also
+                # destroys the previous instance: one live panel, ever.
+                open_project(project_ids[0])
+                open_project(project_ids[1])
+                assert page.evaluate(live_panels) == 1
+                close_project()
+                assert page.evaluate(live_panels) == 0
+
+                assert page.evaluate(count_listeners) == listeners_baseline
+                final_dom = page.evaluate(dom_count)
+                assert final_dom <= dom_baseline + dom_slack, (dom_baseline, final_dom)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
 def _run_docker_ui_assertions(url: str) -> None:
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -3108,16 +3207,22 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 custom_input.wait_for(state="visible", timeout=30_000)
                 custom_input.fill("openai-compatible::scope-reviewer-x")
                 page.locator("#btn-save-settings").click()
+                # The capability ack is an in-app dialog since the native-dialog
+                # class ban (tests/test_web_dialogs_static.py); Playwright's
+                # page.on("dialog") hook only fires for window.alert/confirm/prompt.
+                ack_dialog = page.locator(".confirm-dialog")
+                ack_dialog.wait_for(state="visible", timeout=60_000)
+                ack_text = ack_dialog.inner_text()
+                page.screenshot(path=str(evidence_dir / "v6800-scope-review-ack.png"), full_page=True)
+                ack_dialog.locator("[data-confirm-ok]").last.click()
                 page.wait_for_function(
                     "() => (document.querySelector('#settings-status')?.textContent || '')"
                     ".includes('scope-review route')",
                     timeout=60_000,
                 )
-                page.screenshot(path=str(evidence_dir / "v6800-scope-review-ack.png"), full_page=True)
 
-                assert dialogs, "the owner was never asked to confirm the reviewer's window"
-                assert "1,000,000-token context window" in dialogs[0]
-                assert "openai-compatible::scope-reviewer-x" in dialogs[0], "the ack must name the exact route"
+                assert "1,000,000-token context window" in ack_text
+                assert "openai-compatible::scope-reviewer-x" in ack_text, "the ack must name the exact route"
                 status_text = page.locator("#settings-status").inner_text()
                 assert "Confirmed the required context window for 1 scope-review route(s)." in status_text
                 evidence = json.loads((data_dir / "state" / "capability_evidence.json").read_text(encoding="utf-8"))
@@ -3126,6 +3231,422 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                     if str(entry.get("model") or "") == "openai-compatible::scope-reviewer-x"
                 ]
                 assert acked, "no route-scoped capability evidence was stored for the acked reviewer"
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_superseded_input_dialog_resolves_object_result(direct_server_with_data):
+    """v6.90.3 dialog contract: superseding an INPUT dialog with a newer dialog
+    resolves the documented {confirmed: false, value: ''} — never a bare false
+    the docs do not promise (the supersession close is mode-aware)."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                first_result = page.evaluate(
+                    """
+                    async () => {
+                        const m = await import('/static/modules/confirm_dialog.js');
+                        const first = m.openConfirmDialog({
+                            title: 'first', body: 'input dialog', input: true,
+                        });
+                        const second = m.openConfirmDialog({
+                            title: 'second', body: 'supersedes the first',
+                        });
+                        const r1 = await first;
+                        document.querySelector('[data-confirm-cancel]')?.click();
+                        await second;
+                        return r1;
+                    }
+                    """
+                )
+                assert first_result == {"confirmed": False, "value": ""}
+                assert page.locator(".confirm-dialog").count() == 0
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_login_start_serialized_and_dismiss_keeps_unproven_job(direct_server_with_data):
+    """C7 (owner-approved): one login start at a time. A second start during
+    the in-flight create POST must not issue a second POST (the lock spans the
+    awaited create); a Dismiss whose cancel the daemon did NOT confirm keeps
+    the card and the job id; a later start against that unproven-live job is
+    refused instead of orphaning it."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+                posts: list = []
+                deletes: list = []
+
+                def handle_create(route):
+                    posts.append(1)
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body='{"job_id": "job-race-1", "job": {"state": "running"},'
+                             ' "attach_command": ""}',
+                    )
+
+                def handle_cancel(route):
+                    deletes.append(1)
+                    route.fulfill(status=503, content_type="application/json",
+                                  body='{"error": "daemon busy"}')
+
+                page.route("**/api/claudexor/login", handle_create)
+                page.route("**/api/claudexor/login/*", handle_cancel)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+                card_html = page.evaluate(
+                    """
+                    async () => {
+                        // The app ships its own #harness-login-card on the
+                        // Settings page — render lands THERE, so drive it.
+                        const host = document.getElementById('harness-login-card');
+                        if (!host) return 'NO-HOST';
+                        const m = await import('/static/modules/harness_accounts.js');
+                        // (1) Two rapid starts: the second must be refused by
+                        // the start lock while the first create is in flight.
+                        const p1 = m.startLogin('codex', 'race-a');
+                        const p2 = m.startLogin('codex', 'race-b');
+                        await p1; await p2;
+                        // (2) Dismiss with an unconfirmed cancel (DELETE 503).
+                        host.querySelector('[data-login-dismiss]')?.click();
+                        await new Promise((r) => setTimeout(r, 150));
+                        // (3) A new start against the unproven-live job must
+                        // be refused (cancel still fails with 503).
+                        await m.startLogin('codex', 'race-c');
+                        return host.innerHTML;
+                    }
+                    """
+                )
+                assert len(posts) == 1, f"exactly one create POST, got {len(posts)}"
+                assert len(deletes) >= 1, "dismiss must attempt the cancel DELETE"
+                assert "Could not cancel" in card_html, (
+                    "the card must stay with an honest error after an unproven cancel"
+                )
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server_with_data):
+    """C7 (round b4): dismiss and start share ONE lifecycle lock. A start
+    attempted while Dismiss awaits its (slow) cancel DELETE is refused — it can
+    neither create a job the dismiss continuation would then drop, nor cancel a
+    job it does not own. After the dismissal settles, a fresh start works and
+    stays tracked."""
+    import time as _time
+
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+                posts: list = []
+                deletes: list = []
+
+                def handle_create(route):
+                    posts.append(1)
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body='{"job_id": "job-ov-%d", "job": {"state": "running"},'
+                             ' "attach_command": ""}' % len(posts),
+                    )
+
+                def handle_cancel(route):
+                    deletes.append(1)
+                    _time.sleep(0.35)  # hold the DELETE open: the overlap window
+                    route.fulfill(status=200, content_type="application/json", body="{}")
+
+                page.route("**/api/claudexor/login", handle_create)
+                page.route("**/api/claudexor/login/*", handle_cancel)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+                result = page.evaluate(
+                    """
+                    async () => {
+                        const host = document.getElementById('harness-login-card');
+                        if (!host) return { error: 'NO-HOST' };
+                        const m = await import('/static/modules/harness_accounts.js');
+                        await m.startLogin('codex', 'ov-a');          // create #1
+                        host.querySelector('[data-login-dismiss]')?.click();
+                        // While the dismiss awaits its slow DELETE, a start
+                        // must be refused by the shared lifecycle lock.
+                        await m.startLogin('codex', 'ov-b');
+                        await new Promise((r) => setTimeout(r, 600));
+                        const clearedAfterDismiss = host.innerHTML === '';
+                        await m.startLogin('codex', 'ov-c');          // create #2
+                        return {
+                            clearedAfterDismiss,
+                            finalHasCard: host.innerHTML.length > 0,
+                        };
+                    }
+                    """
+                )
+                assert result.get("error") is None
+                assert result["clearedAfterDismiss"] is True, (
+                    "a PROVEN cancel must clear the card"
+                )
+                assert result["finalHasCard"] is True, (
+                    "the post-dismiss start must stay tracked (its card renders)"
+                )
+                assert len(posts) == 2, (
+                    f"exactly two create POSTs (the overlapped start is refused), got {len(posts)}"
+                )
+                assert len(deletes) == 1, (
+                    f"exactly one cancel DELETE (nobody cancels a job they don't own), got {len(deletes)}"
+                )
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_cancel_error_face_recovers_after_successful_poll(direct_server_with_data):
+    """Round b5: the cancel-failure note is TRANSIENT. After a Dismiss whose
+    DELETE failed (503), a recovered daemon whose poll reads the job
+    successfully must clear the note — the card settles on the job's real
+    state instead of staying stuck on the cancel-error face while the account
+    row says connected."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+
+                def handle_create(route):
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body='{"job_id": "job-rec-1", "job": {"state": "running"},'
+                             ' "attach_command": ""}',
+                    )
+
+                def handle_job(route):
+                    if route.request.method == "DELETE":
+                        route.fulfill(status=503, content_type="application/json",
+                                      body='{"error": "daemon busy"}')
+                        return
+                    # The recovered daemon: the poll reads the job fine and it
+                    # has SUCCEEDED while the cancel was failing.
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job": {"state": "succeeded"}}')
+
+                page.route("**/api/claudexor/login", handle_create)
+                page.route("**/api/claudexor/login/*", handle_job)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+                page.evaluate(
+                    """
+                    async () => {
+                        const host = document.getElementById('harness-login-card');
+                        const m = await import('/static/modules/harness_accounts.js');
+                        await m.startLogin('codex', 'rec-a');
+                        host.querySelector('[data-login-dismiss]')?.click();
+                        await new Promise((r) => setTimeout(r, 150));
+                        window.__cardMidway = host.innerHTML;
+                    }
+                    """
+                )
+                midway = page.evaluate("() => window.__cardMidway")
+                assert "Could not cancel" in midway, "the failed cancel must be visible first"
+                # The first poll tick lands after ~3s; the successful read must
+                # clear the transient note and settle the real (succeeded) face.
+                page.wait_for_function(
+                    "() => { const h = document.getElementById('harness-login-card');"
+                    " return h && !h.innerHTML.includes('Could not cancel'); }",
+                    timeout=10_000,
+                )
+                final_html = page.evaluate(
+                    "() => document.getElementById('harness-login-card').innerHTML"
+                )
+                assert "Could not cancel" not in final_html
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_refused_retry_keeps_polling_and_recovers(direct_server_with_data):
+    """Round b6[0]: Retry must NOT preemptively stop the poll — when the C7
+    guard refuses the restart (cancel unproven, job live), the old poll is the
+    only recovery path: a later successful GET clears the note and settles the
+    real verdict. Exactly one create POST throughout."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+                posts: list = []
+
+                def handle_create(route):
+                    posts.append(1)
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job_id": "job-rp-1", "job": {"state": "running"},'
+                                       ' "attach_command": ""}')
+
+                def handle_job(route):
+                    if route.request.method == "DELETE":
+                        route.fulfill(status=503, content_type="application/json",
+                                      body='{"error": "daemon busy"}')
+                        return
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job": {"state": "succeeded"}}')
+
+                page.route("**/api/claudexor/login", handle_create)
+                page.route("**/api/claudexor/login/*", handle_job)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+                midway = page.evaluate(
+                    """
+                    async () => {
+                        const host = document.getElementById('harness-login-card');
+                        const m = await import('/static/modules/harness_accounts.js');
+                        await m.startLogin('codex', 'rp-a');       // create #1, running
+                        await m.startLogin('codex', 'rp-b');       // guard: DELETE 503 -> refused, error face
+                        const retryBtn = host.querySelector('[data-login-retry]');
+                        if (!retryBtn) return 'NO-RETRY-BUTTON: ' + host.innerHTML.slice(0, 200);
+                        retryBtn.click();                          // the REAL retry handler (mutation site)
+                        await new Promise((r) => setTimeout(r, 250));
+                        return host.innerHTML;
+                    }
+                    """
+                )
+                assert not midway.startswith("NO-RETRY-BUTTON"), midway
+                assert "Could not cancel" in midway, "the refused restart must be visible"
+                page.wait_for_function(
+                    "() => { const h = document.getElementById('harness-login-card');"
+                    " return h && !h.innerHTML.includes('Could not cancel'); }",
+                    timeout=10_000,
+                )
+                assert len(posts) == 1, (
+                    f"the refused restart must not create a second job, got {len(posts)} POSTs"
+                )
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_server_with_data):
+    """Round b6[1]: a poll tick can settle the job (succeeded) while the
+    dismiss's slow DELETE is still in flight. The cancel continuation must
+    re-check the settle instead of stamping a cancel error AFTER it — the
+    terminal tick schedules no further poll, so that error would freeze the
+    card forever against a connected account row."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                page = browser.new_page()
+
+                def handle_create(route):
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job_id": "job-os-1", "job": {"state": "running"},'
+                                       ' "attach_command": ""}')
+
+                def handle_job(route):
+                    # Only GET polls reach the python route: the DELETE is
+                    # delayed on the JS side (a python-side sleep would
+                    # serialize the handlers and the poll could never overtake
+                    # the DELETE).
+                    route.fulfill(status=200, content_type="application/json",
+                                  body='{"job": {"state": "succeeded"}}')
+
+                page.route("**/api/claudexor/login", handle_create)
+                page.route("**/api/claudexor/login/*", handle_job)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+                final_html = page.evaluate(
+                    """
+                    async () => {
+                        // JS-side delayed DELETE: truly concurrent with polls.
+                        const realFetch = window.fetch.bind(window);
+                        window.fetch = (input, init = {}) => {
+                            const url = String(input && input.url ? input.url : input);
+                            const method = String((init && init.method)
+                                || (input && input.method) || 'GET').toUpperCase();
+                            if (method === 'DELETE' && url.includes('/api/claudexor/login/')) {
+                                return new Promise((resolve) => setTimeout(() => resolve(
+                                    new Response('{"error": "daemon busy"}',
+                                        { status: 503,
+                                          headers: { 'Content-Type': 'application/json' } })
+                                ), 4000));
+                            }
+                            return realFetch(input, init);
+                        };
+                        const host = document.getElementById('harness-login-card');
+                        const m = await import('/static/modules/harness_accounts.js');
+                        await m.startLogin('codex', 'os-a');
+                        host.querySelector('[data-login-dismiss]')?.click();
+                        // The ~3s poll settles the job while the DELETE is
+                        // still pending; the DELETE 503 lands at ~4s.
+                        await new Promise((r) => setTimeout(r, 5200));
+                        return host.innerHTML;
+                    }
+                    """
+                )
+                assert "Could not cancel" not in final_html, (
+                    "a cancel error must never be stamped over an already-settled job"
+                )
             finally:
                 browser.close()
     except PlaywrightError as exc:

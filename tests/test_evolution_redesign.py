@@ -319,7 +319,11 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
     assert pending[0]["constraints"] == "No web"
     assert pending[0]["allowed_resources"] == {"web": False}
     assert pending[0]["deadline_at"] == "2026-06-04T12:00:00Z"
-    assert pending[0]["task_contract"]["success_criteria"] == ["report delivered"]
+    # (W2) success_criteria is an input ALIAS: it arrives normalized into
+    # acceptance_claims (one concept, one carrier), not double-persisted.
+    contract = pending[0]["task_contract"]
+    assert [c["claim"] for c in contract["acceptance_claims"]] == ["report delivered"]
+    assert contract["success_criteria"] == []
     assert pending[0]["metadata"]["schedule_id"] == "hourly"
 
 

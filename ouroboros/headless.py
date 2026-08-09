@@ -417,6 +417,9 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
     child_result = load_task_result(child_drive, task_id)
     if not isinstance(child_result, dict):
         return None
+    # W2 receipt-level handoff: the child's durable verify_and_record receipts ride
+    # the SAME finalization copy-back as its artifacts (fail-soft, never blocks).
+    _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
     workspace_task = (
         _workspace_root_from_task(task) is not None and not task_is_readonly_subagent(task)
     )
@@ -483,6 +486,37 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         child_status,
         **payload,
     )
+
+
+def _publish_child_verification_receipts(
+    parent_drive_root: pathlib.Path, task_id: str, child_drive: pathlib.Path
+) -> None:
+    """Publish the child's durable ``verification_receipts.jsonl`` to the canonical root.
+
+    ``verify_and_record`` appends receipts under the CHILD's isolated drive while
+    the parent-side W2 readers (``control._get_task_result`` / ``wait_task``)
+    resolve receipts against the canonical status root — without this copy the
+    rows depend on a fail-silent artifact-sync side effect and rot entirely once
+    the child drive is pruned. Whole-file atomic tmp+rename, not append-merge:
+    receipts key on ``(drive_root, task_id)`` and this publish is the canonical
+    file's only writer for a CHILD task_id, so the copy is collision-free; the
+    append-only source makes re-publish (task_done + reaper/cancel re-checks) an
+    idempotent refresh. Fail-soft: logged, never blocks finalization."""
+    try:
+        # Lazy import: ouroboros.outcomes imports from ouroboros.headless at module level.
+        from ouroboros.outcomes import verification_receipts_path
+
+        src = verification_receipts_path(child_drive, task_id, create=False)
+        if not src.is_file():
+            return
+        dest = verification_receipts_path(parent_drive_root, task_id, create=True)
+        if dest.exists() and os.path.samefile(src, dest):
+            return  # shared-drive shape: already the canonical file
+        tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dest)
+    except Exception:
+        log.warning("Failed to publish child receipts for task %s", task_id, exc_info=True)
 
 
 def _copy_child_artifacts_to_parent(

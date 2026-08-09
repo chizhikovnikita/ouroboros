@@ -1,4 +1,5 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch, updateStrategyForPlan } from './api_client.js';
 
@@ -212,7 +213,13 @@ export function initUpdates({ mount, state }) {
     }
 
     async function rollback(target) {
-        if (!confirm(`Roll back to ${target}?\n\nA rescue snapshot of the current state will be saved. The server will restart.`)) return;
+        const confirmed = await openConfirmDialog({
+            title: 'Roll back',
+            body: `Roll back to ${target}?\n\nA rescue snapshot of the current state will be saved. The server will restart.`,
+            confirmLabel: 'Roll back',
+            danger: true,
+        });
+        if (!confirmed) return;
         try {
             const resp = await apiFetch('/api/git/rollback', {
                 method: 'POST',
@@ -263,9 +270,12 @@ export function initUpdates({ mount, state }) {
     }
 
     async function replaceWithOfficial() {
-        const proceed = confirm(
-            'Recovery will replace the active checkout with the exact official version from the selected channel.\n\nA rescue snapshot and a local keep branch preserve a copy, but the active branch will be reset. Continue?',
-        );
+        const proceed = await openConfirmDialog({
+            title: 'Replace with official version',
+            body: 'Recovery will replace the active checkout with the exact official version from the selected channel.\n\nA rescue snapshot and a local keep branch preserve a copy, but the active branch will be reset. Continue?',
+            confirmLabel: 'Replace checkout',
+            danger: true,
+        });
         if (!proceed) return;
         replaceBtn.disabled = true;
         try {
@@ -295,7 +305,12 @@ export function initUpdates({ mount, state }) {
     applyBtn.addEventListener('click', applyUpdate);
     replaceBtn.addEventListener('click', replaceWithOfficial);
     page.querySelector('#updates-promote').addEventListener('click', async () => {
-        if (!confirm('Promote current ouroboros branch to ouroboros-stable?')) return;
+        const confirmedPromote = await openConfirmDialog({
+            title: 'Promote to stable',
+            body: 'Promote current ouroboros branch to ouroboros-stable?',
+            confirmLabel: 'Promote',
+        });
+        if (!confirmedPromote) return;
         try {
             const resp = await apiFetch('/api/git/promote', { method: 'POST' });
             const data = await resp.json();

@@ -92,6 +92,23 @@ def stricter_sensitivity(left: Any, right: Any) -> str:
     return left_text if sensitivity_rank(left_text) >= sensitivity_rank(right_text) else right_text
 
 
+def ratchet_scope_sensitivity(scope: Any, parent: Any) -> Any:
+    """Return ``scope`` never labelled weaker than the scope it nests inside.
+
+    The ratchet lives here, with the sensitivity vocabulary, and is applied at the
+    single place scopes are bound. That is the point: a subtask must not be able
+    to widen where its parent's data may travel, and far too many call sites build
+    a child scope for "remember to propagate it" to be a real guarantee.
+    """
+    if parent is None:
+        return scope
+    own = getattr(scope, "data_sensitivity", "")
+    strictest = stricter_sensitivity(own, getattr(parent, "data_sensitivity", ""))
+    if sensitivity_rank(strictest) <= sensitivity_rank(own):
+        return scope
+    return replace(scope, data_sensitivity=strictest)
+
+
 def connection_allows_sensitivity(connection: "Connection", sensitivity: Any) -> bool:
     """Whether ``connection`` may carry work of this sensitivity.
 

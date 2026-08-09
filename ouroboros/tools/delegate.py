@@ -1298,6 +1298,10 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # PREVIEW path too: a payload big enough to spill is exactly the one whose
                 # containment block a reader is least likely to reach.
                 _record_containment(ctx, entry, payload)
+                from ouroboros.tools.control import cache_horizon_note
+                _horizon = cache_horizon_note(ctx, time.monotonic() - started)
+                if _horizon:
+                    payload["cache_horizon_note"] = _horizon
                 return json.dumps(payload, ensure_ascii=False, indent=2)
             if last_seq > baseline:
                 # The STREAM is not collapsed — the TIMER is. Every advance reaches the
@@ -1308,7 +1312,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)))
                 baseline = last_seq          # so the NEXT advance is counted once
             def _expired() -> str:
-                return progress.rendered_window(
+                rendered = progress.rendered_window(
                     run_id=rid, state=state, last_seq=last_seq, window=window,
                     elapsed_seconds=(None if _started_at is None else max(0, int(
                         (_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))),
@@ -1316,6 +1320,9 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     waiting_on_user=bool(summary.get("waitingOnUser")),
                     detail=detail, seen=seen,
                     budget=tool_result_limit("delegate_wait"))
+                from ouroboros.tools.control import cache_horizon_note
+                _horizon = cache_horizon_note(ctx, time.monotonic() - started)
+                return f"{rendered}\n\n{_horizon}" if _horizon else rendered
 
             if time.monotonic() >= deadline:
                 return _expired()

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_auto_grant_enabled
+from ouroboros.reviewer_slot_config import reviewer_slot_config_error
 from ouroboros.skill_loader import (
     SkillReviewState,
     auto_grant_if_enabled,
@@ -932,13 +933,20 @@ def _run_skill_advisory_pre_review(ctx: Any, *, skill_name: str, file_pack: str)
     """Return fail-open Claude Code advisory notes for a skill payload."""
     try:
         import os
-        if not os.environ.get("ANTHROPIC_API_KEY", ""):
-            return {}
-        if os.environ.get("PYTEST_CURRENT_TEST"):
-            return {}
         # Reuse advisory routing without adding a second persistent state machine.
         from ouroboros.tools import claude_advisory_review as advisory
-        if not hasattr(advisory, "_run_claude_advisory"):
+        # Availability, not just the key (#123 twin): the api route needs the
+        # key, the delegated route does not, and a DISABLED advisory slot is a
+        # standing owner decision that must not be overridden here — dispatching
+        # anyway would spend review budget the owner switched off. A malformed
+        # config counts as unavailable: skill advisory is OPTIONAL and fail-open,
+        # it must never hard-block skill review.
+        try:
+            if advisory.advisory_gate_unavailable():
+                return {}
+        except ValueError:
+            return {}
+        if os.environ.get("PYTEST_CURRENT_TEST") or not hasattr(advisory, "_run_claude_advisory"):
             return {}
         repo_dir = pathlib.Path(getattr(ctx, "repo_dir", _REPO_ROOT) or _REPO_ROOT)
         drive_root = pathlib.Path(getattr(ctx, "drive_root", repo_dir) or repo_dir)
@@ -1402,6 +1410,10 @@ def review_skill(
     )
     if preflight_outcome is not None:
         return preflight_outcome
+    if slot_err := reviewer_slot_config_error():  # #116: refuse loudly, never the silent default panel
+        return SkillReviewOutcome(
+            skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
+            error=f"invalid reviewer-slot configuration blocks skill review: {slot_err}")
     models = list(get_review_models())
     if len(file_packs) > 1:
         log.warning(

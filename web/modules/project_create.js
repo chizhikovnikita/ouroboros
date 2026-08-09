@@ -253,10 +253,20 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
             });
             const newName = res?.confirmed ? String(res.value || '').trim() : '';
             if (newName.length > maxNameLength) {
-                alert(`Project names are limited to ${maxNameLength} characters.`);
+                await openConfirmDialog({
+                    title: 'Rename project',
+                    body: `Project names are limited to ${maxNameLength} characters.`,
+                    alert: true,
+                });
             } else if (newName && newName !== project.name) {
                 try { await apiClient.projectUpdate(project.id, newName); onChanged?.(); }
-                catch (e) { alert(`Rename failed: ${e?.body?.error || e?.message || e}`); }
+                catch (e) {
+                    await openConfirmDialog({
+                        title: 'Rename failed',
+                        body: `Rename failed: ${e?.body?.error || e?.message || e}`,
+                        alert: true,
+                    });
+                }
             }
             if (anchorEl.isConnected) anchorEl.focus();
         } else if (action === 'delete') {
@@ -269,7 +279,13 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
             if (ok === true) {
                 onChanged?.({ projectId: project.id, lifecycle: 'deleting', optimistic: true });
                 try { await apiClient.projectDelete(project.id); }
-                catch (e) { alert(`Delete did not finish: ${e?.body?.error || e?.message || e}`); }
+                catch (e) {
+                    await openConfirmDialog({
+                        title: 'Delete did not finish',
+                        body: `Delete did not finish: ${e?.body?.error || e?.message || e}`,
+                        alert: true,
+                    });
+                }
                 finally { onChanged?.({ authoritative: true }); }
             }
             if (anchorEl.isConnected) anchorEl.focus();

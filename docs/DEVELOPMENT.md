@@ -136,8 +136,11 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   the system repo while contextual repo tools resolve against the active
   workspace through `ToolContext.active_repo_dir()`.
 - Workspace-mode tasks must use an explicit allowlist, reject system-repo/data
-  overlap, require a git worktree root, and return patch artifacts instead of
-  committing in the target repository.
+  overlap, require a git worktree root, and capture patch artifacts against the
+  preflight git base. Task-local git INCLUDING commits inside the workspace is
+  allowed — the v5.29 "no commits in external repositories" doctrine was
+  reversed in v6.27 ("full git is legitimate task work"); only git targeting
+  the Ouroboros runtime is blocked.
 - Workspace parent/headless tasks may call `task_acceptance_review`. For roots
   in auto/required mode, this call only records evidence for the single
   host-owned acceptance panel; it makes no reviewer-model call and returns no
@@ -510,6 +513,7 @@ Derived from P7 (Minimalism): entire codebase fits in one context window.
 
 - Module target: ~1000 lines. Crossing that line is P7 pressure and should trigger extraction or an explicit justification.
 - Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py`, `server.py`, temporary v5.7.1 debt `git.py`, and temporary v6.15/v6.16 debt `extension_loader.py` (OOP extension parity plus worker->server companion reconcile crossed the gate; the registry-coupled `PluginAPIImpl`/loader split is the deferred follow-up), and v6.20.0 acting-subagents debt `registry.py` / `events.py` (the acting authority/gating grew the tool dispatcher and the supervisor schedule handler past the 1600 gate; extracting their safety-critical dispatch/event internals is the deferred follow-up), v6.33.0 reliability debt `loop.py` / `shell.py` / `core.py` (deadline-aware finalization, the brace-group `sh -c` hint, single-file search, and the re-read-awareness nudge crossed three hot tool/loop modules whose helpers are tightly coupled to internals — a clean split fights the function-size gate and risks import cycles, so it is tracked debt), and v6.50.0 reconciliation-layer debt `control.py` / `workers.py` (typed schedule admission, cap serialization, and parent-side advisory reconciliation grew the existing scheduling surfaces; splitting before the new contract stabilizes would add indirection around the critical path), and v6.63.0 skill-payload debt `skills/unix_computer_use/plugin.py` (the OSWorld remote osworld_http/ssh_macos backends — connection registry, remote screenshot/input/exec translation, fail-closed guards — grew the skill past the gate; extracting the remote translation layer into a sibling payload module is the deferred follow-up; this entry is repo-path-qualified so a future skill's `plugin.py` is not silently exempted) — split deferred until each surface stabilises. The authoritative grandfathered set is `GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`.
+- The module target and hard gate also apply to `web/**/*.js` (perf/lifecycle sprint): the same constants, the same `GRANDFATHERED_OVERSIZED_MODULES` register (current JS debt: `web/modules/chat.js`, keyed by repo-relative path), and the same two consumers (`tests/test_smoke.py::test_no_oversized_modules` and `codebase_health` via `ouroboros/review.py::is_gated_js_module`). Vendored/minified payloads (`_VENDORED_SUFFIXES`/`_VENDORED_NAMES`) and `web/tests/` are excluded. Honest disclosure: the JS gate is LINE-COUNT ONLY — there is no function-length scan for JS (the function gates below stay Python-only).
 - Method target: <150 lines. Crossing that line is a decomposition signal, not an automatic failure by itself.
 - Method hard gate: 300 lines in `tests/test_smoke.py`.
 - Runtime-code function-count hard gate: enforced by `tests/test_smoke.py` against the value defined in `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (single source of truth — bump the constant when adding a feature with an explicit comment justifying the increase). Tracked `devtools/` operator code is excluded from this runtime health gate, but touched `devtools/` files are still fully reviewed. Precedent (2026-06-10, owner decision): the first consolidation paydown removed ~60 dead/duplicate/trivial-wrapper functions and the cap moved to 3500 with deliberate headroom — the gate exists to force acknowledged growth, not to sit at zero slack and churn on every small fix.
@@ -539,6 +543,75 @@ minimalism finding must name the exact symbol or authority, the concrete
 duplication or coupling, and a smaller alternative that still satisfies the
 contract. Diff size, line count, and file count alone are not findings.
 
+### Invariant: Projection over replay (hot readers of growing stores)
+
+A reader that runs per INTERACTION — an HTTP request, a WS/SSE message, a poll
+tick, a task turn — must not replay a growing store to produce its answer.
+Interactive read cost must be O(response), achieved through a maintained
+projection, a cursor, rotation, or a bounded tail — never a full-history scan
+filtered down to the answer.
+
+- **Per interaction is the unit.** Work that runs once per boot or per explicit
+  owner action may scan history; work on a request/message/poll-tick/task-turn
+  path may not. A scan that is cheap today is not the point — every growing
+  store crosses the threshold eventually, and the reader degrades exactly when
+  the system is most used.
+- **Storage-agnostic.** JSONL logs, SQLite tables, JSON snapshots — any store:
+  a full-table read filtered in code IS a replay (a `SELECT *` narrowed in
+  Python is the same failure as parsing a whole JSONL file for its tail). This
+  includes unbounded collections INSIDE snapshot/state files: a "snapshot" that
+  accretes an unbounded list re-reads its entire history on every load.
+- **Passive GET.** Read handlers perform no NEW steady-state durable writes.
+  Exactly two named exceptions exist: (1) substrate-owned integrity repair
+  performed under the substrate's own lock (the usage-ledger torn-tail
+  quarantine in `ouroboros/usage_ledger.py`), and (2) one-time idempotent
+  migrations guarded by a durable watermark (the legacy usage import). Anything
+  else that "just materializes a bit of state" on a GET is a mutation hiding on
+  a read path.
+- **House precedents — reuse these shapes instead of inventing new ones:**
+  chat log rotation with archive-aware readers
+  (`supervisor/state.py::rotate_chat_log_if_needed`); the compact
+  `containment_faults.jsonl` projection maintained beside an unbounded event
+  log (`ouroboros/delegate_custody.py`); dialogue-block consolidation — the P1
+  "infinite horizon, variable granularity" reader; and the passive-GET contract
+  of `gateway/control.py::api_update_status`.
+
+Enforcement: Repo Commit Checklist item 24 (advisory) triggers on diffs that
+add or change an endpoint/poller/subscription/timer or read a growing store;
+the hot-store growth health invariant
+(`agent_startup_checks.py::hot_store_growth_notes`, surfaced by
+`context.py::build_health_invariants`, thresholds justified in
+`ouroboros/context_budget.py`) is the deterministic runtime tripwire. A change
+that introduces a new append-only store read on an interactive path must
+enroll that store in the `ouroboros/context_budget.py` threshold table (with a
+justified constant) in the same commit — an unenrolled hot store is invisible
+to the tripwire.
+
+### Invariant: UI resources carry a disposer
+
+Every long-lived acquisition in `web/` returns or records a disposer, and a UI
+instance owns a `destroy()` that releases everything the instance acquired.
+The resource kinds this covers:
+
+- WS subscriptions (`ws.on(...)`)
+- `document`/`window` event listeners
+- observers (`ResizeObserver`, `MutationObserver`, `IntersectionObserver`)
+- timers (`setInterval`, long-lived `setTimeout` chains)
+- `requestAnimationFrame` loops
+- `EventSource` / streaming connections
+
+An instance that can be closed, hidden, or replaced (project chat panels are
+the canonical case) must be destroyable without leaving any acquisition
+behind; "hide the DOM node, keep the handlers" is the leak shape this
+invariant forbids. Late async continuations check a `destroyed` flag before
+touching state or re-arming loops.
+
+Enforcement (honest disclosure): the deterministic leak test runs in the
+release-tier `ui_browser` lane, not at commit tier; commit-tier coverage is
+the advisory Repo Commit Checklist item 24. The class is closed
+deterministically for the instrumented surfaces and advisorily for future
+ones.
+
 ---
 
 ## Core Governance Artifacts
@@ -556,7 +629,7 @@ Concrete requirements:
 
 | Flow | BIBLE.md | ARCHITECTURE.md | DEVELOPMENT.md |
 |------|----------|-----------------|----------------|
-| Main task context (`context.py`) | ✅ full (tier-0) | ✅ full for self-body tasks in max; navigation map for low, for external/headless/workspace tasks, and (v6.30.0) for evolution cycles — unless self-body docs are explicitly required (task field or contract) | ✅ full for self-body/runnable repo tasks (incl. evolution); external/headless/workspace tasks get an on-demand pointer unless the contract explicitly requires self-body docs |
+| Main task context (`context.py`) | ✅ full (tier-0) | ✅ full in max for EVERY task class — self-body, project tasks (folder or not), evolution, external/headless/workspace surfaces; navigation map in low (D-ARCH, owner 2026-08-08: architecture.md is the capability/tools/access map — without it the agent cannot reason about HOW to work effectively; context economy comes from dropping DEVELOPMENT.md, never ARCHITECTURE) | ✅ full for self-body/self-mod work (incl. evolution) — MODE-INDEPENDENT. D-DEV (owner 2026-08-08): DEVELOPMENT.md is the self-engineering handbook, so it loads exactly when the work targets Ouroboros's own body, and the signal is the ACTIVE REPO BINDING (`not _task_uses_external_context`) — a path fact, never a guess from message text (P5). The external-surface class (bound workspace incl. an auto-provisioned genesis tree, subagent, api/cli/scheduled) gets the visible on-demand pointer; a direct-chat turn in a PROJECT ROOM binds no workspace and KEEPS the handbook; `workspace="none"` keeps it; `context_requires_development`/`context_requires_self_body_docs` always win |
 | Triad review (`tools/review.py`) | ✅ via preamble | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | ↳ Anti-thrashing (v4.35.1) | — | — | Open obligations loaded from `review_state` via `load_state(drive_root)` + `make_repo_key(repo_dir)`, injected unconditionally into `_build_review_history_section` prompt context. Same mechanism in `scope_review.py::_build_scope_prompt` (best-effort when `drive_root` available). |
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
@@ -650,15 +723,29 @@ never runs `plan_task`, steers an existing task, or publishes the work inline.
 **Context mode (low / max).** The owner-selected `OUROBOROS_CONTEXT_MODE`
 (layout SSOT: `ouroboros/context_layout.py`) tiers the *reference-doc* layer of
 the agent's own context (main task context, background consciousness, deep
-self-review). In `max`, self-body tasks inline ARCHITECTURE.md and DEVELOPMENT.md
-in full. External/headless/workspace tasks receive ARCHITECTURE.md as a lossless
-navigation map and DEVELOPMENT.md as an on-demand pointer unless their
-`task_contract` explicitly requires self-body docs. In `low` (for ~200K / local
-models), ARCHITECTURE.md is a lossless **navigation map** (every section + line
-range; full sections read on demand via `read_file`), and DEVELOPMENT.md stays
-full for runnable repo/self-body task contexts unless a structured caller
-explicitly sets `context_requires_development=false` (then a visible on-demand
-pointer is used). README.md and CHECKLISTS.md are not inlined in the agent
+self-review). ARCHITECTURE.md follows the owner mode alone (D-ARCH, owner
+2026-08-08): in `max` it is ALWAYS inlined in full for EVERY task class —
+self-body, project work (with or without a folder), evolution, and
+external/headless/workspace/delegated surfaces — because it is Ouroboros's
+capability/tools/access map; in `low` (for ~200K / local models) it is a
+lossless **navigation map** (every section + line range; full sections read on
+demand via `read_file`). There is no per-task ARCHITECTURE downgrade in `max`.
+DEVELOPMENT.md (the self-engineering handbook) is chosen MODE-INDEPENDENTLY
+from the ACTIVE REPO BINDING (D-DEV, owner 2026-08-08): it is inlined in full
+iff the task's active repo is the system repo — `not
+_task_uses_external_context(task)` in `ouroboros/context.py`, i.e. whenever
+Ouroboros works on its own code, regardless of task class — and is a visible
+on-demand pointer for the external-surface class (a bound workspace, a
+subagent, or an api/cli/scheduled surface: work on ANOTHER codebase). An
+explicit `context_requires_development` on the task wins — an INTERNAL
+task-dict override for structured in-process callers; it is deliberately NOT a
+`POST /api/tasks` body field (the task API drops unknown keys). A task-API
+caller that needs the full handbook passes `context_requires_self_body_docs`
+(which the API does thread through), or the agent reads the doc via the visible
+on-demand pointer. Self-body task classes (explicit
+`context_requires_self_body_docs`, or evolution/deep_self_review/review types)
+always keep the handbook full.
+README.md and CHECKLISTS.md are not inlined in the agent
 context in either mode (README is user-facing; reviewers load their own
 CHECKLISTS copy). The tier-0 protected core — SYSTEM.md, BIBLE.md,
 identity, scratchpad, knowledge index, recent dialogue — is ALWAYS full in every
@@ -786,8 +873,9 @@ degradation ladder — full atlas → compact atlas (durable `context_manifest`
 keeps full per-file coverage) → a `required` artifact the atlas cannot fit is a
 FAILURE TO ASSEMBLE (typed `budget_omitted` row naming artifact and reason,
 `required_artifact_omitted` pack status, no review of the remainder), which the
-ladder answers by shrinking the fixed part and retrying → the largest touched files degrade to
-diff-only with an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` (their full
+ladder answers by shrinking the fixed part and retrying → touched files degrade to
+diff-only, freely degradable ones first and largest-first within each tier (an artifact owed in
+full is reached only after the `-U0` rung), with an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` (their full
 changes stay visible in the staged diff, and those paths are DECLARED to the
 atlas via `diff_only_included`, so the durable coverage row records the dropped
 snapshot rather than claiming the file is fully in the prompt; legal only for
@@ -1031,6 +1119,7 @@ Before every commit, verify the following:
 - `run_script` temporary files are created under the active workspace when the task is workspace/executor-backed, then removed after execution. Do not run workspace scripts from the system repo temp path; relative imports, generated files, and toolchain discovery must observe the same cwd the user requested.
 - Declared process outputs may be files or directories. Directory outputs are copied to the canonical artifact store as a bounded manifest plus zip archive; hidden/control/credential-shaped files, excessive file counts, and excessive byte sizes fail closed instead of leaking through artifact registration.
 - In external workspace mode, light-mode self-repo dirty checks snapshot the system repo, not the active workspace. Task-local git operations inside the external workspace are allowed when the task requires them; Ouroboros repo/data paths remain structurally protected, and workspace patch artifacts are captured against the preflight git base.
+- The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
 - `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
@@ -1080,7 +1169,10 @@ Before every commit, verify the following:
   execution rejects forbidden calls even when invoked manually.
 - Mutative ("acting") subagents (`task_constraint.mode="acting_subagent"`) are
   opt-in via `schedule_subagent(write_surface=...)` plus the master toggle
-  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (default ON in advanced/pro, OFF in light).
+  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (explicit owner value applies to every
+  surface; unset default is SURFACE-AWARE: every surface ON in advanced/pro,
+  light allows `external_workspace`/`genesis` — they build outside the Ouroboros
+  runtime — and keeps `self_worktree` OFF).
   `active_tool_profile` must fail closed: an invalid/missing surface, or a
   delegated subagent with a broken constraint, resolves to read-only — never to
   `self_modification`/`operator_control`. Acting children write only inside their
@@ -1249,9 +1341,15 @@ Before every commit, verify the following:
   current unsaved wizard payload, UI diagnostics must account for that in-memory
   value instead of warning from stale saved settings alone.
 - Owner switches should expose the semantic choices the owner can actually make.
-  For `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`, Settings presents explicit On/Off;
-  the empty runtime-default state remains a backend/default behavior, not a third
-  owner-facing button.
+  For `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`, Settings presents Off / Auto / On
+  (SC-4): Auto IS the unset, mode-derived state — it saves the empty value so
+  the surface-aware runtime-mode default keeps deciding. Unset displays as the
+  effective state where a binary label is truthful (advanced/pro = every surface
+  on = "On") and as "Auto" in light, where the surface-aware default
+  (`external_workspace`/`genesis` on, `self_worktree` off) makes both "On" and
+  "Off" false claims. The v6.22.1-era rule that the empty runtime-default must
+  not become a third owner-facing button was valid only while the unset default
+  was binary per mode; the v6.91 surface-aware light default obsoleted it.
 - One capability, one section. Delegation (`OUROBOROS_SUBAGENT_HARNESS`) and the
   write permission (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`) share Models → Subagents
   (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where
@@ -1272,10 +1370,11 @@ Before every commit, verify the following:
 - [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.
 - [ ] Every core-mediated physical provider send goes through `usage_accounting.execute_physical_attempt[_async]`: reserve, mark dispatched, then settle/unresolve. A transport retry is a new attempt. `llm_usage`, state, and UI counters are projections carrying attempt ids, never a second monetary authority. Provider tier pricing and any empirical tokenizer margin affect only a known reservation; settlement prefers actual provider usage/cost. Unknown price reserves `None`, remains nullable in usage events, and never blocks a model merely because its tariff is unavailable. An external skill with granted model-provider credentials is explicitly unknown/unmetered when it bypasses core transport—not `$0`; an ordinary spawned process must not be mislabeled as monetary work.
 - [ ] Hold the usage-ledger cross-process lock only for budget check, validated append, and fsync. Never hold it over network I/O. Preserve a paid response if settlement persistence fails and leave an honest dispatched/unresolved bound.
+- [ ] **Tree-spend visibility (v6.91).** Any cost number shown to the model as a stop/pacing input under a root cap must be the ROOT SUBTREE's ledger-accounted spend (the number the fence enforces), labeled "accounted incl. in-flight holds" — own accumulated cost is a diagnostic, and unknown is "unknown", never `$0`. Feed it from `usage_accounting.last_root_accounting` (the scope-telemetry stash `reserve_attempt` refreshes for free inside its existing lock) and refresh with a real `refresh_root_accounting` read ONLY at rare, already cache-breaking surfaces (loop start, the 600s pacing note, the 15-round checkpoint) or under an explicit staleness bound on the two deciding surfaces (`_TREE_ACCOUNTING_MAX_STALE_SEC`: free while rounds are shorter than the bound, since every dispatch refreshes the stash — one read when a round blocks longer, e.g. a 900s `wait_tasks` while children spend). Do NOT add unconditional per-round `usage_projection` reads (the O(ledger)-under-lock contention class, e4a87344: 137 tasks burned) and do not put live numbers in the stable cached prefix (see the cache-friendliness invariant below — the static root cap in the start-of-task runtime block is the one allowed static disclosure). The in-task graceful stop is `task_pacing.resolve_cost_ceiling` (typed: `disabled`/`active`/`exhausted_soft_land`/`unknown`; the planning margin is small and ABSOLUTE, never a pct of the cap); it fires the existing forced-final path BEFORE the fence and must never weaken the fence's no-bypass invariant. The two money axes are INDEPENDENT: an absent global budget (`TOTAL_BUDGET` unset → `budget_remaining_usd is None`, the GAIA-shaped run) must never short-circuit the cost gate before the ceiling is consulted — a live root cap has to stop the task on its own, and only a `disabled` ceiling (explicit `cost_hard_stop_pct=0`, or neither axis finite) silences the axis. And the own-cost fallback is DISCLOSED, never silent: `task_pacing.resolve_deciding_spend` is the one place that picks the deciding number and returns its basis (`tree_accounted` / `own_fallback_tree_unknown` / `own_only_no_tree_cap`), so under a root cap an own-cost stand-in is labeled a lower bound in the note, in the stop text, and in the checkpoint/usage record.
 - [ ] Before dispatching any post-task consolidation or synthesis worker, read `usage_breakdown` once for the whole root subtree and pass the same loop-local snapshot to summary and reflection. It is explicitly non-final (`cost_final=false`, `cost_with_children_partial=true`) and carries child-inclusive accounted cost, reservations, unresolved upper bound, unknown/unmetered count, ledger integrity, and capture time. A read failure is unavailable/null, never `$0`. Consolidation, summary, and reflection model spend belongs only to the existing terminal checkpoint; do not add another ledger or reconciliation LLM call.
 - [ ] Runtime notices after the first user/assistant/tool turn are user notices, not new `role=system` messages. `LLMClient` defensively demotes non-leading system messages at the provider boundary; source call-sites should still append `[SYSTEM NOTICE]` user turns so provider payloads, local templates, and prompt authority stay consistent.
 - [ ] Keep stable policy/governance first and dynamic evidence last. Prompt-cache support is deliberately narrow: direct OpenAI `prompt_cache_key`, OpenRouter `session_id` (or a caller-declared `cache_affinity` for surfaces whose rounds repeat with changing evidence, e.g. review), and one exact retry without the named parameter only when the provider explicitly rejects that parameter. Do not add provider hops, body rerouting, or a generic cache/retry framework.
-- [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. (v6.77.0) A builder no longer places tool markers or orders TTLs itself: `llm.LLMClient._normalize_payload_cache_ttl` finalizes the ASSEMBLED provider payload at every physical-send boundary — it promotes earlier existing breakpoints to `1h` when any later one asks for `1h` (Anthropic requires longer TTLs first; a 5m tools marker before a 1h system marker is a hard 400), marks the last tool schema when the tools segment carries none, and on a >4 payload keeps the four earliest anchors while dropping tail markers with a disclosed `prompt_cache_breakpoints_reduced` usage field. Declare your intended TTL on the blocks you own and let the finalizer order them; the assertion above remains the LOUD builder-side layer (the finalizer is the fail-soft transport guard), and routes that cannot carry markers are left byte-identical, so never re-add a per-builder marking site. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
+- [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. (v6.77.0) A builder no longer places tool markers or orders TTLs itself: `llm.LLMClient._normalize_payload_cache_ttl` finalizes the ASSEMBLED provider payload at every physical-send boundary — it promotes earlier existing breakpoints to `1h` when any later one asks for `1h` (Anthropic requires longer TTLs first; a 5m tools marker before a 1h system marker is a hard 400), marks the last tool schema when the tools segment carries none, and on a >4 payload keeps the four earliest anchors while dropping tail markers with a disclosed `prompt_cache_breakpoints_reduced` usage field. Declare your intended TTL on the blocks you own and let the finalizer order them; the assertion above remains the LOUD builder-side layer (the finalizer is the fail-soft transport guard), and routes that cannot carry markers are left byte-identical, so never re-add a per-builder marking site. The TTL VALUE itself is the owner's one global setting `OUROBOROS_PROMPT_CACHE_TTL` (`default`|`5m`|`1h`, default `1h`; `config.resolve_prompt_cache_ttl`), consumed at that same finalizer as an HONEST override: when it names a tier it is stamped onto every existing breakpoint of the Anthropic-normalizing family — including review/safety prefixes (`cached_prompt_blocks` projects the setting; the former `REVIEW_CACHE_TTL` constant is collapsed into it) — before the promotion rule, and it never creates markers, so builder sites keep declaring bare markers and never encode a TTL literal of their own. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
 - [ ] OpenRouter reasoning continuity belongs to OpenRouter conversations only. Direct/local payloads strip OpenRouter round-trip metadata; OpenRouter payloads with `reasoning_details` disable provider fallback to avoid endpoint-bound thought-signature corruption.
 - [ ] Claude Agent SDK sessions (the api-route advisory since D10 retired the edit gateway — the edit path's system-prompt file handoff died with it) must preserve the full governance prompt; do not truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to avoid argv or transport limits.
 - [ ] Delegated (subscription-harness) work is accounted on its OWN ledger row:
@@ -1346,7 +1445,7 @@ Before every commit, verify the following:
 - [ ] Every direct child result needs an exact-hash disposition through the existing `tree_note(kind="decision")` tagged payload (`type=child_result_disposition`, child id, `integrated | irrelevant | deferred`, complete-result SHA-256; note text is rationale). The typed task-tree row is the sole authority; task-result disposition fields are derived reads, never a mirrored write. The join-ledger helper alone validates lineage and current content. Stale or malformed payloads change nothing. `deferred` suppresses only the unchanged reminder and forces an honest degraded/best-effort terminal answer until the item is resolved. Explicit cancellation wins a late-completion race and bounded child scratch is removed without preserving another copy.
 - [ ] Host task acceptance is root-only. Queued/headless/scheduled roots are reviewed in `auto` and `required`; direct eligibility is the union of `outcomes.turn_has_reviewable_effects` and a typed deliverable/criterion. Ordinary read-only tool activity, pure conversation, and meta/routing controls are not reviewed, and child reviews remain advisory. Eligibility must use structured facts, never keywords (Bible P3/P5). For an eligible root under `auto|required`, agent-callable `task_acceptance_review` validates/stores evidence and optional agent disposition but makes zero reviewer calls; it returns `deferred_to_host_acceptance`, `authoritative=false`, and the evidence revision. The call itself never widens eligibility; child and `off` behavior remain unchanged.
 - [ ] Before root acceptance, atomically fence new descendants under the queue lock and prove recursive subtree quiescence from the existing task-status SSOT. Split-drive ACK, subtree, and acceptance-timing reads/writes use canonical `budget_drive_root`. Preserve the prior verdict until the replacement is recorded. A revision must explicitly reopen the fence; terminal/degraded outcomes seal it.
-- [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains (the reviewer verdict vocabulary `PASS|FAIL|DEGRADED` is NOT narrowable — `_contract_valid_actors`, the deliberate-DEGRADED capsule rail and the host's core-overflow DEGRADED all depend on it), and no quorum is a terminal HOST decision. The host acceptance decision itself is written ONLY by `loop._set_acceptance_decision` and has exactly three owner-facing states — `accepted | revision_requested | finalized_unaccepted` — each with a typed `reason` from an existing structured fact; an unknown status fails closed to `finalized_unaccepted` keeping its raw token as the reason. When you add a writer, add its reason to the closed set AND check every value-keyed reader: `outcomes.derive_loop_outcome` keys the deadline-reserve degradation on the status+reason PAIR, and breaking that pairing is a silent false green. The agent may write only `agent_disposition`/`agent_rationale`, merged into the host decision, never replacing it. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.
+- [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains (the reviewer verdict vocabulary `PASS|FAIL|DEGRADED` is NOT narrowable — `_contract_valid_actors`, the deliberate-DEGRADED capsule rail and the host's core-overflow DEGRADED all depend on it), and no quorum is a terminal HOST decision. The host acceptance decision itself is written ONLY by `loop._set_acceptance_decision` and has exactly three owner-facing states — `accepted | revision_requested | finalized_unaccepted` — each with a typed `reason` from an existing structured fact; an unknown status fails closed to `finalized_unaccepted` keeping its raw token as the reason. When you add a writer, add its reason to the closed set AND check every value-keyed reader: `outcomes.derive_loop_outcome` keys the eligible-but-skipped degradation on the status+reason PAIR (`review_skipped_deadline_reserve` plus the closed forced-rail `ACCEPTANCE_BYPASS_REASONS`), and breaking that pairing is a silent false green. Forced exits stamp their typed bypass record in the common terminal recorder (`_record_forced_acceptance_bypass`) as a pure ledger write — never a fence, panel, extra round, or prompt text on a forced path, and never overwriting an existing host decision. The agent may write only `agent_disposition`/`agent_rationale`, merged into the host decision, never replacing it. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.
 - [ ] The acceptance improvement loop is a reviewer-authored DIALOGUE (v6.74.0): obligation identity comes from the reviewer's typed `disposition_kind`/`obligation_id` (an unknown re-raise id fails closed to `new`, disclosed — never a silent fresh hash id); a re-raise reopens the row WITHOUT wiping the agent's argument (`previous_disposition`/`previous_reason`/`reopened_count` survive into the evidence catalog and the obligations clause); termination beyond a clean PASS/accepted rebuttal happens ONLY via the reviewers' quorum `dialogue_status` judgement reduced over ALL contract-valid actors (`aggregate_dialogue_status` — never `_contributing_actors`, which drops a DEGRADED slot's vote) or a real rail — no host counters, no answer/verdict hashes, no keyword gates (P5). Changes here must cover: malformed reviewer output, unknown/stale `obligation_id` on a re_raise, partial panel failure, multi-slot dialogue-status disagreement (the reducer's precedence), replay/restart durability of obligation rows, false completion, and the backward-compatible default when the new fields are absent.
 - [ ] An explicit `max_improvement_passes` binds under every legacy policy. Required+Blocking without one has no local count cap, but real deadline/budget/lifecycle rails remain. The first acceptance review reserves at least 200s; later passes use the canonical event-derived `max(floor, 1.5×EWMA)` (`alpha=0.5`). Only the root runs global post-task synthesis once and persists one phase checkpoint in the canonical `budget_drive_root`. Recovery is startup-only: replay `pending_once`, degrade indeterminate `running` without another paid call, and let the normal supervisor copy-back/artifact path materialize child results without overwriting a terminal canonical phase.
 
@@ -1774,6 +1873,26 @@ Legacy inline assignments that already existed before a scoped change are tracke
 debt, not an automatic release blocker, when the diff does not add or worsen that
 style usage. Prefer paying them down opportunistically instead of expanding the
 scope of unrelated UI work.
+
+### No native browser dialogs in web/modules (v6.90.3)
+
+`window.prompt`, `window.confirm`, and `window.alert` are BANNED in `web/modules`.
+The pywebview desktop shells implement them inconsistently — the macOS cocoa shell
+has no prompt delegate at all, so `window.prompt` silently returns `null` and the
+flow dies without any visible error — and native dialogs are unstyled, untestable,
+and block the event loop. Every dialog goes through
+`web/modules/confirm_dialog.js::openConfirmDialog`:
+
+- confirm mode resolves a strict boolean (`true` only on the confirm button);
+- `input: true` resolves `{confirmed, value}` (empty `value` on cancel);
+- `alert: true` renders a single OK-style button — Escape/backdrop/Close resolve
+  `false`, which alert callers treat as "seen".
+
+Cancel, backdrop, Escape, the header Close, and being superseded by a newer dialog
+all resolve as a NON-confirm. Critical controls gate on the strict result (see
+`chat.js::confirmAndSendPanic`). Enforced by the quick-CI static gate
+`tests/test_web_dialogs_static.py`; the desktop pywebview bridge paths in
+`settings.js` are host-side dialogs, not `window.*` calls, and stay as they are.
 
 ### Declarative widget UI
 

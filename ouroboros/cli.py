@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -284,6 +285,21 @@ def _logs_tail_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _log_row_identity(entry: Dict[str, Any]) -> tuple:
+    """Content-identity dedupe marker for `logs follow` (P2 review fix).
+
+    `_line` in /api/logs responses is window-relative since the bounded tail
+    read: on a >512KB log the window shifts with every append, so a positional
+    marker re-prints already-seen rows each poll (and can silently skip a new
+    row that collides with a stale marker). Identity = source root + ts + a
+    stable hash of the row with the positional fields stripped."""
+    payload = {key: value for key, value in entry.items() if key not in ("_line", "_source_root")}
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return (str(entry.get("_source_root") or ""), str(entry.get("ts") or ""), digest)
+
+
 def _logs_follow_command(args: argparse.Namespace) -> int:
     seen = set()
     client = _client(args)
@@ -291,7 +307,7 @@ def _logs_follow_command(args: argparse.Namespace) -> int:
         data = client.request("GET", f"/api/logs/{urllib.parse.quote(args.name)}?limit={int(args.limit)}")
         entries = list(data.get("entries") or [])
         for entry in entries:
-            marker = (str(entry.get("_source_root") or ""), int(entry.get("_line") or 0), str(entry.get("ts") or ""))
+            marker = _log_row_identity(entry)
             if marker in seen:
                 continue
             seen.add(marker)

@@ -98,9 +98,19 @@ _OPEN_OBLIGATION = {
     "status": "open", "disposition": "",
 }
 
+# The clean-pass fixture carries supported criteria WITH evidence_refs: the
+# evidence condition is unconditional since D-Q5 deleted the constant-true
+# require_criterion_evidence knob (production panels always ran it True, so a
+# real clean PASS always looked exactly like this).
 _CLEAN_PASS = dict(
     aggregate="PASS",
-    actors=[_actor("s0", "PASS", {"verdict": "PASS", "outcome_tier": "solved"})],
+    actors=[_actor("s0", "PASS", {
+        "verdict": "PASS", "outcome_tier": "solved",
+        "criteria_used": [{
+            "criterion": "deliverable is verified", "status": "supported",
+            "evidence_refs": ["verification_summary"],
+        }],
+    })],
 )
 # A PASS whose `solved` claim lacks supported criterion evidence: NOT clean, yet the
 # capsule has nothing actionable (no findings, no dissent, solved tier) — the A14 branch.
@@ -358,6 +368,44 @@ def test_supersede_paths_request_a_revision_with_their_own_reason(tmp_path):
              "reason": REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE},
             "not_eligible", False,
         ),
+        # Forced-rail bypass reasons (closed enum) ride the SAME (status, reason,
+        # eligibility) key — an eligible panel bypassed by a rail is never clean.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_round_limit"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_deadline"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_provider_unavailable"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_children_unabsorbed"},
+            "eligible", True,
+        ),
+        # Bypass reason without eligibility (unknown / not_eligible) never degrades.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "not_eligible", False,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "unknown", False,
+        ),
     ],
 )
 def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligibility, degrades):
@@ -371,14 +419,93 @@ def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligi
         },
     )
     axes = outcome["outcome_axes"]
+    is_deadline_reserve = (
+        decision["reason"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+    )
     if degrades:
         assert axes["execution"]["status"] == "degraded"
-        assert axes["execution"]["reason_code"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        # The typed reason itself is the degradation reason_code — deadline-reserve
+        # keeps its historical token, a forced-rail bypass carries its own.
+        assert axes["execution"]["reason_code"] == decision["reason"]
         assert axes["objective"]["status"] == "degraded"
-        assert axes["objective"]["source"] == "task_acceptance_deadline_reserve"
+        assert axes["objective"]["source"] == (
+            "task_acceptance_deadline_reserve"
+            if is_deadline_reserve else "task_acceptance_forced_bypass"
+        )
     else:
         assert axes["execution"]["status"] == "ok"
-        assert axes["objective"].get("source") != "task_acceptance_deadline_reserve"
+        assert axes["objective"].get("source") not in {
+            "task_acceptance_deadline_reserve", "task_acceptance_forced_bypass",
+        }
+
+
+def test_forced_rail_axes_are_the_production_shape(tmp_path, monkeypatch):
+    """The table above feeds `derive_loop_outcome` a usage dict a forced rail
+    cannot produce (`usage={}`), so it pins the pair-key, not the delivered shape.
+    Driven through the REAL round-limit rail, a stamped bypass ALWAYS arrives with
+    `usage.execution_status='failed'` — every writer of `usage.reason_code` writes
+    it — so the outcome lands on the stronger best_effort/failed classification and
+    the pair-keyed degrade never decides. The owner-visible "a panel was owed and
+    did not run" fact rides the REVIEW axis, which is the claim that must hold."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": "Best answer before the round limit."}, 0.0,
+        ),
+    )
+
+    text, usage, trace = loop._handle_round_limit(limit_ctx)
+
+    # The rail's own execution truth: failed usage + the rail reason code.
+    assert usage["execution_status"] == "failed"
+    assert usage["reason_code"] == "round_limit"
+    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_round_limit"
+
+    axes = derive_loop_outcome(text, usage, trace)["outcome_axes"]
+    # NOT "degraded/acceptance_bypassed_round_limit": the honest rail reason wins.
+    assert axes["execution"]["status"] == "best_effort"
+    assert axes["execution"]["reason_code"] == "round_limit"
+    # ...and the bypass is carried where it is owner-visible and unambiguous.
+    assert axes["review"]["eligibility"] == "eligible"
+    assert axes["review"]["trigger"] == "bypassed_round_limit"
+    assert axes["review"]["run_count"] == 0
+    assert axes["review"]["acceptance_decision"]["reason"] == (
+        "acceptance_bypassed_round_limit"
+    )
+
+
+def test_round_one_budget_rejection_is_also_a_covered_forced_sink(tmp_path):
+    """The total-budget rejection at round<=1 returns its notice directly instead
+    of going through `_forced_final_answer`, so it used to reach the ledger with
+    NO bypass record at all: `eligibility=not_evaluated / run_count=0` — exactly
+    the "indistinguishable from no panel warranted" shape the typed bypass closes.
+    Nothing was produced, so the record is the whole remedy: one ledger write."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    limit_ctx.round_idx = 1
+
+    result = loop._check_budget_limits(limit_ctx, 0.0)
+
+    assert result is not None
+    text, usage, trace = result
+    assert text.startswith("🚫 Task rejected.")
+    assert usage["reason_code"] == "budget_exhausted"
+    assert trace["review_decision"] == {
+        "eligibility": "eligible", "trigger": "bypassed_budget_exhausted",
+    }
+    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_budget_exhausted"
+    assert trace["acceptance_decision"]["source"] == "forced_finalization"
+    # No candidate existed — the record says so instead of inventing one.
+    assert trace["forced_finalization"]["candidate_sha256"] == ""
+    assert trace["forced_finalization"]["source"] == "host_budget_rejection_before_work"
+
+    axes = derive_loop_outcome(text, usage, trace)["outcome_axes"]
+    assert axes["review"]["eligibility"] == "eligible"
+    assert axes["review"]["run_count"] == 0
 
 
 def test_acceptance_projection_carries_the_typed_reason():

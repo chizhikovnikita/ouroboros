@@ -36,7 +36,7 @@ def _resolve_local_file(ctx: ToolContext, path: str, *, max_bytes: int) -> tuple
     """Resolve a local file path through the SAME trust boundary as view_image/read_file:
     it must sit under an allowed file root and pass the protected-artifact read guard.
     Returns (path, "") on success or (None, error_message)."""
-    from ouroboros.tools.vision import _allowed_file_roots
+    from ouroboros.tools.vision import _allowed_file_roots, _read_file_parity_block
     from ouroboros.tool_access import path_is_relative_to
 
     text = str(path or "").strip()
@@ -59,6 +59,13 @@ def _resolve_local_file(ctx: ToolContext, path: str, *, max_bytes: int) -> tuple
             "(uploads / active workspace / artifact store / task drive)."
         )
     fp = next((c for c in confined if c.is_file()), confined[0])
+    # SC-6: the SAME per-path rules read_file applies on the matrix-derived roots
+    # (user_files confinement, restricted-subagent secret/owner-control denials,
+    # project-store guard) — shared with view_image/vlm_query so root admission
+    # never out-reaches read_file here either.
+    parity_block = _read_file_parity_block(ctx, fp)
+    if parity_block:
+        return None, parity_block
     try:
         from ouroboros.protected_artifacts import block_reason_for_path
 

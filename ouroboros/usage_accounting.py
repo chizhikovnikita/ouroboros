@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import dataclasses
 import hashlib
 import json
 import logging
 import os
 import pathlib
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
@@ -35,15 +35,18 @@ from ouroboros.pricing import estimate_cost_optional
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
+    LedgerResumeState,
     UsageAccountingError,
     UsageLedgerCorrupt,
     _append_bytes_fsync,
     _append_rows_locked,
     _drive_root,
     _final_rows,
+    _ledger_resume_state,
     _locked,
     _named_lock,
     _number,
+    _read_new_records_locked,
     _read_records_locked,
     # Re-exported although THIS module no longer reads it: the terminal-state set is
     # part of the substrate's vocabulary, and a policy function that terminalizes an
@@ -54,6 +57,13 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     _write_bytes_atomic_fsync,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
+from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
+    _breakdown_bucket,
+    _physical_call_count,
+    _summary,
+    _with_integrity,
+    _with_limit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -64,9 +74,11 @@ __all__ = (
     "UsageAccountingError", "UsageLedgerCorrupt", "UsageScope", "capture_attempt_ids",
     "current_usage_scope",
     "ensure_legacy_imported", "execute_physical_attempt", "execute_physical_attempt_async",
+    "last_root_accounting",
     "mark_dispatched", "mark_unresolved", "physical_attempt_limit",
     "record_subscription_session",
-    "record_unmetered_external_dispatch", "release_attempt", "reserve_attempt", "settle_attempt",
+    "record_unmetered_external_dispatch", "refresh_root_accounting",
+    "release_attempt", "reserve_attempt", "settle_attempt",
     "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "review_wave_admission",
 )
@@ -79,6 +91,96 @@ _ATTEMPT_COLLECTOR: contextvars.ContextVar[Optional[list[str]]] = contextvars.Co
 _PHYSICAL_LIMIT: contextvars.ContextVar[Optional["_AttemptLimit"]] = contextvars.ContextVar(
     "ouroboros_physical_attempt_limit", default=None
 )
+
+# --- Root-subtree accounted telemetry (v6.91) -------------------------------
+# The loop's in-task cost stop must compare its ceiling against the TREE's
+# accounted spend (the number the fence enforces), but a per-round
+# ``usage_projection`` read would re-create the O(ledger)-under-lock contention
+# that burned 137 concurrent tasks (e4a87344). ``reserve_attempt`` already
+# computes the root subtree sum inside the lock, so it is stashed here
+# (process-local, newest-wins) and read for free; the rare read points (loop
+# start / 600s pacing / 15-round checkpoint) may force one real projection read
+# via ``refresh_root_accounting`` when the stash is stale — e.g. after a 900s
+# ``wait_tasks`` block while children spent. Unknown stays None end-to-end;
+# nothing here is a second monetary authority.
+_ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
+_ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
+_ROOT_ACCOUNTING_TELEMETRY_CAP = 64
+
+
+def _stash_root_accounting(
+    root_task_id: str,
+    accounted_usd: Optional[float],
+    root_limit_usd: Optional[float],
+) -> None:
+    root_task_id = str(root_task_id or "").strip()
+    if not root_task_id:
+        return
+    with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
+        if (
+            root_task_id not in _ROOT_ACCOUNTING_TELEMETRY
+            and len(_ROOT_ACCOUNTING_TELEMETRY) >= _ROOT_ACCOUNTING_TELEMETRY_CAP
+        ):
+            oldest = min(
+                _ROOT_ACCOUNTING_TELEMETRY,
+                key=lambda key: _ROOT_ACCOUNTING_TELEMETRY[key]["updated_monotonic"],
+            )
+            _ROOT_ACCOUNTING_TELEMETRY.pop(oldest, None)
+        _ROOT_ACCOUNTING_TELEMETRY[root_task_id] = {
+            "accounted_usd": None if accounted_usd is None else float(accounted_usd),
+            "root_limit_usd": None if root_limit_usd is None else float(root_limit_usd),
+            "updated_monotonic": time.monotonic(),
+        }
+
+
+def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
+    """The most recent root-subtree accounted snapshot seen by THIS process.
+
+    Zero I/O: refreshed as a byproduct of every ``reserve_attempt`` (with the
+    fresh reservation's in-flight hold included) and every terminal transition
+    (settle/release/unresolve) under this root, so within one process it tracks
+    the ledger fence exactly; only spend from OTHER processes (delegated
+    children) can make it stale. Returns ``{"accounted_usd", "root_limit_usd",
+    "age_sec"}`` or None when no dispatch under the root has been reserved here
+    yet."""
+    with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
+        entry = _ROOT_ACCOUNTING_TELEMETRY.get(str(root_task_id or "").strip())
+        if entry is None:
+            return None
+        entry = dict(entry)
+    entry["age_sec"] = max(0.0, time.monotonic() - entry.pop("updated_monotonic"))
+    return entry
+
+
+def refresh_root_accounting(
+    drive_root: pathlib.Path | str | None,
+    root_task_id: str,
+    *,
+    max_age_sec: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    """Return the root-subtree accounted snapshot, re-reading the ledger only
+    when the stash is missing or older than ``max_age_sec``.
+
+    This is the RARE read path (loop start / pacing / checkpoint — never per
+    round; see the telemetry comment above). Fail-soft: a failed read returns
+    the stale stash (with its honest ``age_sec``) or None — never a fake $0."""
+    root_task_id = str(root_task_id or "").strip()
+    if not root_task_id:
+        return None
+    cached = last_root_accounting(root_task_id)
+    if cached is not None and max_age_sec > 0 and cached["age_sec"] <= max_age_sec:
+        return cached
+    try:
+        projection = usage_projection(drive_root, root_task_id=root_task_id)
+        _stash_root_accounting(
+            root_task_id,
+            _number(projection.get("accounted_usd")),
+            _number(projection.get("limit_usd")),
+        )
+        return last_root_accounting(root_task_id)
+    except Exception:
+        log.debug("root accounting refresh failed for %s", root_task_id, exc_info=True)
+        return cached
 
 
 class BudgetExceeded(UsageAccountingError):
@@ -111,9 +213,8 @@ class UsageScope:
     source: str = "llm"
     global_limit_usd: Optional[float] = None
     root_limit_usd: Optional[float] = None
-    # Ambient data-sensitivity for everything sent inside this scope. Carried here
-    # rather than threaded through every call site because the transport is many
-    # layers below the task that knows the answer — the same reason task_id is.
+    # Ambient data-sensitivity for this scope's sends — ambient for the same reason
+    # task_id is. Ratcheted against the enclosing scope on bind.
     data_sensitivity: str = ""
 
 
@@ -134,11 +235,17 @@ class AttemptRequest:
     source: str = ""
     root_limit_usd: Optional[float] = None
     force_unknown_reservation: bool = False
-    # WHICH pooled connection carried this send. Captured where the connection is
-    # chosen and passed by value, never re-derived later from the model string:
-    # two connections to the same provider are indistinguishable by model alone,
-    # and per-connection rating and in-flight counting both key off this.
+    # WHICH pooled connection carried this send — captured where the connection is
+    # chosen and passed by value, never re-derived from the model string (two
+    # connections to one provider are indistinguishable by model alone).
     connection_id: str = ""
+    # The send-time finalizer's APPLIED prompt-cache TTL for THIS payload
+    # ("1h" / "5m" / "default"), carried by llm._attempt_request so reservation
+    # pricing bills the tier that actually ships. Empty = unknown (a
+    # construction site that never sees a payload); pricing then falls back to
+    # the owner's one TTL authority (config.resolve_prompt_cache_ttl) — never
+    # to a hardcoded second one.
+    prompt_cache_ttl: str = ""
 
 
 @dataclass(frozen=True)
@@ -155,19 +262,12 @@ class AttemptReservation:
 def usage_scope(scope: UsageScope) -> Iterator[UsageScope]:
     """Bind task/root attribution for physical sends in this execution context.
 
-    Data sensitivity RATCHETS: a nested scope inherits the stricter of its own
-    label and the one already bound. Enforcing it here rather than at each call
-    site is the point — a subtask must not be able to widen where its parent's
-    data may travel, and there are too many places that build a child scope for
-    "remember to propagate it" to be a real guarantee.
+    Data sensitivity ratchets against the enclosing scope — see
+    ``connections.ratchet_scope_sensitivity`` for why it is enforced here.
     """
-    parent = _CURRENT_SCOPE.get()
-    if parent is not None:
-        from ouroboros.connections import sensitivity_rank, stricter_sensitivity
+    from ouroboros.connections import ratchet_scope_sensitivity
 
-        strictest = stricter_sensitivity(scope.data_sensitivity, parent.data_sensitivity)
-        if sensitivity_rank(strictest) > sensitivity_rank(scope.data_sensitivity):
-            scope = dataclasses.replace(scope, data_sensitivity=strictest)
+    scope = ratchet_scope_sensitivity(scope, _CURRENT_SCOPE.get())
     token = _CURRENT_SCOPE.set(scope)
     try:
         yield scope
@@ -233,110 +333,60 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     return request, scope
 
 
-def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    settled = confirmed = estimated = reserved = unresolved = 0.0
-    unknown = 0
-    # Finality is a COUNT of OPEN ROWS, not a truthiness test on dollar sums. Three of the
-    # four old terms asked a STATE question of a float, so any row that is genuinely open
-    # while holding $0.00 disappeared from the predicate entirely:
-    #   * an ESTIMATED $0.00 — what the engine reports for a delegated subscription run
-    #     whose cash it has not settled (all 8 estimated rows on a live 60-run page); and
-    #   * a DISPATCHED row whose reservation is exactly 0.0, which `_reservation_cost`
-    #     returns for `provider="local"`, so the projection claimed `cost_final: True`
-    #     with a physical send still in flight.
-    # A row is final when it is SETTLED at a known price its writer called final; anything
-    # else is open, however little it costs. `_final_rows` keys by attempt_id, so a settled
-    # row REPLACES its own reserved/dispatched predecessor — a row still open here is
-    # really still open, and a released reservation is in neither branch.
-    #
-    # The count is also the DISCLOSED CAUSE, returned as `non_final_rows`: a projection
-    # reporting `cost_final: false` with every dollar bucket at zero and `unknown` at zero
-    # is a flag no reader can reconstruct.
-    non_final_rows = 0
-    counts: Dict[str, int] = {}
-    # Separate "sessions and quota" axis: subscription work is already paid for, so
-    # it contributes exactly $0 to money, and its real scarce resource (sessions and
-    # the window that grants them) is counted here instead of being faked as cash.
-    sessions = 0
-    session_windows: Dict[str, str] = {}
-    for row in rows:
-        state = str(row.get("state") or "")
-        if str(row.get("kind") or "") == "subscription_session":
-            sessions += 1
-            route = str(row.get("subscription_route") or "")
-            reset_at = str(row.get("subscription_reset_at") or "")
-            if route and reset_at:
-                session_windows[route] = max(session_windows.get(route, ""), reset_at)
-        if str(row.get("kind") or "") == "legacy_metadata":
-            ambiguous = max(1, int(row.get("ambiguous_call_count") or 1))
-            counts["metadata_only"] = counts.get("metadata_only", 0) + ambiguous
-            continue
-        counts[state] = counts.get(state, 0) + 1
-        pricing_unknown = row.get("pricing_known") is False
-        if state == "settled":
-            cost = _number(row.get("cost_usd"))
-            if cost is None:
-                unknown += 1
-                non_final_rows += 1
-                bound = _number(row.get("reservation_upper_bound_usd"))
-                if bound is not None:
-                    unresolved += bound
-            else:
-                settled += cost
-                if bool(row.get("cost_final")):
-                    confirmed += cost
-                else:
-                    estimated += cost
-                    non_final_rows += 1
-        elif state == "reserved":
-            non_final_rows += 1
-            bound = _number(row.get("reservation_upper_bound_usd"))
-            if bound is None or pricing_unknown:
-                unknown += 1
-            if bound is not None:
-                reserved += bound
-        elif state in {"dispatched", "unresolved"}:
-            non_final_rows += 1
-            bound = _number(row.get("reservation_upper_bound_usd"))
-            if bound is None or pricing_unknown:
-                unknown += 1
-            if bound is not None:
-                unresolved += bound
-    settled, confirmed, estimated, reserved, unresolved = (
-        round(value, 6) for value in (settled, confirmed, estimated, reserved, unresolved)
-    )
-    return {
-        "settled_usd": settled,
-        "confirmed_usd": confirmed,
-        "estimated_usd": estimated,
-        "reserved_usd": reserved,
-        "unresolved_upper_bound_usd": unresolved,
-        "accounted_usd": round(settled + reserved + unresolved, 6),
-        "unknown_unmetered": unknown,
-        # Every row that increments `unknown` is open, so the old `not unknown` term is
-        # subsumed here rather than dropped.
-        "non_final_rows": non_final_rows,
-        "cost_final": not non_final_rows,
-        "attempt_counts": counts,
-        "subscription_sessions": sessions,
-        "subscription_windows": session_windows,
-    }
+@dataclass
+class _LedgerRowsMemo:
+    """In-process cache of one drive root's per-attempt FINAL rows.
+
+    Holds only the ``_final_rows`` dict (one row per attempt, first-occurrence
+    order) plus the resume fingerprint — O(final rows), not O(ledger rows);
+    superseded transition rows are not retained."""
+
+    resume: LedgerResumeState
+    final_rows: Dict[str, Dict[str, Any]]
 
 
-def _with_limit(summary: Dict[str, Any], limit: Optional[float]) -> Dict[str, Any]:
-    if limit is None:
-        return summary
-    summary["limit_usd"] = round(max(0.0, float(limit)), 6)
-    summary["remaining_known_usd"] = round(max(0.0, summary["limit_usd"] - float(summary["accounted_usd"])), 6)
-    return summary
+# Read-side memo per RESOLVED drive root. Populated and advanced only under the
+# cross-process ledger lock; the module lock guards the dict itself. Write paths
+# (reserve/_transition/settle/import) never touch it — their own full locked
+# reads stay the monetary authority, and the stat + seq-continuity check on the
+# next read is what makes a stale memo impossible to serve, so correctness never
+# depends on any writer remembering to invalidate.
+_ROWS_MEMO: Dict[str, _LedgerRowsMemo] = {}
+_ROWS_MEMO_LOCK = threading.Lock()
 
 
-def _with_integrity(summary: Dict[str, Any], degraded: bool) -> Dict[str, Any]:
-    """Attach ledger integrity and prevent a torn tail from claiming final cost."""
-    summary["integrity_degraded"] = bool(degraded)
-    if degraded:
-        summary["cost_final"] = False
-    return summary
+def _memoized_final_rows(root: pathlib.Path) -> list:
+    """Validated final rows for display projections, resumed incrementally.
+
+    Cold (or whenever the resume fingerprint is rejected — file replacement,
+    size shrink, same-size rewrite, seq discontinuity, a non-row-aligned tail,
+    structural corruption) this is one
+    full ``_read_records_locked`` replay, which owns quarantine. Warm, it parses
+    only the bytes appended since the previous read. The file lock is taken via
+    the module-global ``_locked`` at call time (tests monkeypatch that name).
+    Returned row dicts are shared read-only snapshots; row ORDER matches a
+    from-scratch ``_final_rows`` exactly (first-occurrence order, updates in
+    place), so aggregation over them is bit-identical to a fresh replay.
+    """
+    key = str(pathlib.Path(root).resolve(strict=False))
+    with _locked(root):
+        with _ROWS_MEMO_LOCK:
+            memo = _ROWS_MEMO.get(key)
+        advanced = _read_new_records_locked(root, memo.resume) if memo is not None else None
+        if advanced is None:
+            records = _read_records_locked(root)
+            memo = _LedgerRowsMemo(
+                resume=_ledger_resume_state(root, records),
+                final_rows=_final_rows(records),
+            )
+        else:
+            new_records, new_resume = advanced
+            for row in new_records:
+                memo.final_rows[str(row["attempt_id"])] = row
+            memo.resume = new_resume
+        with _ROWS_MEMO_LOCK:
+            _ROWS_MEMO[key] = memo
+        return list(memo.final_rows.values())
 
 
 def usage_projection(
@@ -347,8 +397,7 @@ def usage_projection(
 ) -> Dict[str, Any]:
     """Return a replayed global projection, or one root/subtree projection."""
     root = _drive_root(drive_root)
-    with _locked(root):
-        final = list(_final_rows(_read_records_locked(root)).values())
+    final = _memoized_final_rows(root)
     integrity_degraded = (root / QUARANTINE_REL).is_file()
     if root_task_id:
         final = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
@@ -382,57 +431,6 @@ def usage_projection(
     return _with_integrity(result, integrity_degraded)
 
 
-def _physical_call_count(row: Dict[str, Any]) -> int:
-    kind = str(row.get("kind") or "attempt")
-    if kind == "legacy_metadata":
-        return 0
-    if kind == "legacy_delta":
-        return 0
-    # A subscription session is not a core-mediated physical provider send; it is
-    # counted on the sessions axis instead (see record_subscription_session).
-    if kind == "subscription_session":
-        return 0
-    return 1 if str(row.get("state") or "") in {"dispatched", "settled", "unresolved"} else 0
-
-
-def _breakdown_bucket(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    bucket = _summary(rows)
-
-    def summed(field: str) -> Optional[int]:
-        """Sum the rows that HAVE this count; None when not one of them does.
-
-        `int(row.get(field) or 0)` collapsed an ABSENT count into a reported zero, so a
-        bucket whose provider returned no token counts at all published a confident
-        "0 tokens" — the render-unknown-as-zero shape this module refuses everywhere
-        else (`cost = None  # legacy zero may mean unknown pricing, never "free"`). A
-        zero here is now only ever a MEASURED zero, and a partially-reporting bucket
-        still sums the rows that did report rather than being erased by the ones that
-        did not."""
-        present = [row.get(field) for row in rows if row.get(field) is not None]
-        return sum(max(0, int(value)) for value in present) if present else None
-
-    prompt = summed("prompt_tokens")
-    completion = summed("completion_tokens")
-    prompt_cache_ttls: Dict[str, int] = {}
-    for row in rows:
-        ttl = str(row.get("prompt_cache_ttl") or "").strip()
-        if ttl:
-            prompt_cache_ttls[ttl] = prompt_cache_ttls.get(ttl, 0) + _physical_call_count(row)
-    bucket.update({
-        "physical_calls": sum(_physical_call_count(row) for row in rows),
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        # Unknown on BOTH halves is an unknown total; one known half is a real total
-        # of what was measured, reported as the number it is.
-        "total_tokens": (None if prompt is None and completion is None
-                         else (prompt or 0) + (completion or 0)),
-        "cached_tokens": summed("cached_tokens"),
-        "cache_write_tokens": summed("cache_write_tokens"),
-        "prompt_cache_ttls": prompt_cache_ttls,
-    })
-    return bucket
-
-
 def usage_breakdown(
     drive_root: pathlib.Path | str | None = None,
     *,
@@ -441,8 +439,7 @@ def usage_breakdown(
 ) -> Dict[str, Any]:
     """Read-only physical-call/token/cost buckets from validated ledger finals."""
     root = _drive_root(drive_root)
-    with _locked(root):
-        rows = list(_final_rows(_read_records_locked(root)).values())
+    rows = _memoized_final_rows(root)
     integrity_degraded = (root / QUARANTINE_REL).is_file()
     if root_task_id:
         rows = [row for row in rows if str(row.get("root_task_id") or "") == root_task_id]
@@ -476,6 +473,14 @@ def usage_breakdown(
         "by_category": by_category,
         "by_task": by_task,
         "by_root": by_root,
+        # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
+        # only — a VIEW over the same rows for "where did the money go" readers,
+        # never a third monetary sum or authority. Disclosed-free sessions settle
+        # at $0 here; undisclosed spend stays in `unknown`.
+        "delegated": _with_integrity(
+            _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
+            integrity_degraded,
+        ),
         # Legacy call-count metadata and monetary delta stay explicit; neither
         # is fabricated into a model/provider/category identity.
         "unattributed": {
@@ -521,12 +526,28 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
     cache_write_tokens = (
         prompt_tokens if str(request.model or "").lstrip("~").startswith(("anthropic/", "anthropic::")) else 0
     )
+    prompt_cache_ttl: Optional[str] = None
+    if cache_write_tokens:
+        # Price the cache-write tier that will actually ship, never a hardcoded
+        # worst case: the dispatch path carries the finalizer's APPLIED TTL
+        # (llm._attempt_request reads it off the exact candidate payload), and a
+        # construction site that never sees a payload falls back to the owner's
+        # single TTL authority — the same setting the send-time finalizer stamps
+        # onto every breakpoint of this family. The previous hardcoded "1h" was
+        # a second TTL authority that over-priced admission by 2.0/1.25 on the
+        # write component whenever the owner selected the cheaper 5m/default
+        # tier, rejecting calls the budget actually affords.
+        from ouroboros.config import PROMPT_CACHE_TTL_SCALE, resolve_prompt_cache_ttl
+
+        prompt_cache_ttl = str(request.prompt_cache_ttl or "").strip().lower()
+        if prompt_cache_ttl not in PROMPT_CACHE_TTL_SCALE:
+            prompt_cache_ttl = resolve_prompt_cache_ttl()
     return estimate_cost_optional(
         request.model,
         prompt_tokens,
         max(0, int(request.max_completion_tokens or 0)),
-        cache_write_tokens=cache_write_tokens,
-        prompt_cache_ttl="1h" if cache_write_tokens else None,
+        cache_usage={"cache_write_tokens": cache_write_tokens,
+                     "prompt_cache_ttl": prompt_cache_ttl},
         allow_live_fetch=True,
         provider=request.provider,
     )
@@ -675,10 +696,23 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                 limit_scope="global",
                 root_task_id=scope.root_task_id,
             )
+        root_rows: Optional[list[Dict[str, Any]]] = None
+        root_limit: Optional[float] = None
         if scope.root_task_id and scope.root_limit_usd is not None:
             root_rows = [row for row in finals if str(row.get("root_task_id") or "") == scope.root_task_id]
             root_accounted = float(_summary(root_rows)["accounted_usd"])
             root_limit = max(0.0, float(scope.root_limit_usd))
+            # Scope telemetry piggyback (v6.91): the subtree sum is already in
+            # hand — stash the MEASURED pre-this-attempt value (never a
+            # speculative one: on the refusal path below no row is appended) so
+            # the loop's pacing and ceiling checks read the tree number with
+            # zero new ledger reads. After the append succeeds below, the stash
+            # is refreshed again WITH this reservation's hold: the loop trusts
+            # the stash for up to 120s, so a pre-append-only value advertised
+            # "ledger-accounted incl. in-flight holds" while omitting the one
+            # call currently in flight — near the cap that let the hard ledger
+            # fence fire before the graceful wrap-up ever saw the true number.
+            _stash_root_accounting(scope.root_task_id, root_accounted, root_limit)
             if root_limit <= 0 or root_accounted >= root_limit - 1e-9 or (
                 bound is not None and root_accounted + bound > root_limit + 1e-9
             ):
@@ -688,7 +722,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     limit_scope="root",
                     root_task_id=scope.root_task_id,
                 )
-        _append_rows_locked(
+        appended = _append_rows_locked(
             root,
             records,
             [
@@ -718,13 +752,19 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                 }
             ],
         )
+        if root_rows is not None:
+            # Post-append refresh: the same in-lock rows plus the row just
+            # written — zero additional ledger reads (the e4a87344 constraint).
+            _stash_root_accounting(
+                scope.root_task_id,
+                float(_summary([*root_rows, *appended])["accounted_usd"]),
+                root_limit,
+            )
     bucket = _ATTEMPT_COLLECTOR.get()
     if bucket is not None:
         bucket.append(attempt_id)
-    return AttemptReservation(
-        attempt_id, root, request.model, request.provider, bound,
-        str(request.connection_id or ""),
-    )
+    connection = str(request.connection_id or "")
+    return AttemptReservation(attempt_id, root, request.model, request.provider, bound, connection)
 
 
 def record_unmetered_external_dispatch(
@@ -914,8 +954,8 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "state": state,
             "model": reservation.model,
             "provider": reservation.provider,
-            # Carried forward so EVERY row is self-describing: a reader that only
-            # sees terminal rows must still know which connection was billed.
+            # Carried forward so every row is self-describing: a reader that sees
+            # only terminal rows must still know which connection was billed.
             "connection_id": str(current.get("connection_id") or reservation.connection_id or ""),
             "reservation_upper_bound_usd": reservation.reservation_upper_bound_usd,
             "pricing_known": current.get("pricing_known"),
@@ -929,7 +969,24 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             "root_limit_usd": current.get("root_limit_usd"),
             **fields,
         }
-        return _append_rows_locked(reservation.drive_root, records, [row])[0]
+        appended = _append_rows_locked(reservation.drive_root, records, [row])
+        root_task_id = str(current.get("root_task_id") or "")
+        root_limit = _number(current.get("root_limit_usd"))
+        if root_task_id and root_limit is not None:
+            # Telemetry refresh from the post-transition finals: settle/release/
+            # unresolve change the subtree's accounted sum (a settled cost
+            # replaces its own hold, a release drops it), and leaving the stash
+            # at the reserve-time pre-append value made the loop's 120s-trusted
+            # snapshot lag one full call behind the ledger fence. Same lock,
+            # same rows already in memory — no new ledger read.
+            subtree = [
+                r for r in _final_rows([*records, *appended]).values()
+                if str(r.get("root_task_id") or "") == root_task_id
+            ]
+            _stash_root_accounting(
+                root_task_id, float(_summary(subtree)["accounted_usd"]), root_limit,
+            )
+        return appended[0]
 
 
 def mark_dispatched(reservation: AttemptReservation) -> None:
@@ -1083,9 +1140,9 @@ def settle_attempt(
             reservation.model,
             int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0),
             int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0),
-            cached_tokens=int(normalized.get("cached_tokens") or 0),
-            cache_write_tokens=int(normalized.get("cache_write_tokens") or 0),
-            prompt_cache_ttl=str(normalized.get("prompt_cache_ttl") or ""),
+            cache_usage={"cached_tokens": int(normalized.get("cached_tokens") or 0),
+                         "cache_write_tokens": int(normalized.get("cache_write_tokens") or 0),
+                         "prompt_cache_ttl": str(normalized.get("prompt_cache_ttl") or "")},
             allow_live_fetch=False,
             provider=reservation.provider,
         )
@@ -1217,27 +1274,12 @@ def _is_tos_rejection(exc: BaseException) -> bool:
 def _note_connection_outcome(reservation: AttemptReservation, exc: BaseException | None) -> None:
     """Feed the pool's rotation signal from the one place every send lands.
 
-    Best-effort by design: routing health is a hint, and failing an otherwise
-    successful accounting path over it would trade a real result for a heuristic.
-    A bad credential keeps failing, so it is separated from a transient error and
-    earns a much longer rest.
+    The classification lives in the pool, not here: this module owns money, and
+    what counts as a credential failure worth resting is routing policy.
     """
-    connection_id = str(getattr(reservation, "connection_id", "") or "")
-    if not connection_id:
-        return
-    try:
-        from ouroboros.connection_pool import note_failure, note_success
+    from ouroboros.connection_pool import note_attempt_outcome
 
-        if exc is None:
-            note_success(connection_id)
-            return
-        text = f"{type(exc).__name__}: {exc}".lower()
-        kind = "auth" if any(
-            marker in text for marker in ("401", "403", "invalid api key", "unauthorized", "authentication")
-        ) else "error"
-        note_failure(connection_id, kind=kind)
-    except Exception:
-        log.debug("connection health note skipped", exc_info=True)
+    note_attempt_outcome(str(getattr(reservation, "connection_id", "") or ""), exc)
 
 
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> None:

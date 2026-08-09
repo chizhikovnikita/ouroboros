@@ -617,6 +617,37 @@ def advisory_route_requires_api_key() -> bool:
     return advisory_review_route() == "api"
 
 
+def advisory_gate_unavailable() -> bool:
+    """Whether the commit gate must treat the advisory as bypassed (#123).
+
+    Route/slot-aware successor of the bare ANTHROPIC_API_KEY probe: the gate is
+    unavailable when the owner disabled the advisory slot (its audited bypass
+    needs the compensating test preflight), when the configured route is
+    ``api`` and no key is present, or when the delegated (agent_session) route
+    has NO resolvable session route — neither the advisory row's own target nor
+    the shared review/subagent route (mirroring
+    ``run_delegated_review_session``, which refuses that exact state with
+    ``ReviewRouteUnavailable``). An enabled slot that structurally cannot run
+    is as unavailable as a keyless api route. Raises ValueError on a malformed
+    slots/route configuration — each caller owns its fail direction (the
+    pre-commit gate fails closed INTO the compensating preflight)."""
+    if not advisory_slot_enabled():
+        return True
+    if advisory_route_requires_api_key():
+        return not os.environ.get("ANTHROPIC_API_KEY", "")
+    # Delegated route: mirror the runner's resolution order — the slot's own
+    # target when it parses, else the shared session route; None there is a
+    # typed refusal at run time, so None here is UNAVAILABLE at gate time.
+    from ouroboros.review_execution import review_session_route
+    from ouroboros.reviewer_slot_config import advisory_slot_config
+    from ouroboros.subagents import parse_subagent_harness
+
+    _target = str(advisory_slot_config().target_id or "")
+    if _target and parse_subagent_harness(_target) is not None:
+        return False
+    return review_session_route() is None
+
+
 def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
     """The advisory as a delegated Claudexor session, rehydrated into the same
     result structure the SDK path produces (5.8: only the transport changes).

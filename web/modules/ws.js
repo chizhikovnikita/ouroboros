@@ -216,12 +216,21 @@ export class WS {
         return this.ws?.readyState === WebSocket.OPEN;
     }
 
+    // Every subscription returns its disposer (UI resource lifecycle, P3): a
+    // chat instance collects these and releases them in destroy(). Listeners
+    // are a Set per event — insertion order is preserved, and subscribing the
+    // same function twice collapses to one call (no such call-site exists).
     on(event, fn) {
-        (this.listeners[event] ||= []).push(fn);
+        const set = (this.listeners[event] ||= new Set());
+        set.add(fn);
+        return () => set.delete(fn);
     }
 
+    // Emit over a snapshot so a listener added during emit does not receive
+    // that same emit, and a disposal during emit cannot skip a neighbor.
+    // Listener errors propagate to the caller, matching the old array path.
     emit(event, data) {
-        (this.listeners[event] || []).forEach(fn => fn(data));
+        [...(this.listeners[event] || [])].forEach(fn => fn(data));
     }
 }
 

@@ -674,6 +674,116 @@ def _run_session_directly(tmp_path, **overrides):
     return run_delegated_review_session(invocation=SessionInvocation(**invocation), **kwargs)
 
 
+def _lineage_scope():
+    from ouroboros.usage_accounting import UsageScope
+
+    return UsageScope(task_id="t-agent", root_task_id="t-root", parent_task_id="t-parent")
+
+
+def _custody_rows(drive_root):
+    return [json.loads(line) for line in
+            custody.event_log_path(drive_root).read_text().splitlines() if line.strip()]
+
+
+def test_custody_rows_carry_lineage_from_the_bound_usage_scope(tmp_path, fake_route):
+    """#112: BOTH custody writers — the pre-POST request row and the STARTED
+    row — carry root/parent from the ambient UsageScope (the coordinator binds
+    review_usage_scope per slot thread). Unbound stays EMPTY: the settlement
+    layer owns the task_id fallback convention, never these writers."""
+    from ouroboros.usage_accounting import usage_scope
+
+    with usage_scope(_lineage_scope()):
+        _run_session_directly(tmp_path, task_id="t-agent")
+
+    rows = _custody_rows(tmp_path)
+    requested = [r for r in rows if r["type"] == custody.START_REQUESTED]
+    started = [r for r in rows if r["type"] == custody.STARTED]
+    assert requested and started
+    for row in (requested[-1], started[-1]):
+        assert row["root_task_id"] == "t-root", row
+        assert row["parent_task_id"] == "t-parent", row
+
+    # No ambient scope → empty lineage, never an `or task_id` fallback here.
+    custody._CUSTODY.clear()
+    _run_session_directly(tmp_path / "unbound", task_id="t-agent")
+    unbound = [r for r in _custody_rows(tmp_path / "unbound")
+               if r["type"] == custody.STARTED]
+    assert unbound and unbound[-1]["root_task_id"] == ""
+    assert unbound[-1]["parent_task_id"] == ""
+
+
+def test_restart_reconciliation_settles_review_spend_to_the_recorded_root(
+    tmp_path, fake_route, monkeypatch
+):
+    """#112 Path A: a run whose worker died before settling is reconciled by
+    the SUPERVISOR (no ambient scope). The replayed custody must carry the
+    recorded lineage, so the subscription-session ledger row lands on the real
+    root "t-root" — not on the review's own task id as a fake root."""
+    import ouroboros.usage_accounting as ua
+    from ouroboros.usage_accounting import usage_scope
+
+    # The live run's ledger write fails, leaving an unsettled STARTED row.
+    with monkeypatch.context() as m:
+        m.setattr(ua, "record_subscription_session",
+                  lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ledger down")))
+        with usage_scope(_lineage_scope()):
+            facts = _run_session_directly(tmp_path, task_id="t-agent")
+    assert facts["settlement"]["settled"] is False
+
+    # Restart: the in-process memo is gone and no scope is bound.
+    custody._CUSTODY.clear()
+    outcomes = custody.reconcile_orphaned_runs(
+        tmp_path, running_task_ids=set(), gateway_factory=lambda: FakeGateway(),
+    )
+    assert [o["action"] for o in outcomes] == ["settled"]
+
+    ledger = [json.loads(line) for line in
+              (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
+              if line.strip()]
+    sessions = [r for r in ledger if r.get("kind") == "subscription_session"]
+    assert sessions, "reconciliation must write the subscription-session row"
+    assert sessions[-1]["task_id"] == "t-agent"
+    assert sessions[-1]["root_task_id"] == "t-root", sessions[-1]
+    assert sessions[-1]["parent_task_id"] == "t-parent"
+
+
+def test_pending_invocation_recovery_replays_the_recorded_lineage(tmp_path, fake_route):
+    """#112 Path B: a start whose POST outcome stayed unknown leaves ONLY the
+    START_REQUESTED row. Its pending-invocation record must carry the lineage,
+    and the sweep's recovery must replay it onto the recovered run's custody
+    and ledger row."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.usage_accounting import usage_scope
+
+    fake_route.start_error = ClaudexorUnavailable("daemon_unreachable", "boom", status_code=0)
+    state: dict = {}
+    with usage_scope(_lineage_scope()):
+        with pytest.raises(ClaudexorUnavailable):
+            _run_session_directly(tmp_path, task_id="t-agent", retry_state=state)
+    assert state["pending_invocation_id"]
+
+    pending = custody.pending_invocations(tmp_path)
+    assert len(pending) == 1
+    record = pending[0]
+    assert record["root_task_id"] == "t-root"
+    assert record["parent_task_id"] == "t-parent"
+
+    # The sweep recovers the invocation with NO ambient scope: the stored
+    # record is the single source of the replay's facts, lineage included.
+    result = custody._recover_pending_invocation(tmp_path, FakeGateway(), record)
+    assert result["action"] == "settled"
+    recovered = [r for r in _custody_rows(tmp_path)
+                 if r["type"] == custody.STARTED
+                 and r.get("recovered_from_pending_invocation")]
+    assert recovered and recovered[-1]["root_task_id"] == "t-root"
+    assert recovered[-1]["parent_task_id"] == "t-parent"
+    ledger = [json.loads(line) for line in
+              (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
+              if line.strip()]
+    sessions = [r for r in ledger if r.get("kind") == "subscription_session"]
+    assert sessions and sessions[-1]["root_task_id"] == "t-root"
+
+
 def test_retry_replays_the_stored_route_and_registers_nothing_new(tmp_path, fake_route,
                                                                  monkeypatch):
     """A retry replays the STORED invocation, so every fact about it comes from the

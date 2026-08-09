@@ -35,6 +35,26 @@ const safeExternalUrl = safeExternalHrefAttr;
 
 const MARKETPLACE_SEARCH_LIMIT = 16;
 
+/**
+ * Ask which version to update a skill to (pure decision helper, node-tested
+ * with an injected dialog). window.prompt is dead on the macOS desktop shell
+ * (pywebview/WKWebView answers null silently), so this rides the in-house
+ * input dialog. Contract preserved from the prompt() flow: cancel skips the
+ * update entirely; confirmed-empty means "latest" (the server treats a
+ * body without `version` as latest — gateway/marketplace.py).
+ */
+export async function promptUpdateVersion(slug, latest, { dialogImpl = openConfirmDialog } = {}) {
+    const answer = await dialogImpl({
+        title: `Update ${slug}`,
+        body: `Update ${slug} to which version?\nLeave empty for latest (${latest || 'unknown'}).`,
+        input: true,
+        initialValue: latest || '',
+        confirmLabel: 'Update',
+    });
+    if (!answer?.confirmed) return { confirmed: false, version: '' };
+    return { confirmed: true, version: String(answer.value || '').trim() };
+}
+
 
 function controlsTemplate() {
     return `
@@ -672,18 +692,18 @@ export function initMarketplace(pane, controlsHost = null) {
                 updateBtn.disabled = false;
                 return;
             }
-            // Empty version means latest; cancel skips update.
+            // Empty version means latest; cancel skips update. slug/installed/
+            // sanitized/latest are all captured BEFORE the await below: the
+            // 5-second lifecycle poller re-renders the results DOM under the
+            // open dialog, so nothing may be read off the row afterwards.
             const summary = state.results.find((s) => s.slug === slug);
             const latest = summary?.latest_version || '';
-            const userVersion = window.prompt(
-                `Update ${slug} to which version? Leave empty for latest (${latest || 'unknown'}).`,
-                latest,
-            );
-            if (userVersion === null) {
+            const asked = await promptUpdateVersion(slug, latest);
+            if (!asked.confirmed) {
                 updateBtn.disabled = false;
                 return;
             }
-            const targetVersion = (userVersion || '').trim();
+            const targetVersion = asked.version;
             showStatus(pane, `Updating ${slug}${targetVersion ? ` → v${targetVersion}` : ' (latest)'}…`, 'muted');
             setPending(slug, {
                 label: 'Updating',
@@ -702,6 +722,9 @@ export function initMarketplace(pane, controlsHost = null) {
                     emitSkillLifecycle('update', sanitized, result);
                 }
             } catch (err) {
+                // Pre-existing quirk (disclosed, unchanged): "Retry update" goes
+                // through runLifecycleAction('update'), which always POSTs {} =
+                // latest — a typed pinned version does not survive into the retry.
                 setPending(slug, {
                     label: 'Failed',
                     tone: 'danger',

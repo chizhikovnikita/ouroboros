@@ -352,6 +352,53 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
     }
 
 
+def _accept_receipt_exhibits(receipts: list) -> list:
+    """Canonical indexed receipt exhibits: one compact host-attested row per receipt,
+    under the SAME global index ``acceptance_support_refs`` cites
+    (``verification_receipts[i]``). The D-Q5 vocabulary enumerates THESE rows — a
+    reviewer can only cite a receipt the packet actually carries, with its status
+    visible, and only a green one resolves (the count-synthesized vocabulary let a
+    red receipt nobody ever saw buy a release-clean PASS)."""
+    from ouroboros._outcome_receipts import receipt_identity_projection
+
+    return [{
+        "ref": f"verification_receipts[{idx}]",
+        "status": str(r.get("status") or ""),
+        "matched": r.get("matched") if "matched" in r else None,
+        "contract_kind": str(r.get("contract_kind") or ""),
+        "criterion_source": str(r.get("criterion_source") or ""),
+        "provenance": "host_attested",
+        **receipt_identity_projection(r, bound=_accept_redact_cap, check_cap=200),
+    } for idx, r in enumerate(x for x in (receipts or []) if isinstance(x, dict))]
+
+
+def _accept_effective_claims(
+    ctx: Any, contract: Dict[str, Any], drive_root: Any, task_id: str,
+) -> tuple[list, str]:
+    """Effective claims + provenance for the packet, via the ONE pure seam
+    (contracts.task_contract.effective_acceptance_claims): ingress-contract claims
+    first, the CLOSED plan wave's frozen claims only when ingress is empty. The
+    plan-state lookup mirrors plan_task's own state location (budget_drive_root
+    first) and is FAIL-SOFT — a claims lookup must never break packet building."""
+    from ouroboros.contracts.task_contract import effective_acceptance_claims
+
+    claims, source = effective_acceptance_claims(contract)
+    if claims:
+        return claims, source
+    root = getattr(ctx, "budget_drive_root", None) or drive_root
+    if not root or not str(task_id or ""):
+        return [], ""
+    try:
+        from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
+
+        wave = closed_plan_review_wave(
+            load_plan_review_state(pathlib.Path(str(root)), str(task_id))
+        )
+    except Exception:
+        return [], ""
+    return effective_acceptance_claims(contract, wave)
+
+
 def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list[Dict[str, Any]]:
     """Host-built support references for acceptance claims.
 
@@ -429,6 +476,64 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
             "support_status": "supported" if supported else ("declared_only" if declared_only else ("linked_failed" if refs else "missing")),
         })
     return out
+
+
+# D-Q5 exhibit-key vocabulary + exact-membership resolver: extracted to the
+# ``review_evidence_refs`` leaf (module size gate); re-exported here so every
+# historical import site keeps resolving. ``annotate_criteria_evidence_resolution``
+# below reads the two functions through THESE module globals on purpose — the
+# fail-closed seam stays patchable at ``review_evidence.<name>`` (D-Q5 tests).
+from ouroboros.review_evidence_refs import (
+    _RESOLUTION_UNAVAILABLE_ROW as _RESOLUTION_UNAVAILABLE_ROW,
+)
+from ouroboros.review_evidence_refs import (
+    acceptance_evidence_ref_vocabulary as acceptance_evidence_ref_vocabulary,
+)
+from ouroboros.review_evidence_refs import (
+    CLAIM_ID_UNSUPPORTED as CLAIM_ID_UNSUPPORTED,
+)
+from ouroboros.review_evidence_refs import (
+    NON_RESOLVING_BASIS_KINDS as NON_RESOLVING_BASIS_KINDS,
+)
+from ouroboros.review_evidence_refs import (
+    resolve_criteria_evidence_refs as resolve_criteria_evidence_refs,
+)
+
+
+def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
+    """Stamp per-actor ``criteria_refs_unresolved`` disclosure rows in place (D-Q5).
+
+    Runs ONCE per acceptance panel over actor dict rows; a fully-resolving actor
+    gets NO annotation (the common clean path is byte-identical). The annotation
+    feeds ONLY ``task_acceptance_is_clean`` and disclosure — never parse validity,
+    never quorum, never a verdict.
+
+    TOTAL and fail-CLOSED. An annotation that did not run may never be read as
+    "everything resolved": the absence of a row is what authorizes the clean bit,
+    so a resolver failure that left the rows off would silently certify evidence
+    nobody checked. Any failure therefore stamps the typed
+    ``host_resolution_unavailable`` row on EVERY actor, landing on the same
+    clean-bit rail as an unresolved ref — never a verdict, never a veto."""
+    unavailable = False
+    try:
+        vocabulary = acceptance_evidence_ref_vocabulary(evidence)
+    except Exception:
+        log.warning("acceptance evidence-ref vocabulary unavailable", exc_info=True)
+        vocabulary, unavailable = {}, True
+    for actor in actors if isinstance(actors, list) else []:
+        if not isinstance(actor, dict):
+            continue
+        try:
+            if unavailable:
+                actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
+                continue
+            parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+            rows = resolve_criteria_evidence_refs(parsed.get("criteria_used"), vocabulary)
+            if rows:
+                actor["criteria_refs_unresolved"] = rows
+        except Exception:
+            log.warning("acceptance evidence-ref resolution failed for one actor", exc_info=True)
+            actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
 
 
 def _accept_trajectory(tool_calls: list) -> tuple:
@@ -704,6 +809,56 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
     return rows
 
 
+_ACCEPT_DELTA_CHILD_CAP = 20  # reduced-children rows in the finalizer aggregate
+
+
+def _accept_capability_deltas(drive_root: Any, task_id: str, root_task_id: str) -> Dict[str, Any]:
+    """Typed aggregate of capability reductions for the FINALIZER (one section).
+
+    The task's own dispatch delta plus every DIRECT child that ran below what
+    was asked for (lane served on Main, executor fallback to metered tokens,
+    profile reduction). Each delta is disclosed at absorption — but absorption
+    happens mid-flight, dozens of rounds before the final claim is written, and
+    nothing carried the accumulated picture to finalization: a result built on
+    degraded runs was judged as if everything ran as scheduled. One bounded,
+    host-attested section; ``disclosable_capability_delta`` is the SAME predicate
+    the absorption surfaces use, so this cannot disagree with what the parent
+    was told. Empty dict when nothing was reduced (noise-free by construction).
+    """
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import find_child_tasks
+    from ouroboros.tools.control import disclosable_capability_delta
+
+    out: Dict[str, Any] = {}
+    try:
+        own = disclosable_capability_delta(load_task_result(drive_root, task_id) or {})
+        if own:
+            out["own"] = own
+        children: List[Dict[str, Any]] = []
+        for row in find_child_tasks(
+            drive_root,
+            parent_task_id=task_id,
+            root_task_id=root_task_id or task_id,
+            scope="direct",
+        ):
+            delta = disclosable_capability_delta(row)
+            if delta:
+                children.append({
+                    "task_id": str(row.get("task_id") or ""),
+                    "status": str(row.get("status") or ""),
+                    "capability_delta": delta,
+                })
+        if children:
+            out["children_reduced_count"] = len(children)
+            if len(children) > _ACCEPT_DELTA_CHILD_CAP:
+                out["children_omitted"] = len(children) - _ACCEPT_DELTA_CHILD_CAP
+                children = children[:_ACCEPT_DELTA_CHILD_CAP]
+            out["children"] = children
+    except Exception:
+        log.debug("Failed to aggregate capability deltas for acceptance evidence", exc_info=True)
+    return out
+
+
 def build_task_acceptance_evidence(
     ctx: Any,
     *,
@@ -756,6 +911,12 @@ def build_task_acceptance_evidence(
         ev["agent_supplied"] = redact_projection(a).value
         prov["agent_supplied"] = "agent_supplied"
     contract = _accept_task_contract(ctx)
+    # W2: resolve the claims that bind this task through the ONE seam — ingress
+    # first, plan-frozen only when ingress is empty. The packet VIEW carries them;
+    # the durable/live contract is never mutated.
+    claims, claims_source = _accept_effective_claims(ctx, contract, drive_root, task_id)
+    if claims_source == "plan_review":
+        contract = {**contract, "acceptance_claims": claims}
     receipts = read_verification_receipts(drive_root, task_id) if (drive_root is not None and task_id) else []
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
@@ -767,12 +928,21 @@ def build_task_acceptance_evidence(
         # Structural (key-aware) redaction of the full contract before it enters the prompt.
         ev["task_contract"] = redact_projection(contract).value
         prov["task_contract"] = "host_attested"
+        if claims_source:
+            ev["acceptance_claims_source"] = claims_source
+            prov["acceptance_claims_source"] = "host_attested"
         support_refs = _accept_claim_support_refs(contract, receipts)
         if support_refs:
             ev["acceptance_support_refs"] = redact_projection(support_refs).value
             prov["acceptance_support_refs"] = "host_attested"
     ev["verification_summary"] = _accept_verification_summary(receipts)
     prov["verification_summary"] = "host_attested"
+    receipt_exhibits = _accept_receipt_exhibits(receipts)
+    if receipt_exhibits:
+        # D-Q5: the indexed exhibit list the receipt-ref vocabulary derives from —
+        # `verification_receipts[i]` must name a row that is HERE, never a bare count.
+        ev["verification_receipts"] = redact_projection(receipt_exhibits).value
+        prov["verification_receipts"] = "host_attested"
     if drive_root is not None and task_id:
         from ouroboros.mutation_attribution import load_mutation_evidence_projection
 
@@ -780,6 +950,10 @@ def build_task_acceptance_evidence(
         if mutation_projection:
             ev["mutation_attribution"] = mutation_projection
             prov["mutation_attribution"] = "host_attested"
+        delta_aggregate = _accept_capability_deltas(drive_root, task_id, root_task_id)
+        if delta_aggregate:
+            ev["capability_deltas"] = redact_projection(delta_aggregate).value
+            prov["capability_deltas"] = "host_attested"
     ev["repo_diff"] = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
     prov["repo_diff"] = "host_attested"
     if subtree_statuses is not None:

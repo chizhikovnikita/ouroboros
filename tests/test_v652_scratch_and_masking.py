@@ -69,7 +69,7 @@ def test_scratch_exempts_output_guard_and_is_not_an_artifact(tmp_path, monkeypat
         },
     )
     # Declared scratch is exempt from the undeclared-output guard...
-    assert "ARTIFACT_OUTPUT_ERROR" not in result, result
+    assert "ARTIFACT_OUTPUT_" not in result, result
     assert "exit_code=0" in result
     # ...and is never registered as a task artifact (the manifest itself is excluded too).
     assert collect_task_artifact_records(data, "task1") == []
@@ -87,7 +87,7 @@ def test_undeclared_write_still_blocks_without_scratch(tmp_path, monkeypatch):
         "run_command",
         {"cmd": [sys.executable, "-c", f"open({str(target)!r}, 'w').write('x')"], "cwd": str(desktop)},
     )
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
 
 
 def test_scratch_adopts_preexisting_untracked_file(tmp_path, monkeypatch):
@@ -135,7 +135,8 @@ def test_scratch_tracked_path_still_blocked(tmp_path, monkeypatch):
 
 def test_output_guard_ignores_nonexistent_path_candidates(tmp_path, monkeypatch):
     """v6.56.0 stat-verification: import-string / flag candidates that name no real fresh file are
-    NOT flagged as undeclared user_files outputs (kills the ARTIFACT_OUTPUT_ERROR false-positive class)."""
+    NOT flagged as undeclared user_files outputs (kills the undeclared-output false-positive class;
+    the exit_code=0 nudge is typed ARTIFACT_OUTPUT_UNDECLARED since the v6.91 policy-denial split)."""
     registry, _repo, _data, desktop = _reg(tmp_path, monkeypatch)
     # The command TEXT mentions absolute '/http'-style tokens after a write marker, but writes nothing
     # under user_files. Under the old regex-only guard this false-flagged; stat-verification clears it.
@@ -146,7 +147,7 @@ def test_output_guard_ignores_nonexistent_path_candidates(tmp_path, monkeypatch)
         "run_command",
         {"cmd": [sys.executable, "-c", f"print('would write_text to {marker_home.as_posix()} via /http/x import')"], "cwd": str(desktop)},
     )
-    assert "ARTIFACT_OUTPUT_ERROR" not in result, result
+    assert "ARTIFACT_OUTPUT_" not in result, result
     assert "exit_code=0" in result
 
 
@@ -158,7 +159,7 @@ def test_output_guard_still_flags_real_fresh_write(tmp_path, monkeypatch):
         "run_command",
         {"cmd": [sys.executable, "-c", f"open({str(target)!r}, 'w').write('x')"], "cwd": str(desktop)},
     )
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
 
 
 def test_run_script_body_audit_is_post_exec_stat_verified(tmp_path, monkeypatch):
@@ -170,21 +171,21 @@ def test_run_script_body_audit_is_post_exec_stat_verified(tmp_path, monkeypatch)
         "run_script",
         {"script": "import http.client  # /http/client\nprint('hi')", "interpreter": "python3", "cwd": str(desktop)},
     )
-    assert "ARTIFACT_OUTPUT_ERROR" not in ok, ok
+    assert "ARTIFACT_OUTPUT_" not in ok, ok
     # (b) body actually writes a user_files deliverable -> flagged post-exec
     target = desktop / "from_body.txt"
     bad = registry.execute(
         "run_script",
         {"script": f"open({str(target)!r}, 'w').write('deliverable')", "interpreter": "python3", "cwd": str(desktop)},
     )
-    assert "ARTIFACT_OUTPUT_ERROR" in bad, bad
+    assert "ARTIFACT_OUTPUT_UNDECLARED" in bad, bad
 
 
 def test_run_script_body_audit_runs_on_failure_path(tmp_path, monkeypatch):
     """v6.56.0 review regression: a script that WRITES an undeclared user_files
     deliverable and then FAILS (raise/SystemExit) still leaves the file on disk —
     the post-exec audit must run on the error path too, surfacing BOTH the error
-    and the ARTIFACT_OUTPUT_ERROR (not skipping the audit because the result is ⚠️)."""
+    and the ARTIFACT_OUTPUT_UNDECLARED nudge (not skipping the audit because the result is ⚠️)."""
     registry, _repo, _data, desktop = _reg(tmp_path, monkeypatch)
     target = desktop / "written_then_failed.txt"
     result = registry.execute(
@@ -193,7 +194,7 @@ def test_run_script_body_audit_runs_on_failure_path(tmp_path, monkeypatch):
          "interpreter": "python3", "cwd": str(desktop)},
     )
     assert target.exists()  # the write really happened
-    assert "ARTIFACT_OUTPUT_ERROR" in result, result
+    assert "ARTIFACT_OUTPUT_UNDECLARED" in result, result
 
 
 def test_scratch_directory_declaration_refused(tmp_path, monkeypatch):
@@ -275,7 +276,7 @@ def test_audit_gap_audits_nonscratch_deliverable_despite_scratch(tmp_path, monke
         "run_command",
         {"cmd": [sys.executable, "-c", code], "cwd": str(ws), "scratch": [str(ws / "probe.py")]},
     )
-    assert "ARTIFACT_OUTPUT_ERROR" not in result, result
+    assert "ARTIFACT_OUTPUT_" not in result, result
     assert "ARTIFACT_AUDIT_GAP" in result, result  # the non-scratch deliverable is still audited
 
 

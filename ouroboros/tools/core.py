@@ -25,6 +25,7 @@ from ouroboros.tool_access import (
     normalize_root_relative,
     project_room_lens_dir,
     resolve_user_file_path,
+    UserFilesPathBlockedError,
     resolve_resource_path,
     resource_root_path,
     user_files_path_block_reason,
@@ -1116,6 +1117,12 @@ def _read_file(
         except Exception:
             pass
         return f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)}{hint}"
+    except UserFilesPathBlockedError as exc:
+        # Typed POLICY refusal, not an executor failure: the runtime said "no"
+        # to this read. The distinct prefix routes it into the v6.57.0
+        # policy-denial partition instead of a generic error that falsely
+        # degrades a shipped task to tool_failure.
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
     except Exception as exc:
         return f"⚠️ READ_FILE_ERROR: {type(exc).__name__}: {exc}"
 
@@ -1171,6 +1178,9 @@ def _list_files(
         return json.dumps(items, ensure_ascii=False, indent=2)
     except _ListingFailure as exc:
         return f"⚠️ LIST_FILES_ERROR: {exc}"
+    except UserFilesPathBlockedError as exc:
+        # Typed POLICY refusal (see _read_file): policy denial, not tool_failure.
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
     except Exception as exc:
         # A hard failure is a first-class tool error, never a JSON "listing" that
         # reads as success with an error string inside (v6.54.3: that shape
@@ -1670,6 +1680,9 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             if normalized == "user_files"
             else (root_path / safe_relpath(path)).resolve()
         )
+    except UserFilesPathBlockedError as exc:
+        # Typed POLICY refusal (see _read_file): policy denial, not tool_failure.
+        return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
     except Exception as exc:
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
     if not search_root.exists():

@@ -1284,7 +1284,7 @@ def _api_state_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     app = types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root, app_start=0.0))
     request = Request({
         "type": "http", "method": "GET", "path": "/api/state", "headers": [],

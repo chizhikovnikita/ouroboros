@@ -21,6 +21,7 @@ import os
 import pathlib
 import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -169,9 +170,22 @@ def _quarantine_tail(root: pathlib.Path, raw: bytes, offset: int, reason: str) -
         log.exception("Failed to emit usage-ledger quarantine event")
 
 
-def _validate_records(records: Sequence[Dict[str, Any]]) -> None:
-    states: Dict[str, str] = {}
-    expected = 1
+def _validate_records(
+    records: Sequence[Dict[str, Any]],
+    *,
+    start_seq: int = 1,
+    states: Optional[Dict[str, str]] = None,
+) -> None:
+    """Validate row structure, dense sequence, and per-attempt transitions.
+
+    ``start_seq``/``states`` are the ADDITIVE resume seam for incremental tail
+    validation: a caller that already validated a prefix passes the next
+    expected sequence number and the prefix's per-attempt last-state map (which
+    is mutated in place as the tail validates). Defaults reproduce the historic
+    whole-ledger behavior exactly.
+    """
+    states = {} if states is None else states
+    expected = int(start_seq)
     for row in records:
         try:
             sequence = int(row.get("seq") or 0) if isinstance(row, dict) else 0
@@ -273,6 +287,129 @@ def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
         _quarantine_tail(root, bad_chunk, bad_offset, "structurally invalid final ledger row")
         records.pop()
     return records
+
+
+@dataclass
+class LedgerResumeState:
+    """Where a validated read of the ledger ended, for incremental resumption.
+
+    Identity (``st_ino``/``st_dev``), extent (``size`` = byte offset after the
+    last validated row) and ``st_mtime_ns`` fingerprint the file as it was read
+    UNDER THE LOCK; ``row_count`` and the per-attempt last-``states`` map seed
+    tail validation so transition rules hold across the resume boundary. A
+    missing ledger is represented as ``st_ino/st_dev = -1`` with ``size = 0``;
+    ``st_ino/st_dev = -2`` marks a deliberately NON-RESUMABLE fingerprint (the
+    file's tail is not row-aligned), which no real inode ever matches, so every
+    subsequent read stays a full replay.
+    """
+
+    st_ino: int
+    st_dev: int
+    size: int
+    st_mtime_ns: int
+    row_count: int
+    states: Dict[str, str] = field(default_factory=dict)
+
+
+def _ledger_resume_state(
+    root: pathlib.Path, records: Sequence[Dict[str, Any]]
+) -> LedgerResumeState:
+    """Fingerprint the just-read ledger for incremental resumption.
+
+    Must be called under the same held ledger lock as the read that produced
+    ``records`` (writers append only under that lock, so the stat is consistent
+    with the validated content — including any quarantine truncation the read
+    itself performed)."""
+    states = {str(row.get("attempt_id") or ""): str(row.get("state") or "") for row in records}
+    path = root / LEDGER_REL
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return LedgerResumeState(-1, -1, 0, -1, len(records), states)
+    if stat.st_size > 0:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(stat.st_size - 1)
+                terminated = handle.read(1) == b"\n"
+        except OSError:
+            terminated = False
+        if not terminated:
+            # A crash-torn final line that is still valid JSON parses in the full
+            # read, but its end is NOT a row boundary: a later append glues onto
+            # the unterminated line, so an incremental resume from this offset
+            # would accept the glued-on row while a fresh replay quarantines the
+            # whole glued line. Refuse to resume until the tail is repaired.
+            return LedgerResumeState(-2, -2, stat.st_size, -1, len(records), states)
+    return LedgerResumeState(
+        stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns, len(records), states
+    )
+
+
+def _read_new_records_locked(
+    root: pathlib.Path, resume: LedgerResumeState
+) -> Optional[Tuple[list[Dict[str, Any]], LedgerResumeState]]:
+    """Incrementally read rows appended after ``resume``; ``None`` = full refold.
+
+    Returns ``(new_records, new_resume)`` when the resume fingerprint still
+    matches and the appended tail parses and validates as a seq-continuous,
+    transition-legal continuation. Returns ``None`` whenever the resume state
+    cannot be trusted — file replaced (inode/device change), shrunk below the
+    resume offset, rewritten in place (same size, different mtime), or a
+    torn/structurally invalid tail — so the caller re-reads through the normal
+    ``_read_records_locked``, which OWNS quarantine. This function never
+    truncates or otherwise mutates the ledger, and must be called under the
+    held ledger lock.
+    """
+    path = root / LEDGER_REL
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        if resume.row_count == 0 and resume.size == 0:
+            return [], resume
+        return None
+    except OSError:
+        return None
+    if (stat.st_ino, stat.st_dev) != (resume.st_ino, resume.st_dev):
+        return None
+    if stat.st_size < resume.size:
+        return None
+    if stat.st_size == resume.size:
+        return ([], resume) if stat.st_mtime_ns == resume.st_mtime_ns else None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(resume.size)
+            data = handle.read()
+    except OSError:
+        return None
+    if not data.endswith(b"\n"):
+        # A torn in-flight append (crashed writer). The full reader decides
+        # whether that tail is quarantined; never guess here.
+        return None
+    records: list[Dict[str, Any]] = []
+    for chunk in data.splitlines():
+        raw = chunk.rstrip(b"\r")
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8"))
+            if not isinstance(row, dict):
+                raise ValueError("row is not an object")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        records.append(row)
+    seeded_states = dict(resume.states)
+    try:
+        _validate_records(records, start_seq=resume.row_count + 1, states=seeded_states)
+    except UsageLedgerCorrupt:
+        return None
+    return records, LedgerResumeState(
+        stat.st_ino,
+        stat.st_dev,
+        stat.st_size,
+        stat.st_mtime_ns,
+        resume.row_count + len(records),
+        seeded_states,
+    )
 
 
 def _append_rows_locked(

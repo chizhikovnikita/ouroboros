@@ -863,8 +863,16 @@ def test_workspace_run_shell_cwd_allows_scratch_blocks_runtime(tmp_path, monkeyp
     assert "SHELL_CWD_BLOCKED" in runtime_repo_cwd
     runtime_data_cwd = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(data)})
     assert "SHELL_CWD_BLOCKED" in runtime_data_cwd
-    git_escape = registry.execute("run_command", {"cmd": ["git", "-C", str(system_repo), "status"]})
-    assert "WORKSPACE_GIT_BLOCKED" in git_escape
+    # READ-ONLY git at a runtime target is ALLOWED (owner contract "read-only
+    # everywhere"; the f14baf8f false-block class). Only MUTATING git is target-checked.
+    git_read = registry._run_shell_safety_check(
+        {"cmd": ["git", "-C", str(system_repo), "status"]}, "advanced"
+    )
+    assert git_read is None, git_read
+    git_escape = registry._run_shell_safety_check(
+        {"cmd": ["git", "-C", str(system_repo), "commit", "-m", "x"]}, "advanced"
+    )
+    assert git_escape and "WORKSPACE_GIT_BLOCKED" in git_escape
     git_chain = registry.execute("run_command", {"cmd": ["sh", "-c", "true && git --version; echo git binary OK"]})
     assert "WORKSPACE_GIT_BLOCKED" not in git_chain
     outside_write = registry.execute("run_command", {"cmd": ["touch", str(system_repo / "README.md")]})
@@ -1049,6 +1057,12 @@ def test_external_workspace_shell_allows_task_local_git(tmp_path, monkeypatch):
     for cmd in allowed:
         assert registry._run_shell_safety_check({"cmd": cmd}, "advanced") is None, cmd
 
+    # READ-ONLY git reaches the runtime through EVERY retarget vector — that is the
+    # owner contract ("read-only everywhere, including at a runtime target") and the
+    # recorded false-block class f14baf8f. Before the Q4=A composition these four
+    # were refused: the target-aware resolver let them through and the
+    # external-workspace runtime-READ guard then blocked them as
+    # WORKSPACE_SHELL_BLOCKED, naming the wrong reason.
     for cmd in (
         ["git", "-C", str(system_repo), "status"],
         ["git", "--git-dir", str(system_repo / ".git"), "status"],
@@ -1058,7 +1072,25 @@ def test_external_workspace_shell_allows_task_local_git(tmp_path, monkeypatch):
         ["sh", "-c", "git -C $OUROBOROS_TEST_RUNTIME_REPO status"],
     ):
         result = registry._run_shell_safety_check({"cmd": cmd}, "advanced")
+        assert result is None, (cmd, result)
+
+    # ...while the MUTATING form of each vector stays blocked.
+    for cmd in (
+        ["git", "-C", str(system_repo), "commit", "-m", "x"],
+        ["git", "--git-dir", str(system_repo / ".git"), "commit", "-m", "x"],
+        ["sh", "-c", f"cd {system_repo.as_posix()} && git commit -m x"],
+        ["sh", "-c", "git -C $OUROBOROS_TEST_RUNTIME_REPO commit -m x"],
+    ):
+        result = registry._run_shell_safety_check({"cmd": cmd}, "advanced")
         assert result and "WORKSPACE_GIT_BLOCKED" in result, (cmd, result)
+
+    # The read-only exemption is ALL-or-NOTHING per segment: a compound that only
+    # STARTS with git still meets the runtime/secret read guard in full.
+    mixed = registry._run_shell_safety_check(
+        {"cmd": ["sh", "-c", f"git status && cat {(data / 'settings.json').as_posix()}"]},
+        "advanced",
+    )
+    assert mixed and "WORKSPACE_SHELL_BLOCKED" in mixed, mixed
 
 
 def test_workspace_shell_git_ls_remote_requires_network_contract(tmp_path):
@@ -1127,11 +1159,17 @@ def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive
     assert "SHELL_CWD_BLOCKED" in child_control
     blocked = registry.execute("run_command", {"cmd": ["pwd"], "cwd": str(parent_data / "logs")})
     assert "SHELL_CWD_BLOCKED" in blocked
-    git_escape = registry._run_shell_safety_check(
+    # Read-only git is allowed everywhere now; the escape check uses a MUTATING form.
+    git_read = registry._run_shell_safety_check(
         {"cmd": ["git", "-C", "../other-repo", "status"], "cwd": str(child_dir)},
         "advanced",
     )
-    assert "WORKSPACE_GIT_BLOCKED" in git_escape
+    assert git_read is None, git_read
+    git_escape = registry._run_shell_safety_check(
+        {"cmd": ["git", "-C", "..", "commit", "-m", "x"], "cwd": str(child_dir)},
+        "advanced",
+    )
+    assert git_escape and "WORKSPACE_GIT_BLOCKED" in git_escape, git_escape
     protected_escape = registry._run_shell_safety_check(
         {"cmd": ["touch", "../data/state/state.json"]},
         "pro",

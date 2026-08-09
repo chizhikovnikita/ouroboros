@@ -16,6 +16,16 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.fixture(autouse=True)
+def _isolated_projects_root(tmp_path_factory, monkeypatch):
+    """Q10=A auto-provisions a genesis workspace for file-less project promotes;
+    keep it out of the real ~/Ouroboros/projects."""
+    monkeypatch.setenv(
+        "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
+        str(tmp_path_factory.mktemp("projects_root")),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_event_bus_shutdown_latch():
     """A prior TestClient lifespan must not leak its shutdown latch into tests."""
     import supervisor.workers as workers

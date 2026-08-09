@@ -415,24 +415,61 @@ def test_no_env_dumping():
 
 
 def test_no_oversized_modules():
-    """Principle 7: no non-grandfathered module exceeds the hard gate."""
-    from ouroboros.review import MAX_MODULE_LINES, module_is_grandfathered
+    """Principle 7: no non-grandfathered module exceeds the hard gate.
+
+    Covers Python everywhere plus web/**/*.js (perf/lifecycle sprint): the JS
+    predicate is the SSOT `is_gated_js_module` shared with codebase_health, so
+    the two consumers never diverge. `web/tests/` needs no special-casing here —
+    `_SKIP_DIRS` already prunes any directory named `tests` from the walk.
+    """
+    from ouroboros.review import MAX_MODULE_LINES, is_gated_js_module, module_is_grandfathered
 
     max_lines = MAX_MODULE_LINES
     violations = []
     for root, dirs, files in os.walk(REPO):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for f in files:
-            if not f.endswith(".py"):
-                continue
             path = pathlib.Path(root) / f
+            # Compute rel BEFORE filtering: the JS predicate is path-based
+            # (web/** only, vendored/minified .min.js excluded).
+            rel = path.relative_to(REPO).as_posix()
+            if not (f.endswith(".py") or is_gated_js_module(rel)):
+                continue
             lines = len(path.read_text(encoding="utf-8").splitlines())
             # Shared matcher (basename OR repo-relative path) — the same one
             # codebase_health uses, so the two consumers never diverge.
-            rel = path.relative_to(REPO).as_posix()
             if lines > max_lines and not module_is_grandfathered(rel):
                 violations.append(f"{rel}: {lines} lines")
     assert len(violations) == 0, f"Oversized modules (>{max_lines} lines):\n" + "\n".join(violations)
+
+
+def test_js_module_gate_buckets_and_grandfathering():
+    """The JS size gate sees web/**/*.js, exempts chat.js by rel-path only,
+    and excludes vendored/minified payloads and web/tests/."""
+    from ouroboros.review import compute_complexity_metrics, module_is_grandfathered
+
+    sections = [
+        ("repo/web/app.js", "x\n" * 2000),                   # gated, over hard gate, not grandfathered
+        ("repo/web/modules/chat.js", "x\n" * 4000),          # gated, grandfathered by rel-path
+        ("repo/web/vendor/chart.umd.min.js", "x\n" * 9000),  # vendored/minified — excluded
+        ("repo/web/tests/foo.test.js", "x\n" * 9000),        # web/tests/ — excluded
+        ("repo/ouroboros/small.py", "x\n" * 10),
+    ]
+    metrics = compute_complexity_metrics(sections)
+
+    assert metrics["js_files"] == 2  # app.js + chat.js; vendored and web/tests excluded
+    oversized = {p for p, _n in metrics["oversized_modules"]}
+    grandfathered = {p for p, _n in metrics["grandfathered_modules"]}
+    assert "repo/web/app.js" in oversized
+    assert "repo/web/modules/chat.js" in grandfathered
+    assert "repo/web/modules/chat.js" not in oversized
+    for excluded in ("repo/web/vendor/chart.umd.min.js", "repo/web/tests/foo.test.js"):
+        assert excluded not in oversized and excluded not in grandfathered
+
+    # Grandfather entry is rel-path-keyed: a chat.js anywhere else stays gated.
+    assert module_is_grandfathered("web/modules/chat.js")
+    assert module_is_grandfathered("repo/web/modules/chat.js")
+    assert not module_is_grandfathered("web/other/chat.js")
 
 
 def test_no_bare_except_pass():

@@ -205,8 +205,8 @@ def test_project_sidebar_and_menu_static_contracts():
 
     assert "chatAnnotation: msg.chat_annotation || null" in chat
     annotation_handler = chat[
-        chat.index("ws.on('message_annotation'"):
-        chat.index("ws.on('log'")
+        chat.index("onWs('message_annotation'"):
+        chat.index("onWs('log'")
     ]
     assert "updateMessageAnnotation" in annotation_handler
     assert "addMessage(" not in annotation_handler
@@ -232,7 +232,7 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
 
     unread_fn = chat[
         chat.index("function incrementUnreadIfNeeded"):
-        chat.index("ws.on('typing'")
+        chat.index("onWs('typing'")
     ]
     project_guard = unread_fn.index("if (isKnownProjectFrame(msg)) return;")
     increment = unread_fn.index("state.unreadCount++;")
@@ -243,7 +243,7 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
     # the original frame so the Project-origin guard can classify it.
     fanout = chat[
         chat.index("const isProjectMirrorFrame"):
-        chat.index("ws.on('message_annotation'")
+        chat.index("onWs('message_annotation'")
     ]
     assert "mirrorProject && isProjectMirrorFrame(msg)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
@@ -259,6 +259,20 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
     ]
     assert "appendTaskSummaryToLiveCard(msg" in history
     assert "incrementUnreadIfNeeded" not in history
+
+
+def test_chat_ws_subscriptions_flow_through_disposer_helper():
+    """P3 lifecycle: every WS subscription in chat.js must go through the
+    onWs helper so destroy() can release it. A bare ws.on() call would leak
+    a listener past the instance lifetime; the helper's own definition is
+    the single allowed occurrence of `ws.on(`."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
+
+    assert "const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));" in chat
+    assert chat.count("ws.on(") == 1
 
 
 def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
@@ -424,8 +438,8 @@ def test_ephemeral_decision_web_frames_never_create_task_card_or_second_receipt(
     assert logs.index("showContextFitToast(evt);") < logs.index("registerEphemeralDecisionFrame(evt)")
 
     fanout = chat[
-        chat.index("ws.on('chat'"):
-        chat.index("ws.on('message_annotation'")
+        chat.index("onWs('chat'"):
+        chat.index("onWs('message_annotation'")
     ]
     # Inline ephemeral answers are not blanket-suppressed. Typed routing turns
     # retain any non-empty final answer while their progress/card stays hidden.

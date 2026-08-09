@@ -151,6 +151,140 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     assert texts.index("older message before the rotation") < texts.index("newest live message")
 
 
+def test_progress_history_backfills_from_rotated_archive(tmp_path):
+    """progress.jsonl now rotates to archive/progress_<ts>.jsonl like chat. History
+    replay must backfill rotated progress rows (newest-first, until the n_progress
+    quota) so a rotation does not silently erase live task cards (BIBLE P1)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+
+    (archive / "progress_20260808T010000.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T00:30:00Z",
+            "content": "archived step",
+            "task_id": "rotated-task",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T01:30:00Z",
+            "content": "live step",
+            "task_id": "live-task",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    texts = [item.get("text", "") for item in payload]
+    assert "archived step" in texts
+    assert "live step" in texts
+    # Chronological reassembly: archived rows precede the newer live row.
+    assert texts.index("archived step") < texts.index("live step")
+
+
+def test_progress_archive_not_read_when_live_satisfies_quota(tmp_path):
+    """Archive backfill stops once the live window already satisfies the filtered
+    quota — the rotated segments are not touched on the common path."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "progress_20260808T010000.jsonl").write_text(
+        json.dumps({"ts": "2026-08-08T00:30:00Z", "content": "old archived", "task_id": "t-old"}) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        "\n".join(
+            json.dumps({"ts": f"2026-08-08T01:00:{i:02d}Z", "content": f"live-{i}", "task_id": "t1"})
+            for i in range(5)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "3"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    texts = [item.get("text", "") for item in payload]
+    assert "old archived" not in texts  # quota satisfied by the live window
+    assert texts == ["live-2", "live-3", "live-4"]
+
+
+def test_history_annotation_after_quota_resolves_in_window_card(tmp_path):
+    """Post-quota annotation behavior change (v6.90.x P2): a terminal task whose
+    truth-anchor rows fell OUTSIDE the emitted window (here: its task_summary chat
+    row evicted by the n_human quota) still resolves its surviving in-window
+    progress card with the full terminal truth. Pre-change, the summary row seen
+    during the full parse suppressed the progress-row anchor and the truth was
+    applied only to rows the quota then dropped."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    chat_rows = [
+        json.dumps({
+            "ts": "2026-08-08T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "windowed",
+            "chat_id": 1,
+            "text": "Task windowed finished.",
+            "tool_calls": 1,
+            "rounds": 1,
+        })
+    ]
+    # Newer human rows push the summary row out of a small n_human window.
+    chat_rows += [
+        json.dumps({
+            "ts": f"2026-08-08T00:10:{i:02d}Z",
+            "direction": "in" if i % 2 else "out",
+            "chat_id": 1,
+            "text": f"newer human {i}",
+        })
+        for i in range(4)
+    ]
+    (logs / "chat.jsonl").write_text("\n".join(chat_rows) + "\n", encoding="utf-8")
+    (logs / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T00:05:00Z",
+            "content": "still visible progress",
+            "task_id": "windowed",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "windowed.json").write_text(
+        json.dumps({
+            "task_id": "windowed",
+            "status": "completed",
+            "cost_usd": 0.42,
+            "cost_final": True,
+            "reason_code": "",
+        }),
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(
+        endpoint(SimpleNamespace(query_params={"n_human": "2", "n_progress": "10"}))
+    )
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    assert not any(item.get("system_type") == "task_summary" for item in payload)
+    rec = next(item for item in payload if item.get("task_id") == "windowed")
+    assert rec["task_terminal_status"] == "completed"
+    # Full terminal truth (cost) landed on the in-window progress anchor.
+    assert rec["cost_usd"] == 0.42
+    assert rec["cost_final"] is True
+
+
 def test_chat_history_backfill_quota_is_thread_aware(tmp_path):
     """Regression for the v6.58.5 review finding: the archive-backfill human-row
     quota must be counted with the SAME thread filter used at render time. A

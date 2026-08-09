@@ -6,6 +6,8 @@ import pathlib
 from typing import Any, Dict, List, Tuple
 
 from ouroboros.tools.review_helpers import (
+    _VENDORED_NAMES,
+    _VENDORED_SUFFIXES,
     iter_repo_pack_entries,
 )
 
@@ -186,9 +188,40 @@ GRANDFATHERED_OVERSIZED_MODULES = {
     # helpers out of git_ops is the tracked follow-up (same class as
     # registry/events above).
     "git_ops.py",
+    # 2026-08-08 perf/lifecycle sprint (P4): web/**/*.js joined the module-size
+    # gate — the chat module had grown to 4067 lines with no deterministic brake
+    # because the gate filtered on `.py` only. chat.js is the single existing
+    # offender above the 1600 hard gate; splitting its history/scroll/attachment
+    # concerns is the tracked follow-up. Keyed by REPO-RELATIVE path (not the
+    # bare basename), following the skills/unix_computer_use/plugin.py precedent,
+    # so a future chat.js anywhere else is not silently exempted.
+    "web/modules/chat.js",
 }
 # Bundle-only launcher is not part of the self-editable function budget.
 FUNCTION_COUNT_EXCLUDED_FILES = {"launcher.py"}
+
+
+def is_gated_js_module(path: str) -> bool:
+    """True if `path` is a web JS module subject to the module-size gate.
+
+    Accepts an optional leading `repo/` (health sections are prefixed) and
+    covers ALL of web/**/*.js — not only web/modules/ (app.js must not escape) —
+    excluding `web/tests/` and vendored/minified payloads
+    (`_VENDORED_SUFFIXES`/`_VENDORED_NAMES`; `iter_repo_pack_entries` already
+    drops those from health sections — excluded here too so the smoke-gate walk
+    in tests/test_smoke.py shares this exact definition)."""
+    posix = pathlib.PurePosixPath(str(path).replace("\\", "/"))
+    rel = posix.as_posix()
+    if rel.startswith("repo/"):
+        rel = rel[len("repo/"):]
+    if not (rel.startswith("web/") and rel.endswith(".js")):
+        return False
+    if rel.startswith("web/tests/"):
+        return False
+    name = posix.name
+    if name in _VENDORED_NAMES or any(name.endswith(s) for s in _VENDORED_SUFFIXES):
+        return False
+    return True
 
 
 def module_is_grandfathered(path: str) -> bool:
@@ -232,12 +265,18 @@ def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any
     total_lines = sum(size for _path, size in file_sizes)
     func_lens = [length for _, _, length in function_lengths]
     py_files = [item for item in file_sizes if item[0].endswith(".py")]
-    target_drift_modules = [(p, n) for p, n in py_files if n > TARGET_MODULE_LINES]
-    hard_modules = [(p, n) for p, n in py_files if n > MAX_MODULE_LINES]
+    # JS size gate (perf/lifecycle sprint): web JS modules join the drift/hard
+    # buckets on line count only — the function-length scan above stays
+    # Python-only (no JS parser; disclosed in DEVELOPMENT.md Module Size).
+    js_files = [item for item in file_sizes if is_gated_js_module(item[0])]
+    gated_files = py_files + js_files
+    target_drift_modules = [(p, n) for p, n in gated_files if n > TARGET_MODULE_LINES]
+    hard_modules = [(p, n) for p, n in gated_files if n > MAX_MODULE_LINES]
 
     return {
         "total_files": len(sections),
         "py_files": len(py_files),
+        "js_files": len(js_files),
         "total_lines": total_lines,
         "total_functions": len(function_lengths),
         "avg_function_length": round(sum(func_lens) / max(1, len(func_lens)), 1) if func_lens else 0,
