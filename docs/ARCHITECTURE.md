@@ -2872,8 +2872,16 @@ OpenAI-compatible, Anthropic, MiniMax, and GigaChat routes without an automatic
 source are honestly unknown.
 
 A provider-reported cost is normalized to USD at ingress by
-`pricing.normalize_reported_cost`, called in `llm._normalize_remote_response`
-before any consumer reads `usage["cost"]`. Some gateways bill in a national
+`pricing.normalize_reported_cost`, called in BOTH places a reported cost enters
+the system: `usage_accounting.usage_from_response`, which is where the ledger's
+own number comes from, and `llm._normalize_remote_response`, which produces the
+usage dict events and the UI read. Two call sites rather than one because they
+parse the provider payload independently — normalizing only the second left
+roubles reaching the ledger booked as dollars while the displayed usage was
+already correct. The same pure helper serves both, so there is no second
+authority. The extractor also honours an explicitly named `cost_usd`, which its
+candidate list previously ignored: a gateway that states the unit plainly
+(closerouter's OpenAI-semantic lane) was recorded as unknown spend. Some gateways bill in a national
 currency and still name the plain field `cost` — polza.ai returns `cost` and
 `cost_rub` holding the SAME number, so booking it as dollars inflated recorded
 spend by the whole exchange rate and tripped the budget fence roughly eighty times

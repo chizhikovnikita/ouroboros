@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
-from ouroboros.pricing import estimate_cost_optional
+from ouroboros.pricing import estimate_cost_optional, normalize_reported_cost
 # One-way seam: the durable ledger substrate (locking, atomic append + fsync, row
 # and transition validation, torn-tail quarantine) lives in ouroboros/usage_ledger.py
 # and knows nothing about reservations, budgets, pricing, or projections. This module
@@ -1116,7 +1116,7 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
         if candidate is not None:
             cost_value = candidate
             break
-    cost = _number(cost_value)
+    cost, _ = normalize_reported_cost({**usage, "cost": _number(cost_value)})  # currency settled at money ingress
     return normalized, cost, cost is not None
 
 

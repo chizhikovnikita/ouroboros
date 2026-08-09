@@ -70,3 +70,59 @@ def test_a_missing_cost_stays_missing():
 
 def test_a_non_numeric_cost_is_not_coerced():
     assert normalize_reported_cost({"cost": "0.37", "cost_rub": "0.37"}) == (None, "")
+
+
+# --- the ledger's own ingress ------------------------------------------------
+
+
+def test_the_ledger_extractor_converts_the_reported_currency(monkeypatch):
+    """`usage_from_response` is where the ledger's number comes from.
+
+    Normalizing only the caller-facing usage dict in llm.py was not enough: the
+    money path reads the raw provider payload separately, so roubles still reached
+    the ledger booked as dollars.
+    """
+    monkeypatch.setenv("OUROBOROS_RUB_USD_RATE", "80")
+    from ouroboros.usage_accounting import usage_from_response
+
+    _usage, cost, final = usage_from_response({
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 80.0, "cost_rub": 80.0},
+    })
+    assert cost == pytest.approx(1.0)
+    assert final is True
+
+
+def test_the_ledger_records_unknown_rather_than_a_foreign_figure(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_RUB_USD_RATE", raising=False)
+    from ouroboros.usage_accounting import usage_from_response
+
+    _usage, cost, final = usage_from_response({
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.37, "cost_rub": 0.37},
+    })
+    assert cost is None
+    assert final is False
+
+
+def test_a_provider_that_only_reports_cost_usd_is_no_longer_ignored():
+    """closerouter's OpenAI-semantic lane names the unit and omits `cost`.
+
+    The extractor's candidate list never looked at `cost_usd`, so that spend was
+    recorded as unknown while the provider had stated it plainly.
+    """
+    from ouroboros.usage_accounting import usage_from_response
+
+    _usage, cost, final = usage_from_response({
+        "usage": {"prompt_tokens": 7, "completion_tokens": 12, "cost_usd": 4e-06},
+    })
+    assert cost == 4e-06
+    assert final is True
+
+
+def test_a_plain_usd_cost_still_reaches_the_ledger_unchanged():
+    from ouroboros.usage_accounting import usage_from_response
+
+    _usage, cost, final = usage_from_response({
+        "usage": {"prompt_tokens": 17, "completion_tokens": 5, "cost": 0.000126},
+    })
+    assert cost == 0.000126
+    assert final is True
