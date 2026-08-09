@@ -318,3 +318,44 @@ def test_a_send_with_no_connection_identity_touches_nothing(tmp_path):
     with pytest.raises(RuntimeError):
         execute_physical_attempt(request, _boom)
     assert pool._COOLDOWN_UNTIL == {}
+
+
+def _add_compatible(tmp_path, connection_id, base_url, models=()):
+    conns.upsert(conns.parse_connection({
+        "connection_id": connection_id,
+        "provider": "openai-compatible",
+        "kind": "endpoint",
+        "base_url": base_url,
+        "models": list(models),
+    }), tmp_path)
+    conns.set_secret(connection_id, {"OPENAI_COMPATIBLE_API_KEY": f"k-{connection_id}"}, tmp_path)
+
+
+def test_a_connection_that_names_the_model_beats_a_catch_all_on_the_same_lane(tmp_path, monkeypatch):
+    """Two gateways, one transport lane, different catalogs.
+
+    The polza/closerouter incident: the settings-derived connection serves
+    "whatever this provider serves", so a Claude request could be load-balanced onto
+    a key that does not sell Claude and comes back 403. A named model is a claim; an
+    empty list is only the absence of one.
+    """
+    monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
+    _add_compatible(tmp_path, "catch-all", "https://polza.example/v1")
+    _add_compatible(tmp_path, "claude-only", "https://closerouter.example/v1",
+                    models=["anthropic/claude-opus-5"])
+
+    named = pool.candidates("openai-compatible::anthropic/claude-opus-5", tmp_path)
+    assert [c.connection_id for c in named] == ["claude-only"]
+
+    # A model only the catch-all can serve still reaches it — narrowing must not
+    # strand traffic that has nowhere more specific to go.
+    other = pool.candidates("openai-compatible::deepseek/deepseek-v4-flash", tmp_path)
+    assert [c.connection_id for c in other] == ["catch-all"]
+
+
+def test_catch_all_connections_still_share_traffic_when_none_declare_models(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
+    _add_compatible(tmp_path, "a", "https://a/v1")
+    _add_compatible(tmp_path, "b", "https://b/v1")
+    got = {c.connection_id for c in pool.candidates("openai-compatible::any/model", tmp_path)}
+    assert got == {"a", "b"}

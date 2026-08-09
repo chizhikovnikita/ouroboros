@@ -316,3 +316,42 @@ def test_a_compatible_lane_on_the_legacy_openai_pair_is_still_seen():
 
 def test_nothing_configured_projects_nothing():
     assert conns.legacy_connections({}) == ()
+
+
+def test_a_pasted_endpoint_url_is_rejected_as_a_provider():
+    """The closerouter incident: a URL in `provider` made a silently inert row.
+
+    Routing matches this field against `provider_for_model`, and the credential key
+    is derived from it, so an unrecognized lane both fails to route and stores the
+    secret under a name no transport reads — while the UI showed it as configured.
+    """
+    with pytest.raises(conns.ConnectionConfigError) as excinfo:
+        conns.parse_connection({
+            "connection_id": "key1",
+            "provider": "https://closerouter.dev/",
+            "base_url": "https://api.closerouter.dev/v1",
+        })
+    message = str(excinfo.value)
+    assert "unknown provider" in message
+    # The error has to teach the fix, not just refuse.
+    assert "base_url" in message and "openai-compatible" in message
+
+
+def test_every_known_transport_lane_is_accepted_as_a_provider():
+    from ouroboros.provider_models import PROVIDER_CREDENTIAL_GROUPS
+
+    for provider in PROVIDER_CREDENTIAL_GROUPS:
+        parsed = conns.parse_connection({"connection_id": "c1", "provider": provider})
+        assert parsed.provider == provider
+
+
+def test_an_invalid_provider_row_is_skipped_without_hiding_the_healthy_ones(tmp_path):
+    path = conns.catalog_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"connections": [
+        {"connection_id": "broken", "provider": "https://example.dev/"},
+        {"connection_id": "good", "provider": "openai-compatible", "base_url": "https://x/v1"},
+    ]}), encoding="utf-8")
+
+    loaded = conns.load_registry(tmp_path)
+    assert [c.connection_id for c in loaded] == ["good"]

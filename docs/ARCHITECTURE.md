@@ -1266,6 +1266,16 @@ means "no opinion" and the caller keeps the old path — that is what preserves
 provider independence rather than a separate compatibility branch.
 `OUROBOROS_DISABLE_CONNECTION_POOL=1` forces that answer globally.
 
+**A declared model beats a default one.** Two gateways can share one transport
+lane while selling different catalogs — a settings-derived key and a registry
+connection are both `openai-compatible`, and an empty `models` list means
+"whatever this provider serves", which is a default rather than a claim. So when
+one candidate names the model outright and another matches only by default,
+`_most_specific` narrows to the ones that named it: an owner who wrote the model
+down was telling the pool something, and balancing across the silent key only
+buys a provider 403. Rating and load then decide inside the narrowed set. When
+nothing declares the model, every catch-all stays in rotation.
+
 **In-flight is derived, not stored.** Workers are separate processes, so an
 in-memory busy counter would read zero in a sibling. The usage ledger already
 appends a `reserved` row under a cross-process lock and moves it to a terminal
@@ -2860,6 +2870,19 @@ model id and provider-supplied fields are used; there is no manual model table,
 prefix inheritance, cache-price multiplier, or numeric fallback. Direct OpenAI,
 OpenAI-compatible, Anthropic, MiniMax, and GigaChat routes without an automatic
 source are honestly unknown.
+
+A provider-reported cost is normalized to USD at ingress by
+`pricing.normalize_reported_cost`, called in `llm._normalize_remote_response`
+before any consumer reads `usage["cost"]`. Some gateways bill in a national
+currency and still name the plain field `cost` — polza.ai returns `cost` and
+`cost_rub` holding the SAME number, so booking it as dollars inflated recorded
+spend by the whole exchange rate and tripped the budget fence roughly eighty times
+too early. The rules: an explicitly named `cost_usd` wins; a witness field whose
+value EQUALS `cost` proves the currency and converts through the owner-set
+`OUROBOROS_RUB_USD_RATE` (the same authority the cloud.ru catalog uses); without
+that rate the cost becomes unknown, never the foreign figure. A witness that
+disagrees numerically proves nothing and the plain value passes through. The
+decision is recorded on the usage row as `cost_currency_note`.
 
 Unknown price is fail-open for model admission under finite global/root budgets:
 the attempt reserves `None`, dispatches while already-known accounted spend remains

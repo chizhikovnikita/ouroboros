@@ -3619,19 +3619,26 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to log owner_message_injected event", exc_info=True)
 
 
-def _handle_review_wave_budget_insufficient(evt: Dict[str, Any], ctx: Any) -> None:
-    """Persist the typed review-wave admission refusal durably (v6.69.0).
+def _handle_review_wave_budget_event(evt: Dict[str, Any], ctx: Any) -> None:
+    """Persist a typed review-wave admission verdict durably (v6.69.0).
 
-    Without a registered handler the worker event would land in
-    supervisor.jsonl as an unknown_worker_event repr instead of a typed
-    events.jsonl row that budget audits can aggregate."""
+    Covers BOTH admission outcomes that carry a budget fact: the refusal
+    (``review_wave_budget_insufficient``) and the admitted-but-partly-unpriced wave
+    (``review_wave_budget_partial_unknown``). The second one exists solely to make
+    an unknowable slot price observable, so leaving it unregistered defeated its
+    only purpose — it was dropped as an unknown worker event and the gap it
+    reports vanished, which is precisely the silence BIBLE P1 forbids.
+
+    Without a registered handler the worker event would land in supervisor.jsonl as
+    an unknown_worker_event repr instead of a typed events.jsonl row that budget
+    audits can aggregate."""
     try:
         append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "events.jsonl",
             {"ts": evt.get("ts", utc_now_iso()), **{k: v for k, v in evt.items() if k != "ts"}},
         )
     except Exception:
-        log.debug("Failed to log review_wave_budget_insufficient event", exc_info=True)
+        log.debug("Failed to log %s event", evt.get("type", "review_wave_budget"), exc_info=True)
 
 
 def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
@@ -3745,7 +3752,8 @@ EVENT_HANDLERS = {
     "toggle_consciousness": _handle_toggle_consciousness,
     "owner_message_injected": _handle_owner_message_injected,
     "log_event": _handle_log_event,
-    "review_wave_budget_insufficient": _handle_review_wave_budget_insufficient,
+    "review_wave_budget_insufficient": _handle_review_wave_budget_event,
+    "review_wave_budget_partial_unknown": _handle_review_wave_budget_event,
     "skill_exec_finished": _handle_skill_lifecycle,
     "skill_exec_failed": _handle_skill_lifecycle,
     "acceptance_fence": _handle_acceptance_fence,

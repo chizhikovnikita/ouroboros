@@ -100,6 +100,68 @@ def get_pricing(
         return dict(rows)
 
 
+# A provider that bills in a national currency may still name the field "cost".
+# polza.ai does exactly this: it returns ``cost`` and ``cost_rub`` holding the SAME
+# number, so the plain field is roubles. Booking that as USD is worse than not
+# knowing it — it moves the budget fence by the whole exchange rate and makes two
+# providers' spend incomparable in the one ledger that is supposed to be the truth.
+#
+# Each entry maps the corroborating field to the currency the plain ``cost`` is in.
+_COST_CURRENCY_WITNESS = {"cost_rub": "RUB"}
+
+# Same authority as the cloud.ru catalog conversion: roubles PER USD, owner-set.
+# There is deliberately no built-in rate — an implicit one would be a made-up number
+# that silently decides how much the owner is allowed to spend.
+_RUB_RATE_ENV = "OUROBOROS_RUB_USD_RATE"
+
+
+def _rub_usd_rate() -> Optional[float]:
+    try:
+        rate = float(os.environ.get(_RUB_RATE_ENV, "") or "")
+    except (TypeError, ValueError):
+        return None
+    return rate if rate > 0 else None
+
+
+def normalize_reported_cost(usage: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Provider-reported cost as USD, plus a note naming what was decided.
+
+    Returns ``(usd, note)``. The note is empty when nothing needed deciding; it is
+    non-empty exactly when the caller should record how the number was reached:
+
+    - ``"usd_declared"``   — the provider named the currency itself (``cost_usd``).
+    - ``"converted_RUB"``  — a witness field proved the plain ``cost`` was roubles
+      and the owner's rate converted it.
+    - ``"unconvertible_RUB"`` — same proof, no configured rate: the honest answer
+      is None. An unknown cost is already a first-class ledger state; a wrong one
+      is not.
+    """
+    declared = usage.get("cost_usd")
+    if isinstance(declared, (int, float)):
+        return float(declared), "usd_declared"
+
+    raw = usage.get("cost")
+    if not isinstance(raw, (int, float)):
+        return None, ""
+    raw = float(raw)
+
+    for witness, currency in _COST_CURRENCY_WITNESS.items():
+        value = usage.get(witness)
+        if not isinstance(value, (int, float)):
+            continue
+        # Equality is the proof: the provider is showing the same figure twice, once
+        # under a name that states the currency. A DIFFERENT value would mean the
+        # plain field is something else entirely, and guessing is what this avoids.
+        if abs(float(value) - raw) > 1e-9:
+            continue
+        rate = _rub_usd_rate() if currency == "RUB" else None
+        if rate is None:
+            return None, f"unconvertible_{currency}"
+        return raw / rate, f"converted_{currency}"
+
+    return raw, ""
+
+
 def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int, *,
                            cache_usage: Optional[Dict[str, Any]] = None,
                            allow_live_fetch: bool = True,

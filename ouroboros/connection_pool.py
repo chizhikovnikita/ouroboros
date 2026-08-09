@@ -278,10 +278,28 @@ def candidates(
             return ()
         usable = permitted
 
+    usable = _most_specific(usable)
+
     ready = tuple(conn for conn in usable if not cooling_down(conn.connection_id))
     # Every candidate resting is not the same as having none: rather than fail the
     # send, fall back to the full permitted set and let the provider decide.
     return ready or usable
+
+
+def _most_specific(pool: Sequence[registry.Connection]) -> Tuple[registry.Connection, ...]:
+    """Narrow to the connections that NAME this model, when any do.
+
+    Two gateways can share one transport lane while selling different catalogs, and
+    an empty model list means "whatever this provider serves" — a default, not a
+    claim. So when one connection lists the model outright and another only matches
+    by default, the declaration wins: an owner who wrote the model down was telling
+    the pool something, and load-balancing across the silent one just buys a 403.
+
+    Ordering is preserved so the caller's rating and load rules still decide within
+    the narrowed set.
+    """
+    declared = tuple(conn for conn in pool if conn.models)
+    return declared or tuple(pool)
 
 
 def select(

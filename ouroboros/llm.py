@@ -3763,6 +3763,15 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
+        # Before ANY consumer reads usage["cost"]: a provider may report it in its own
+        # currency (polza.ai bills roubles under the plain "cost" name). Settle the
+        # currency here, at ingress, so exactly one number in one unit travels onward.
+        from ouroboros.pricing import normalize_reported_cost
+
+        _usd, _cost_note = normalize_reported_cost(usage)
+        if _cost_note:
+            usage["cost"] = _usd
+            usage["cost_currency_note"] = _cost_note
         # An HTTP-200 that carried a provider body-error (OpenRouter passes
         # 429/5xx through the body) reaches here only when a same-model reroute
         # was unavailable or also errored. Surface it as a typed marker so the

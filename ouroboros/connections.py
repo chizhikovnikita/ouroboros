@@ -24,6 +24,7 @@ independence), and nothing has to be copied to two places.
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import re
@@ -34,6 +35,8 @@ from ouroboros.provider_models import (
     PROVIDER_CREDENTIAL_GROUPS,
     normalize_model_identity,
 )
+
+log = logging.getLogger(__name__)
 
 
 CATALOG_REL = pathlib.Path("state/connections.json")
@@ -234,6 +237,34 @@ def _validate_choice(raw: Any, valid: Iterable[str], *, where: str, what: str, d
     return value
 
 
+def _validate_provider(raw: Any, *, where: str) -> str:
+    """A connection's provider must be a real transport lane, not a free string.
+
+    An unrecognized value is not merely untidy — it is silently inert. Routing
+    compares this against ``provider_for_model``, so a lane nothing resolves to can
+    never be selected, and the credential key is derived from the same name, so the
+    secret lands under a field no transport reads. A pasted vendor URL produced both
+    at once: a connection that showed up healthy in the UI and carried nothing.
+    """
+    provider = _text(raw).lower()
+    if not provider:
+        raise ConnectionConfigError(f"{where}: provider must not be empty")
+    if provider not in PROVIDER_CREDENTIAL_GROUPS:
+        hint = ""
+        if "://" in provider or provider.endswith((".ai", ".dev", ".com", ".io")):
+            # The most likely mistake, named explicitly: the endpoint URL belongs in
+            # base_url, and every custom OpenAI-style gateway rides one shared lane.
+            hint = (
+                " — an endpoint URL belongs in base_url; a custom OpenAI-compatible"
+                " gateway uses provider 'openai-compatible'"
+            )
+        raise ConnectionConfigError(
+            f"{where}: unknown provider {provider!r}; valid: "
+            f"{', '.join(sorted(PROVIDER_CREDENTIAL_GROUPS))}{hint}"
+        )
+    return provider
+
+
 def _string_tuple(raw: Any) -> Tuple[str, ...]:
     if raw is None or raw == "":
         return ()
@@ -284,9 +315,7 @@ def parse_connection(row: Any, *, where: str = "connection") -> Connection:
         raise ConnectionConfigError(f"{where}: row is not an object")
 
     connection_id = _validate_id(row.get("connection_id"), where=where)
-    provider = _text(row.get("provider")).lower()
-    if not provider:
-        raise ConnectionConfigError(f"{where}: provider must not be empty")
+    provider = _validate_provider(row.get("provider"), where=where)
 
     extras_raw = row.get("extras")
     extras: Dict[str, str] = {}
@@ -354,8 +383,11 @@ def load_registry(root: pathlib.Path | str | None = None) -> Tuple[Connection, .
     for index, row in enumerate(rows):
         try:
             parsed = parse_connection(row, where=f"connections[{index}]")
-        except ConnectionConfigError:
-            # One bad row must not hide the rest; it is skipped, not fatal.
+        except ConnectionConfigError as exc:
+            # One bad row must not hide the rest; it is skipped, not fatal. Logged
+            # rather than swallowed: a connection that vanishes from the UI without
+            # a word is the same silent failure this module exists to prevent.
+            log.warning("connection row skipped: %s", exc)
             continue
         if parsed.connection_id in seen:
             continue
